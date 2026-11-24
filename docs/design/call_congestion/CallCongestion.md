@@ -58,8 +58,9 @@ At the scale the cfgs use, **1 tick = 100 ms**. The values below are those of `r
    - *Hides:* RTT growth on the listeners' own uplinks (none is capped in the measured runs).
 3. **No loss, no reordering.** Only delay. That is the measured case.
    - *Hides:* the loss path of the retry budget. A lost message's retries are exactly the ones modelled; they just never get a late proof.
-4. **The Channel window is never full.** At an RTT below `CHANNEL_RTT_FAST_MS` (180 ms) the window floor is 16 (`update_window_for_rtt`). Control at ~1 Hz per leg never reaches it.
-   - *Hides:* `Busy` refusals. That is the mechanism of F8.
+4. **The Channel window is not modelled; it is never full.** At an RTT below `CHANNEL_RTT_FAST_MS` (180 ms) the window floor is 16 (`update_window_for_rtt`). Control at ~1 Hz per leg never reaches it.
+   - *Hides:* `Busy` refusals (the mechanism of F8). It also hides the window's own dynamics: the decrement per timeout, and the give-back of the decrements a spurious retransmit cost.
+   - The review's rule is that the give-back is clamped to the window before the loss, so a link that just drained is not re-flooded. That rule is NOT checked here. A model with the window would need it as a state variable per leg, with the clamp as a guard on the give-back.
 5. **Link setup is instant.** A redial that is due and whose path is up succeeds in the same tick, with a fresh Channel (SRTT 0, no authenticated inbound).
    - *Hides:* a handshake that itself queues behind P's backlog (F6's "no route to peer" is folded into the re-punch time).
 6. **One stream.** Only P publishes, as in `a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`. So P relays nothing and has no shares or standbys.
@@ -70,9 +71,15 @@ At the scale the cfgs use, **1 tick = 100 ms**. The values below are those of `r
    - *Silence failover is not modelled.* With `idle_aware_silence` a listener that hears nothing on any path treats the stream as idle, not its parent as dead (`selector.rs` tick). So a listener whose only parent went silent waits for a shed notice or a link close. That is exactly what the model does.
    - *Voluntary switches.* The model keeps only the move back to P after the dwell, when P's offer shows room. The 1.2× hysteresis over `hysteresis_hold_windows` is folded into "P has room".
 9. **The egress meter is blind on datagram legs** (`path_meter.rs:402`). A window is congested iff the stall verdict holds. The only growth signals are demand (a refused subscribe) and a ceiling gone stale.
-10. **Heard counts distinct publish ticks per listener**, in the window `[CapAt, Horizon − TailTicks]`, deduplicated like the frame stream (a tick older than the newest one heard is dropped).
+10. **Heard counts distinct publish ticks per listener, published WHILE CAPPED** (`[CapAt, min(CapUntil, Horizon − TailTicks)]`), deduplicated like the frame stream (a tick older than the newest one heard is dropped).
+    - With a 4 s cap, a 1.4 s gap costs ~35 % of heard. The edge test caps for 30 s. So heard figures are reported both for the 4 s cap and with the cap held (20 s), and the held figure is the one to compare with the test's 70 %.
     - *Hides:* the reorder window's own drops (CIRISEdge#931).
-11. **Liveness on a bounded run.** Time stops at `Horizon`, and the last state stutters. So "eventually" means "by the horizon", and each liveness property is also stated as a terminal-state check with its bound (`End*`).
+11. **Media granularity.** One FIFO item carries one tick (100 ms, ~3 frames) of P's media for its children. A child's media therefore leaves the queue in tick-sized pieces.
+    - At 2.25× those pieces are ~2.25 ticks apart per child, so a silence threshold of 3 ticks can be crossed by lateness alone. Real frames interleave ~75 ms apart.
+    - *Hides / distorts:* silence-based rules with thresholds of 300 ms or less. That is why the SilenceFailover result at 300 ms and 2.25× is set aside as an artifact (see Results).
+12. **Adversaries.** `ReplayAttack`: after the dead node dies, an on-path party replays a recorded Channel frame (seq 0) and a media tick on every leg from it. They decrypt; the link has no replay protection. `DelayProofs`: an on-path party withholds every proof `DelayVictim` emits during `[AdvFrom, AdvTo)`. Withholding for longer than the retry ladder is, for timing, the same as delaying.
+    - *Not modelled:* forging (all frames are authentic) and dropping media.
+13. **Liveness on a bounded run.** Time stops at `Horizon`, and the last state stutters. So "eventually" means "by the horizon", and each liveness property is also stated as a terminal-state check with its bound (`End*`).
     - *Hides:* anything after the horizon. Every bound is stated with its property.
 
 ## The switches
@@ -95,6 +102,16 @@ All switches are FALSE in the baseline, which is the code before any of today's 
 | `ShedDrains` | A shed child is fed for `DrainTicks` or until it unsubscribes (make-before-break). Off: the stall shed removes it from the ledger and P stops at once. | missing for the stall shed: `admission.rs:905-914` removes without a drain; `shed_all_draining` `admission.rs:396` is the drained form (relay-off, tier 2) |
 | `PeerLiveness` | The hold (C3) counts an authenticated packet from the same peer on any leg: the peer's own leg's frames and datagrams, which decrypt under that leg's key, as well as this leg's proofs. | missing in leviculum (#113 option (a)); today the per-link `last_authenticated_inbound_ms` (channel/mod.rs:1034) |
 | `ReceiverMoves` | A child of P that is not P's first child, and that sees P's media arrive `RxDelayTicks` (300 ms) or more after it was sent, moves itself to a relay, keeping P until the relay admits. Its unsubscribe says "late" (`unsub_late`). P reads that as congestion: room = its current children, `lastCong` = now, and the probe backoff steps up. Any widening (P6's demand step, or the SlowStart probe) waits 2 windows × 2^fails, fails ≤ 2, stepping down after each widening that held. | missing in edge. The delay is readable: `on_chunk` carries `source_ms` (alm.rs). The rank of P's first child is a wire addition to the Admit. |
+| `ProbeBackoff` | Any widening (the demand step P6, the SlowStart probe) waits 2 windows × 2^fails since the last congestion or widening. `fails` counts late moves (N3), at most 2, and steps down after each widening that held. | missing (admission.rs:854-875 widens on demand with no backoff) |
+| `HashRank` | P keeps, and the receivers spare, the lowest-ranked child by an order every member computes (hash of stream id and child key: `RankSeq`, deliberately unlike the join order). This replaces "oldest admitted" plus a rank in the Admit. | missing; no wire change |
+| `SerialRedial` | While P's verdict holds: one P leg's setup per `SetupGap`; a listener heard through a relay defers its legs with P. | missing (av_call.rs:4253 dials every member at once) |
+| `StaggeredSetup`, `SetupUnits` | P's side of a leg's setup costs `SetupUnits` of P's queue (40 ≈ 1 s at the cap: F11), at the start and on every redial. Staggered: one P leg per 3 ticks at the start. | the cost is real today (F11); staggering is missing |
+| `ProbeTwoLegs` | Every 200 ms P sends a small control frame on at most two live legs with nothing unproved, so the verdict never waits for an offer (F10). | missing |
+| `SilenceFailover`, `SilentTicks` | A child whose primary delivered nothing for 300 / 500 ms moves to a member that offers. | the code's silence suspicion is idle-aware (selector.rs tick); evaluated here as proposed |
+| `StallDrain`, `DrainPct` | While the verdict holds, P's copies are 25 / 50 / 75 % of a copy (a base layer, or audio). | `legs_shed_to_base` (C5) exists for other causes; not wired to the stall |
+| `FreshEvidence` | Evidence is only a packet that advances state: a Channel frame with a new sequence, a proof for an outstanding receipt, a new media tick. | leviculum review (being built) |
+| `ConditionalRto` | The learned SRTT sets the waits of a message only if fresh evidence arrived after its first send; otherwise the cold ladder. | leviculum review (being built) |
+| `ReplayAttack`, `DelayProofs` (adversary) | See abstraction 12. | - |
 | `CloseLost` (environment) | A LINKCLOSE never reaches the peer, which learns only by the stale bound. | CIRISEdge#1030 |
 
 ## Properties
@@ -106,14 +123,16 @@ The safety properties are checked at every state. The model folds them into `bad
 | `NoSpuriousTeardown` | No leg is torn down `exhausted` (or goes `stale`) while its peer is alive. Every peer here is reachable. |
 | `KeepsOneChild` | No shed leaves P with zero direct children when it had any. |
 | `NeverTwoParents` | A listener sits in two forwarders' ledgers for at most 2 ticks plus P's queue delay. The parent variable is single-valued by construction. This is the ledger form. |
-| `MakeBeforeBreak` | A child P shed, while its leg is up, is still fed by P until it has moved. |
+| `MakeBeforeBreak` (voluntary) | A child P shed, while its leg is up, is still fed by P until it has moved. **It applies to a voluntary shed** (relaying turned off, a window rebalance), where P has headroom to keep feeding. The model has no voluntary shed: relay-off and rebalancing are not modelled, so for every configuration here the property only ever meets stall sheds. Its "violations" in the results are stall sheds and are read as such. |
+| `StallShedGap` | A child a STALL shed removed has a parent again within `GapBound` (1.5 s). **Why the split:** a stall shed exists to cut load now. Feeding the shed children until they move is the load that kills the links, and their media was already late. So the obligation is a bounded gap, not continuity. |
+| `NoIdleWithOffer` | No listener sits with no parent and nothing pending while a viable member offers, for more than two watch ticks (a refused subscribe costs one watch tick before the next candidate is tried). |
 | `NothingWaitsForever` | Every Channel message is proved, or its leg torn, within `Stale + HeldCap + Wait(5, cap)`. |
 | `ReparentBound` | At most `MaxReparents` re-parentings per listener: the join, the move to a relay, the move back after a lift, and two per probe. With the probe backoff at most ⌊log₂(H/2W)⌋+1 probes fit in a horizon H, so the bound is 3 + 2·(⌊log₂(H/20)⌋+1) (11 at H = 230). A bound logarithmic in the call's length is what "no oscillation" means here. |
 | `EndParented` | At the horizon every live listener has a parent. |
 | `EndHeard` | At the horizon every live listener heard at least 70 % of what P published in the window. |
 | `EndFullFanOut` | `RecoverBy` ticks after the cap lifts, every live listener's parent is P. `RecoverBy` is stated per configuration: the latch (20) + a window (10) + the dwell (20) + a window (10) + the widenings. With SlowStart and the backoff, the widenings are 2W·4 + 2W·2 = 120; without SlowStart, the ceiling staleness (20). That gives 180 or 80 ticks at N=4. In code scale: about 2 + 1 + 10 + 1 + 8 + 4 ≈ 26 s with SlowStart, and about 60 + 10 + 4 ≈ 74 s without (the real dwell and staleness). |
 | `EndQueueDrained` | At the end, P's queue delay is at most `QTarget` (500 ms), unless a widening is less than `Dwell` + 4 windows old (a probe still playing out). |
-| `DeadDetected` | `DeadBound` after a node dies, every leg toward it is down at the live dialer, and every leg from it at the live receiver. `DeadBound` = an offer period + twice the retry span at the learned cap + the stale bound: the bound the code has today, so the fixes must not stretch it (#1030). |
+| `DeadDetected` | After a node dies, every leg toward it is down at the live dialer within `DialerDeadBound`, and every leg from it is down at the live receiver within the stale bound (+2). `DialerDeadBound` is the cold ladder when `ConditionalRto` is on: an offer period + 13 ticks + a watch tick, today's time (#1030). Without it, the ladder at the learned SRTT cap. The scenarios kill the node right after a queueing episode, with SRTT at its cap. |
 
 Terminal outcomes (the `Outcome` probe):
 

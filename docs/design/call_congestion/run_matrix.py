@@ -34,20 +34,22 @@ ALL_OFF = dict(RPA="FALSE", RTO="FALSE", HOLD="FALSE", SOV="FALSE", RKO="FALSE",
                SS="FALSE", RPU="FALSE", DRAIN="FALSE", PEER="FALSE", RXMOVE="FALSE",
                PBO="FALSE", HASH="FALSE", STAG="FALSE", SERIAL="FALSE", PROBE2="FALSE",
                SILENCE="FALSE", SDRAIN="FALSE", FRESH="FALSE", CRTO="FALSE",
-               REPLAY="FALSE", DELAYP="FALSE")
+               REPLAY="FALSE", DELAYP="FALSE", OWNGUARD="FALSE", DEPHOLD="FALSE",
+               GRACEFUL="FALSE")
 SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
               SOV="ShedOnVerdict", RKO="RoomKeepsOne", SS="SlowStart",
               RPU="RedialOnPathUp", DRAIN="ShedDrains", PEER="PeerLiveness",
               RXMOVE="ReceiverMoves", PBO="ProbeBackoff", HASH="HashRank",
               STAG="StaggeredSetup", SERIAL="SerialRedial", PROBE2="ProbeTwoLegs",
               SILENCE="SilenceFailover", SDRAIN="StallDrain", FRESH="FreshEvidence",
-              CRTO="ConditionalRto", REPLAY="ReplayAttack", DELAYP="DelayProofs")
+              CRTO="ConditionalRto", REPLAY="ReplayAttack", DELAYP="DelayProofs",
+              OWNGUARD="OwnDownlinkGuard", DEPHOLD="DepartureHolds", GRACEFUL="Graceful")
 INVS = "TypeOK RecordOutcome"   # the properties fold into `bad`, read per terminal state
 BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4", CAPAT="10",
             CAPUNTIL="50", HORIZON="230", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -63,15 +65,23 @@ SIX = on("RPA", "RTO", "SOV", "RKO", "SS", "RPU")       # the brief's six
 EIGHT = dict(SIX, **on("HOLD", "DRAIN"))                # + the #113 hold, make-before-break
 ALL = dict(EIGHT, **on("PEER", "RXMOVE", "PBO", "FRESH", "CRTO"))        # + what the model found missing
 # The lead's proposed minimum for 45.2.0's safety properties.
-MIN = on("PEER", "SOV", "RKO", "PBO", "SERIAL", "FRESH", "CRTO")
-SETUP = dict(SETUP="40")                      # ~1 s of P's queue per leg set up (F11)
+# (+ RPA and HOLD: already in leviculum c75fdeb01; without per-attempt
+# receipts, fresh-only evidence starves a shed child's leg toward P.)
+MIN = on("PEER", "SOV", "RKO", "PBO", "SERIAL", "FRESH", "CRTO", "RPA", "HOLD")
+MIN_NO_RPA = on("PEER", "SOV", "RKO", "PBO", "SERIAL", "FRESH", "CRTO")
+SETUP = dict(SETUP="40")
+# What ships in 45.2.0: the minimum set + ReceiverMoves on the hash rank, P
+# reading any direct child's departure as late (no wire reason), the
+# own-downlink guard.
+SHIP = dict(MIN, **on("RXMOVE", "HASH", "DEPHOLD", "OWNGUARD", "SS"), INIT="2", HOLDT="100",
+            SCOPE='"offer"')                      # ~1 s of P's queue per leg set up (F11)
 
 
 def scenarios():
     yield "smoke-baseline", dict(PPH="{3}", LPH="{0}", WPH="{0}", NPICK="1", PUNCH="{10}")
     yield "baseline", {}
     for k in SWITCH:
-        if k not in ("REPLAY", "DELAYP"):
+        if k not in ("REPLAY", "DELAYP", "GRACEFUL"):
             yield f"only-{SWITCH[k]}", on(k)
     yield "pin-c8699c3d6", TODAY_LEV_C86
     yield "pin-c75fdeb01", TODAY_LEV_C75
@@ -105,6 +115,32 @@ def scenarios():
         yield f"cmp-{tag}-probe2", dict(fine, PROBE2="TRUE")
         yield f"cmp-{tag}-probe2-drain50", dict(fine, PROBE2="TRUE", SDRAIN="TRUE", DRAINPCT="50")
         yield f"cmp-{tag}-rxmove-hash", dict(fine, RXMOVE="TRUE", HASH="TRUE")
+    # The shipping set.
+    for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
+        fine = dict(SHIP, M="12", RCAP=r)
+        yield f"ship-{tag}-cap-held", dict(fine, CAPUNTIL="1000")
+        yield f"ship-{tag}-cap-lifts", fine
+    yield "ship", SHIP
+    # RM4: whom the receivers spare (cap held: the steady state must keep one).
+    for sc in ["member", "child", "offer"]:
+        yield f"ship-scope-{sc}-cap-held", dict(SHIP, SCOPE=f'"{sc}"', CAPUNTIL="1000")
+        yield f"ship-scope-{sc}-x225-cap-held", dict(SHIP, SCOPE=f'"{sc}"', M="12", RCAP="16",
+                                                     CAPUNTIL="1000")
+    yield "cap-stays-ship", dict(SHIP, CAPUNTIL="1000")
+    yield "ship-setup", dict(SHIP, **SETUP)
+    yield "ship-unscaled", dict(SHIP, DWELL="100", CSTALE="600", HORIZON="320")
+    # (i) a receiver whose own downlink is slow (no cap: P is fine).
+    slow = dict(SLOWNODE='"B"', SLOWTICKS="3", CAPAT="1000", CAPUNTIL="1000")
+    yield "ship-slow-B", dict(SHIP, **slow)
+    yield "ship-slow-B-no-guard", dict(SHIP, OWNGUARD="FALSE", **slow)
+    # (ii) a direct child hangs up after the cap lifts, others still on relays.
+    hang = dict(DEAD='"B"', DEADAT="58", GRACEFUL="TRUE")
+    yield "ship-hangup", dict(SHIP, **hang)
+    yield "ship-hangup-with-reason", dict(SHIP, DEPHOLD="FALSE", **hang)
+    yield "ship-hangup-uncapped", dict(SHIP, CAPAT="1000", CAPUNTIL="1000", **hang)
+    # Review checks on the shipping set.
+    yield "dead-after-queue-ship", dict(SHIP, DEAD='"B"', DEADAT="52")
+    yield "delay-proofs-A-ship", dict(SHIP, DELAYP="TRUE")
     # The review (leviculum): fresh evidence, the conditional RTO, adversaries.
     dq = dict(DEAD='"B"', DEADAT="52")           # B dies just after the cap lifts (SRTT at its cap)
     yield "dead-after-queue-min", dict(MIN, **dq)
@@ -119,6 +155,8 @@ def scenarios():
     yield "delay-proofs-A-no-peer", dict(MIN, PEER="FALSE", DELAYP="TRUE")
     yield "delay-proofs-A-uncapped-min", dict(MIN, DELAYP="TRUE", CAPAT="1000", CAPUNTIL="1000")
     # What closes the stall-shed gap on the minimum set.
+    yield "min-without-receipts", MIN_NO_RPA
+    yield "cap-stays-min-without-receipts", dict(MIN_NO_RPA, CAPUNTIL="1000")
     yield "min+probe2", dict(MIN, PROBE2="TRUE")
     yield "min+rxmove-hash", dict(MIN, RXMOVE="TRUE", HASH="TRUE")
     yield "min+probe2+rxmove-hash", dict(MIN, PROBE2="TRUE", RXMOVE="TRUE", HASH="TRUE")
@@ -167,18 +205,22 @@ def scenarios():
 
 def recover_by(p):
     """EndFullFanOut's bound (ticks after the cap lifts): the verdict's latch
-    (20) and the window it closes in (10), the dwell and a window for the
-    move, and the widenings: with SlowStart one stream per two clean windows,
-    each waiting out the probe backoff (2W x 2^fails, fails <= 2, stepping
-    down after each probe that held); without it, the ceiling's staleness."""
+    (20) and the window it closes in (10), the widenings, the dwell and a
+    window for the move. With SlowStart each stream above the first room
+    waits out the probe backoff (2W x 2^fails, fails <= 2, stepping down
+    after each probe that held) and, for the first, the hold after a stall;
+    without SlowStart, the ceiling's staleness."""
     n = 2 if p["LSEQ"] == "Listeners2" else 3
     w = 10
     if p["SS"] == "TRUE":
         fmax = 2 if p["PBO"] == "TRUE" else 0
-        grow = sum(2 * w * 2 ** max(0, fmax - i) for i in range(max(0, n - int(p["INIT"]))))
+        steps = [2 * w * 2 ** max(0, fmax - i) for i in range(max(0, n - int(p["INIT"])))]
+        if steps:
+            steps[0] = max(steps[0], int(p["HOLDT"]))
+        grow = sum(steps)
     else:
         grow = int(p["CSTALE"])
-    return str(20 + w + int(p["DWELL"]) + w + grow)
+    return str(20 + w + grow + int(p["DWELL"]) + w)
 
 
 def max_reparents(p):
