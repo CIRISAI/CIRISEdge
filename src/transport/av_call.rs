@@ -1884,6 +1884,11 @@ struct Shared {
     /// dialled this node meanwhile, so its call address stands, and the first
     /// dial may be waiting out a no-path establish timeout from before it did.
     racing_dial: StdMutex<std::collections::HashSet<String>>,
+    /// ALM C3 — must-arrive frames (answers, subscribes) a link refused,
+    /// per member, in order: one worker per member retries the front, and a
+    /// newer frame queues behind it. Independent retries reordered answers
+    /// (an older ADMIT landing after a newer one).
+    c3_pending: StdMutex<HashMap<String, std::collections::VecDeque<alm::Outgoing>>>,
     /// G8 serial redial — members whose leg this node had and lost, not yet
     /// redialled (a redial may be deferred once; a first dial never is).
     lost_legs: StdMutex<std::collections::HashSet<String>>,
@@ -2605,6 +2610,7 @@ impl Call {
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
             racing_dial: StdMutex::new(std::collections::HashSet::new()),
+            c3_pending: StdMutex::new(HashMap::new()),
             lost_legs: StdMutex::new(std::collections::HashSet::new()),
             reannounce_skipped: StdMutex::new(HashMap::new()),
             reannounce_running: AtomicBool::new(false),
@@ -5024,10 +5030,21 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
                 .test_fail_c3
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok();
-        if refused_by_seam {
-            let s = Arc::clone(shared);
-            tokio::spawn(async move { resend_c3(&s, o).await });
-            continue;
+        // Behind a refused frame to the same member: in order, after it.
+        {
+            let mut pending = Shared::lock(&shared.c3_pending);
+            if let Some(q) = pending.get_mut(&o.to) {
+                q.push_back(o);
+                continue;
+            }
+            if refused_by_seam {
+                let to = o.to.clone();
+                pending.insert(to.clone(), std::collections::VecDeque::from([o]));
+                drop(pending);
+                let s = Arc::clone(shared);
+                tokio::spawn(async move { c3_worker(&s, &to).await });
+                continue;
+            }
         }
         let sent = shared
             .publisher
@@ -5078,8 +5095,24 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
         } else {
             // Everything else changes state on one side only: it must arrive,
             // and it must not hold up the pump or the watch tick waiting.
-            let s = Arc::clone(shared);
-            tokio::spawn(async move { resend_c3(&s, o).await });
+            let to = o.to.clone();
+            let start = {
+                let mut pending = Shared::lock(&shared.c3_pending);
+                match pending.get_mut(&to) {
+                    Some(q) => {
+                        q.push_back(o);
+                        false
+                    }
+                    None => {
+                        pending.insert(to.clone(), std::collections::VecDeque::from([o]));
+                        true
+                    }
+                }
+            };
+            if start {
+                let s = Arc::clone(shared);
+                tokio::spawn(async move { c3_worker(&s, &to).await });
+            }
         }
     }
     for (_, frames) in offers {
@@ -5093,6 +5126,34 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
 /// subscriber's request timeout is still read: a stale ADMIT is answered
 /// with an UNSUBSCRIBE, which releases the slot. Each try is one send: the
 /// publisher lock is never held to wait.
+/// One member's queue of refused must-arrive frames: the front retried
+/// ([`resend_c3`]) until it goes or is given up, then the next, in order.
+async fn c3_worker(shared: &Arc<Shared>, to: &str) {
+    loop {
+        let front = {
+            let mut pending = Shared::lock(&shared.c3_pending);
+            match pending.get(to).and_then(|q| q.front().cloned()) {
+                Some(o) => o,
+                None => {
+                    pending.remove(to);
+                    return;
+                }
+            }
+        };
+        resend_c3(shared, front).await;
+        let mut pending = Shared::lock(&shared.c3_pending);
+        if let Some(q) = pending.get_mut(to) {
+            q.pop_front();
+            if q.is_empty() {
+                pending.remove(to);
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+}
+
 async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
     let deadline = tokio::time::Instant::now() + C3_RESEND_BUDGET;
     let mut pause = C3_RESEND_PAUSE;

@@ -1954,6 +1954,21 @@ impl AlmState {
         if now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0 {
             self.last_offer_ms = now.max(1);
             let mut own_offer = self.own.offer();
+            // The publisher's upstream latency is its own uplink queue: what
+            // a child admitted now waits for its first chunk (the child's
+            // selector owes a new subscription that much before calling it
+            // silent).
+            let queued = self
+                .leg_queue_ms
+                .values()
+                .copied()
+                .fold(0.0_f64, f64::max)
+                .clamp(0.0, f64::from(u32::MAX));
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                own_offer.upstream_latency_ms =
+                    own_offer.upstream_latency_ms.max(queued.round() as u32);
+            }
             own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
             own_offer.forwarder_headroom_bps =
                 self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);

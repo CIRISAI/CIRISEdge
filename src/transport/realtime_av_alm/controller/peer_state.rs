@@ -80,6 +80,17 @@ impl PeerHealth {
         self.go(PeerState::Down, now_ms)
     }
 
+    /// The forwarder admitted this node: a Down or Suspected peer starts
+    /// Recovering now (an ADMIT is the forwarder's fresh commitment, not a
+    /// black hole's offer; delivery still has to follow, or silence makes
+    /// it Suspected again).
+    pub fn on_admitted(&mut self, now_ms: u64) -> Option<(PeerState, PeerState)> {
+        match self.state {
+            PeerState::Down | PeerState::Suspected => self.go(PeerState::Recovering, now_ms),
+            _ => None,
+        }
+    }
+
     /// A liveness proof while not subscribed (an offer arrived): a Down or
     /// Suspected peer starts Recovering, but only once it has stayed so for
     /// `hold_ms`. An offer proves the forwarder is alive, not that it
