@@ -403,6 +403,11 @@ Each item below is outside the model, or held fixed in it. Every property's "hol
 - **The listeners' own uplinks, and CPU.** These are uncapped and instant. #996 (the relayed leg losing chunks under CPU contention) is out of scope.
 - **Security.** Who may send a shed or an offer is not modelled. Every message here is authentic.
 - **The canonical (T in the edge test).** It is not a room member, and it relays nothing on 45.x (`CANONICAL_AV_FALLBACK = false`), so it is not modelled.
+- **Standbys** are modelled only as P's (the publisher's): a stall-shed child, or a late mover, keeps P as a warm standby under `StandbyFeed` = full/fix. A relay's standbys are not modelled.
+- **Background control** (`CtrlBg`) is load only: it is not a Channel message, so it creates no retries and no evidence.
+- **Silent listeners** are modelled by `SilentListener`: no offers to P. A relay always offers to the other listeners, because the model's candidacy needs it.
+- **TreeRepair's stranding** (80/160) is not traced to its end.
+- **`f13-ship-pace5`** (pacing without expiry) throws a TLC exception that was not diagnosed.
 - **What is unverified.**
   - The second recorded run's per-node numbers. Only the brief's ranges were available (see [Trace conformance](#trace-conformance)).
   - The [summary] citations.
