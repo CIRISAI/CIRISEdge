@@ -42,8 +42,8 @@ def stats(xs):
 def main():
     outdir = sys.argv[1]
     pat = sys.argv[2] if len(sys.argv) > 2 else ".*"
-    rows = ["| scenario | verdict_s | shed_s | q_at_shed_s | max_q_s | end_q_s | heard_min_pct | full_at_s | parent_gap_s | media_gap_s | obs |",
-            "|---|---|---|---|---|---|---|---|---|---|---|"]
+    rows = ["| scenario | verdict_s | shed_s | q_at_shed_s | max_q_s | end_q_s | heard_min_pct | full_at_s | parent_gap_s | media_gap_s | drain_clear_s | cap_end_q_s | obs |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for name, params in scenarios():
         if not re.fullmatch(pat, name):
             continue
@@ -70,6 +70,8 @@ def main():
             stats([o["full_at"] / 10 if o["full_at"] >= 0 else None for o in obs]),
             stats([o["parent_gap"] / 10 for o in obs]),
             stats([o["media_gap"] / 10 for o in obs]),
+            stats([(o["drain_clear"] - o["first_shed"]) / 10 if o["drain_clear"] >= 0 and o["first_shed"] >= 0 else None for o in obs]),
+            stats([o["cap_end_q"] / 10 if o["cap_end_q"] >= 0 else None for o in obs]),
             str(len(obs))]) + " |")
     print("\n".join(rows))
 

@@ -59,6 +59,10 @@ CONSTANTS
     SerialRedial,       \* while P's verdict holds: one leg setup at a time; a
                         \* listener heard through a relay defers its legs' redial
     ProbeTwoLegs,       \* P sends a small control frame each ProbeEvery on <= 2 idle legs
+    SilenceFailover,    \* a child whose primary delivered nothing for SilentTicks moves
+    SilentTicks,
+    StallDrain,         \* while the verdict holds, P's copies are DrainPct of a copy
+    DrainPct,
     ProbeEvery,
     ReceiverMoves,      \* a non-first child that sees P's media late moves itself
     RxDelayTicks,       \* ... at this media delay (ticks)
@@ -159,7 +163,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -167,7 +171,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -191,7 +195,8 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         maxQd |-> maxQd, firstVerdictAt |-> firstVerdictAt, firstShedAt |-> firstShedAt,
         firstShedQ |-> firstShedQ, fullAt |-> fullAt, lastSetupAt |-> lastSetupAt,
         shedAtL |-> shedAtL, maxParentGap |-> maxParentGap, lastNewAt |-> lastNewAt,
-        maxMediaGap |-> maxMediaGap, idleCand |-> idleCand,
+        maxMediaGap |-> maxMediaGap, idleCand |-> idleCand, lastFromParent |-> lastFromParent,
+        drainClear |-> drainClear, capEndQ |-> capEndQ,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -283,6 +288,7 @@ KeepOf(ch) == IF RoomKeepsOne THEN 1 ELSE ch.keep
 Media1(S, s, c, t) ==
     IF ~Alive(S, c) \/ ~S.peerUp[<<s, c>>] THEN S
     ELSE LET S0 == [S EXCEPT !.peerAuth[c][s] = S.now,
+                             !.lastFromParent[c] = IF S.parent[c] = s THEN S.now ELSE @,
                              !.rxDelay[c] = IF s = "P" THEN S.now - t ELSE @]
              S1 == IF t > S0.lastHeard[c]
                    THEN [S0 EXCEPT !.lastHeard[c] = t, !.lastNewAt[c] = S.now,
@@ -323,7 +329,7 @@ OnAdmit(S, l, x) ==
              S1 == [S EXCEPT !.parent[l] = x, !.pendSub[l] = None,
                              !.reparents[l] = @ + 1, !.lastSwitch[l] = S.now,
                              !.maxParentGap = IF S.shedAtL[l] >= 0 THEN Max(@, S.now - S.shedAtL[l]) ELSE @,
-                             !.shedAtL[l] = -1,
+                             !.shedAtL[l] = -1, !.lastFromParent[l] = S.now,
                              !.shedBy[l] = None, !.lateMove[l] = FALSE]
              \* a move made because P's media came late says so: P reads it
              \* as congestion (ReceiverMoves)
@@ -555,6 +561,14 @@ LWatch1(S, l, k) ==
             ELSE IF /\ ReceiverMoves /\ S2.pendSub[l] = None /\ S2.parent[l] = "P"
                     /\ S2.rxDelay[l] >= RxDelayTicks /\ first /= l /\ relays /= <<>>
             THEN Subscribe([S2 EXCEPT !.lateMove[l] = TRUE], l, relays[Min(k, Len(relays))])
+            \* SilenceFailover: the primary delivered nothing for SilentTicks
+            \* and another member that hears the stream offers: move to it,
+            \* keeping the old parent until the new one admits.
+            ELSE IF /\ SilenceFailover /\ S2.pendSub[l] = None /\ S2.parent[l] /= None
+                    /\ S2.now - S2.lastFromParent[l] >= SilentTicks
+                    /\ SelectSeq(relays, LAMBDA x : x /= S2.parent[l]) /= <<>>
+            THEN LET rs == SelectSeq(relays, LAMBDA x : x /= S2.parent[l])
+                 IN Subscribe(S2, l, rs[Min(k, Len(rs))])
             ELSE IF /\ S2.pendSub[l] = None /\ S2.parent[l] \notin {None, "P"}
                     /\ Viable(S2, l, "P") /\ S2.now - S2.lastSwitch[l] >= Dwell
             THEN Subscribe(S2, l, "P")
@@ -623,9 +637,10 @@ Publish(S) ==
     IF ~Alive(S, "P") THEN S
     ELSE LET to == {c \in L : (c \in S.children \/ S.drainTo[c] >= S.now) /\ S.up[<<"P", c>>]}
              S1 == [S EXCEPT !.published = IF InWin(S.now) THEN @ + 1 ELSE @]
+             per == IF StallDrain /\ S.stall THEN Max(1, (M * DrainPct) \div 100) ELSE M
          IN IF to = {} THEN S1
             ELSE Emit(S1, "P", Item("media", <<"P", "P">>, 0, 0, 0, NoPay, "P", to, S.now),
-                      M * Cardinality(to))
+                      per * Cardinality(to))
 
 \* (a) The uplink drains Rate units at the end of the tick; what left it is
 \* received (and answered) within the tick.
@@ -780,6 +795,9 @@ Step(S, ch) ==
         S9 == Gaps(Dual(S8))
         S10 == IF TraceOn THEN [S9 EXCEPT !.hist = Append(@, Snap(S9, S.torn))] ELSE S9
         S11 == [S10 EXCEPT !.now = @ + 1, !.maxQd = Max(@, QDelayS(S10)),
+                           !.capEndQ = IF S10.now = Min(CapUntil, Horizon) - 1 THEN QDelayS(S10) ELSE @,
+                           !.drainClear = IF @ < 0 /\ S10.firstShedAt >= 0 /\ QDelayS(S10) <= QTarget
+                                          THEN S10.now ELSE @,
                            !.fullAt = IF @ < 0 /\ \A c \in L : S10.parent[c] = "P" THEN S10.now ELSE @]
     IN [S11 EXCEPT !.bad = @ \cup Bad(S11)]
 
@@ -809,6 +827,7 @@ Init ==
     /\ fullAt = -1 /\ lastSetupAt = -100
     /\ shedAtL = [c \in L |-> -1] /\ maxParentGap = 0 /\ lastNewAt = [c \in L |-> 0]
     /\ maxMediaGap = 0 /\ idleCand = [c \in L |-> 0]
+    /\ lastFromParent = [c \in L |-> 0] /\ drainClear = -1 /\ capEndQ = -1
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
@@ -845,7 +864,8 @@ Assign(S) ==
     /\ firstShedAt' = S.firstShedAt /\ firstShedQ' = S.firstShedQ
     /\ fullAt' = S.fullAt /\ lastSetupAt' = S.lastSetupAt
     /\ shedAtL' = S.shedAtL /\ maxParentGap' = S.maxParentGap /\ lastNewAt' = S.lastNewAt
-    /\ maxMediaGap' = S.maxMediaGap /\ idleCand' = S.idleCand /\ dialAt' = S.dialAt
+    /\ maxMediaGap' = S.maxMediaGap /\ idleCand' = S.idleCand
+    /\ lastFromParent' = S.lastFromParent /\ drainClear' = S.drainClear /\ capEndQ' = S.capEndQ /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
@@ -921,6 +941,7 @@ Observed ==
      sheds |-> sheds, verdicts |-> verdicts, qdelay |-> QueueDelay, max_qdelay |-> maxQd,
      first_verdict |-> firstVerdictAt, first_shed |-> firstShedAt, q_at_shed |-> firstShedQ,
      full_at |-> fullAt, parent_gap |-> maxParentGap, media_gap |-> maxMediaGap,
+     drain_clear |-> drainClear, cap_end_q |-> capEndQ,
      heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
 \* One line per terminal state: the outcome, the violated set, what is observed.
 RecordOutcome == Over => PrintT(<<"OUTCOME", Outcome, bad, Observed>>)

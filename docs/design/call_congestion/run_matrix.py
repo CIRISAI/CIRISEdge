@@ -32,18 +32,20 @@ CAP_SECS = 5400
 
 ALL_OFF = dict(RPA="FALSE", RTO="FALSE", HOLD="FALSE", SOV="FALSE", RKO="FALSE",
                SS="FALSE", RPU="FALSE", DRAIN="FALSE", PEER="FALSE", RXMOVE="FALSE",
-               PBO="FALSE", HASH="FALSE", STAG="FALSE", SERIAL="FALSE", PROBE2="FALSE")
+               PBO="FALSE", HASH="FALSE", STAG="FALSE", SERIAL="FALSE", PROBE2="FALSE",
+               SILENCE="FALSE", SDRAIN="FALSE")
 SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
               SOV="ShedOnVerdict", RKO="RoomKeepsOne", SS="SlowStart",
               RPU="RedialOnPathUp", DRAIN="ShedDrains", PEER="PeerLiveness",
               RXMOVE="ReceiverMoves", PBO="ProbeBackoff", HASH="HashRank",
-              STAG="StaggeredSetup", SERIAL="SerialRedial", PROBE2="ProbeTwoLegs")
+              STAG="StaggeredSetup", SERIAL="SerialRedial", PROBE2="ProbeTwoLegs",
+              SILENCE="SilenceFailover", SDRAIN="StallDrain")
 INVS = "TypeOK RecordOutcome"   # the properties fold into `bad`, read per terminal state
 BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4", CAPAT="10",
             CAPUNTIL="50", HORIZON="230", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -86,6 +88,25 @@ def scenarios():
             yield f"min{tag}-but-{SWITCH[k]}", dict(MIN, **{k: "FALSE"}, **extra)
         yield f"cap-stays-min{tag}", dict(MIN, CAPUNTIL="1000", **extra)
     yield "peer-only-setup", dict(on("PEER"), **SETUP)
+    # The lead's comparison (copy = 12 units, control 1 unit ~ 0.08 copy):
+    # the minimum set plus SilenceFailover (300 / 500 ms), StallDrain (25 /
+    # 50 / 75 % of a copy), both, and ProbeTwoLegs, at 2.25x, 1.8x, 1.5x.
+    for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
+        fine = dict(MIN, M="12", RCAP=r)
+        yield f"cmp-{tag}-min", fine
+        yield f"cmp-{tag}-silence3", dict(fine, SILENCE="TRUE", SILENTT="3")
+        yield f"cmp-{tag}-silence5", dict(fine, SILENCE="TRUE", SILENTT="5")
+        for d in ["25", "50", "75"]:
+            yield f"cmp-{tag}-drain{d}", dict(fine, SDRAIN="TRUE", DRAINPCT=d)
+        yield f"cmp-{tag}-silence3-drain50", dict(fine, SILENCE="TRUE", SILENTT="3", SDRAIN="TRUE", DRAINPCT="50")
+        yield f"cmp-{tag}-probe2", dict(fine, PROBE2="TRUE")
+        yield f"cmp-{tag}-probe2-drain50", dict(fine, PROBE2="TRUE", SDRAIN="TRUE", DRAINPCT="50")
+        yield f"cmp-{tag}-rxmove-hash", dict(fine, RXMOVE="TRUE", HASH="TRUE")
+    # What closes the stall-shed gap on the minimum set.
+    yield "min+probe2", dict(MIN, PROBE2="TRUE")
+    yield "min+rxmove-hash", dict(MIN, RXMOVE="TRUE", HASH="TRUE")
+    yield "min+probe2+rxmove-hash", dict(MIN, PROBE2="TRUE", RXMOVE="TRUE", HASH="TRUE")
+    yield "cap-stays-min+rxmove-hash", dict(MIN, RXMOVE="TRUE", HASH="TRUE", CAPUNTIL="1000")
     # Setup cost (F11) and the redial storm.
     yield "baseline-setup", SETUP
     yield "all-on-setup", dict(ALL, **SETUP)
