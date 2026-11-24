@@ -62,6 +62,9 @@ impl LatencyFloor {
 
 /// RM2 — the latency at or above which a publisher's own delivery is late.
 pub(super) const LATE_MS: f64 = 300.0;
+/// RM6 — the latency at or above which another source also reads late (the
+/// own-downlink guard).
+pub(super) const OTHER_LATE_MS: f64 = 150.0;
 /// RM2 — the span a reading takes the median over (about one watch tick of
 /// chunks: one late chunk is not a late stream).
 pub(super) const READING_MS: u64 = 250;

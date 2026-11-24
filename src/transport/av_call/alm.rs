@@ -2043,6 +2043,12 @@ impl AlmState {
             }
             return Vec::new();
         }
+        if self.own_downlink_slow(s, &publisher, now) {
+            if self.late_noted.insert(s) {
+                self.label(crate::observability::ALM_LATE_OWN_DOWNLINK);
+            }
+            return Vec::new();
+        }
         // A direct child that is not the spared one may move itself: never
         // a target (two movers onto each other would loop).
         let keep = rxmove::lowest(s, &directs).cloned();
@@ -2055,6 +2061,42 @@ impl AlmState {
         self.log = log;
         act.map(|a| self.action_frames(s, vec![a]))
             .unwrap_or_default()
+    }
+
+    /// RM6 — the own-downlink guard: whether every other source this node
+    /// hears reads late too, so the lateness is this node's own downlink and
+    /// no relay would help.
+    ///
+    /// Transition: observable, the current reading of every other path
+    /// this node hears (median over the last 250 ms); state, `publisher`'s
+    /// stream reads late from it (RM2); action, no move when at least one
+    /// other publisher's stream is heard and every such stream reads ≥
+    /// [`rxmove::OTHER_LATE_MS`], unless a relayed copy of `publisher`'s
+    /// stream reads on time (then this node's downlink is fine); with no
+    /// other publisher heard (a one-publisher room) the guard cannot run
+    /// and the move goes ahead; must never, move when every source is late.
+    /// A relayed copy of `publisher`'s stream never fires the guard: it left
+    /// through the same uplink, so it is late whenever that uplink is. Paths
+    /// from `publisher` (other streams it relays) are left out for the same
+    /// reason.
+    fn own_downlink_slow(&self, s: StreamId, publisher: &str, now: u64) -> bool {
+        let mut others: Option<bool> = None;
+        for ((st, from), r) in &self.readings {
+            if from == publisher {
+                continue;
+            }
+            let Some(l) = r.current(now) else {
+                continue;
+            };
+            if *st == s {
+                if l < rxmove::OTHER_LATE_MS {
+                    return false;
+                }
+                continue;
+            }
+            others = Some(others.unwrap_or(true) && l >= rxmove::OTHER_LATE_MS);
+        }
+        others == Some(true)
     }
 
     /// Every stream this node receives, with its chosen parents.
@@ -3248,6 +3290,62 @@ mod tests {
         }
         assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "spared: {sent:?}");
         assert!(!sends(&sent, "a", false));
+    }
+
+    /// RM6 — observable: `a`'s stream late ≥ 300 ms from `a`, and every
+    /// other source this node hears late ≥ 150 ms; state: as RM2; action: no
+    /// move (it is this node's downlink, and a relay would not help); must
+    /// never: move. With another publisher heard on time the move goes
+    /// ahead, and so it does with no other source at all (the one-publisher
+    /// room). A relayed copy of `a`'s stream rides `a`'s uplink, so late it
+    /// proves nothing; on time it shows this node's downlink is fine.
+    /// Mutation (45.2.0 before RM6): the slow receiver moved for nothing.
+    #[test]
+    fn a_receiver_late_from_every_source_does_not_move() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let (kept, mover, other) = (kids[0], kids[2], kids[1]);
+        for other_late in [true, false] {
+            let (mut n, _) = joined_receiver(mover, &[kept, other]);
+            n.note_publisher(s(5), other);
+            n.note_bound_publisher(s(5), other);
+            // `other` publishes too, heard from it directly: on time first.
+            for step in 0..20u64 {
+                n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+                late_chunk(&mut n, s(1), "a", 9_000 + step, 0);
+                late_chunk(&mut n, s(5), other, step, 0);
+            }
+            let mut sent = Vec::new();
+            for step in 0..100u64 {
+                n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+                late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+                late_chunk(
+                    &mut n,
+                    s(5),
+                    other,
+                    100 + step,
+                    if other_late { 400 } else { 20 },
+                );
+                if step % 50 == 0 {
+                    offers_to(&mut n, &[kept, other]);
+                }
+                if step % 12 == 11 {
+                    let out = n.tick(&[]);
+                    sent.extend(answer_admits_but(&mut n, &out, Some(kept)));
+                    sent.extend(out);
+                }
+            }
+            assert_eq!(
+                sends(&sent, kept, true),
+                !other_late,
+                "other publisher late={other_late}: {sent:?}"
+            );
+            if other_late {
+                assert!(n
+                    .labels
+                    .contains(&crate::observability::ALM_LATE_OWN_DOWNLINK));
+            }
+        }
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────
