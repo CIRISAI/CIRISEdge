@@ -1107,6 +1107,10 @@ pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
 /// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
 /// queue behind the backlog and spend that link's retry budget.
 pub const ALM_OFFER_HELD_BACKLOG: &str = "alm_offer_held:backlog";
+/// G8 — a chunk a settling leg had parked went out on the flusher's retry.
+pub const AV_CHUNK_PARKED_SENT: &str = "av_chunk_parked_sent";
+/// G8 — a parked chunk replaced by a newer one (it never left the process).
+pub const AV_CHUNK_PARKED_REPLACED: &str = "av_chunk_parked_replaced";
 /// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
 /// unshaped links only (Eric 2026-11-06).
 pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
@@ -2984,6 +2988,8 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
     ALM_OFFER_HELD_BACKLOG,
+    AV_CHUNK_PARKED_SENT,
+    AV_CHUNK_PARKED_REPLACED,
     SHAPED_ONLY_NO_MEDIA,
     AV_CALL_ENDED_MEDIA_REFUSED,
     ALM_FORWARDED,

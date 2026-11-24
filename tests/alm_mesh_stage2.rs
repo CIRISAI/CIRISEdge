@@ -3455,6 +3455,54 @@ async fn publish_capped_for(cp: &mut Call, secs: u64, seq0: u64) -> u64 {
     publish_timed_for(cp, secs, seq0).await.0
 }
 
+/// Every frame each of `listeners` hears from `publisher`, counted as it
+/// arrives (a call's frame queue holds 256: read only at the end, a count is
+/// capped there).
+struct FrameCounts {
+    counts: Vec<Arc<AtomicU64>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl FrameCounts {
+    fn read(&self) -> Vec<u64> {
+        self.counts
+            .iter()
+            .map(|c| c.load(Ordering::SeqCst))
+            .collect()
+    }
+}
+
+impl Drop for FrameCounts {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+fn count_frames_from(listeners: &mut [Call], publisher: &str) -> FrameCounts {
+    let mut counts = Vec::new();
+    let mut tasks = Vec::new();
+    for l in listeners.iter_mut() {
+        let mut rx = l.frames().expect("frames");
+        let c = Arc::new(AtomicU64::new(0));
+        let n = Arc::clone(&c);
+        let from = publisher.to_owned();
+        tasks.push(tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if f.publisher == from {
+                    n.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }));
+        counts.push(c);
+    }
+    FrameCounts { counts, tasks }
+}
+
+/// One frame at the 30 Hz these witnesses publish at.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
 /// How long each `publish()` call took: `(max, p95, p50)`.
 #[derive(Debug, Clone, Copy)]
 struct PublishLatency {
@@ -3571,27 +3619,13 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     for l in &listeners {
         wait_legs(l, 3).await;
     }
-    let mut rx: Vec<mpsc::Receiver<ReceivedFrame>> = listeners
-        .iter_mut()
-        .map(|l| l.frames().expect("frames"))
-        .collect();
-    let drain = |rx: &mut Vec<mpsc::Receiver<ReceivedFrame>>, from: &str| {
-        rx.iter_mut()
-            .map(|r| {
-                let mut n = 0u64;
-                while let Ok(f) = r.try_recv() {
-                    if f.publisher == from {
-                        n += 1;
-                    }
-                }
-                n
-            })
-            .collect::<Vec<u64>>()
-    };
+    // Counted as they arrive: each call's frame queue holds 256, and a
+    // count read only at the end is capped there.
+    let heard_of = count_frames_from(&mut listeners, &p.key.key_id);
     // Baseline: the full mesh carries P.
-    let seq = publish_capped_for(&mut cp, 5, 0).await;
+    let (seq, base_lat) = publish_timed_for(&mut cp, 5, 0).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let base = drain(&mut rx, &p.key.key_id);
+    let base = heard_of.read();
     assert!(
         base.iter().all(|n| *n * 10 >= seq * 9),
         "baseline: {base:?} of {seq}"
@@ -3641,12 +3675,17 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     };
     let capped_from = seq;
     let _ = uplink.take_peak();
-    let seq = publish_capped_for(&mut cp, 30, seq).await;
+    let (seq, capped_lat) = publish_timed_for(&mut cp, 30, seq).await;
     sampler.abort();
     let peak = uplink.take_peak();
     let sent = seq - capped_from;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let heard = drain(&mut rx, &p.key.key_id);
+    let heard: Vec<u64> = heard_of
+        .read()
+        .iter()
+        .zip(&base)
+        .map(|(n, b)| n - b)
+        .collect();
     let exhausted: u64 = nodes
         .iter()
         .map(|n| channel_exhausted(&n.metrics))
@@ -3683,6 +3722,16 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     }
     if parents.iter().any(Option::is_none) {
         failed.push("a listener has no parent".to_owned());
+    }
+    // The host's capture loop waits on publish(): one call must never cost
+    // it a frame, capped or not (G8: 45-60 ms a call, and seconds when a
+    // leg redialled, with sends retried under the publisher lock).
+    for (phase, lat) in [("uncapped", base_lat), ("capped", capped_lat)] {
+        if lat.max >= FRAME_INTERVAL {
+            failed.push(format!(
+                "publish() {phase}: {lat:?}, over one frame interval"
+            ));
+        }
     }
     for (i, n) in heard.iter().enumerate() {
         // About the one-copy rate: the uplink carries one copy, so each
@@ -3757,26 +3806,12 @@ async fn a_call_that_starts_on_a_capped_uplink_keeps_every_link() {
     for l in &listeners {
         wait_legs(l, 3).await;
     }
-    let mut rx: Vec<mpsc::Receiver<ReceivedFrame>> = listeners
-        .iter_mut()
-        .map(|l| l.frames().expect("frames"))
-        .collect();
+    let heard_of = count_frames_from(&mut listeners, &p.key.key_id);
     let _ = uplink.take_peak();
-    let sent = publish_capped_for(&mut cp, 20, 0).await;
+    let (sent, lat) = publish_timed_for(&mut cp, 20, 0).await;
     let peak = uplink.take_peak();
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let heard: Vec<u64> = rx
-        .iter_mut()
-        .map(|r| {
-            let mut n = 0u64;
-            while let Ok(f) = r.try_recv() {
-                if f.publisher == p.key.key_id {
-                    n += 1;
-                }
-            }
-            n
-        })
-        .collect();
+    let heard = heard_of.read();
     let exhausted: u64 = nodes
         .iter()
         .map(|n| channel_exhausted(&n.metrics))
@@ -3808,6 +3843,9 @@ async fn a_call_that_starts_on_a_capped_uplink_keeps_every_link() {
     }
     if parents.iter().any(Option::is_none) {
         failed.push("a listener has no parent".to_owned());
+    }
+    if lat.max >= FRAME_INTERVAL {
+        failed.push(format!("publish(): {lat:?}, over one frame interval"));
     }
     for (i, n) in heard.iter().enumerate() {
         if *n * 10 < sent * 7 {

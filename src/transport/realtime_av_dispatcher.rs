@@ -521,6 +521,17 @@ struct OutboundState {
     /// [`MEDIA_IDLE`] restarts at the Channel's floor window (see
     /// [`MEDIA_RAMP`]).
     last_media: Option<std::time::Instant>,
+    /// G8 — the ONE chunk a settling leg refused, sealed at
+    /// `next_link_seq`, waiting for [`AvDispatcher::flush_parked`] (the
+    /// caller's flusher, off the publish path) or the next fan-out. A newer
+    /// chunk replaces it: the replaced one is dropped and counted.
+    parked: Option<ParkedChunk>,
+}
+
+/// G8 — a refused chunk a settling leg keeps for one more try.
+struct ParkedChunk {
+    wire: Vec<u8>,
+    forwarded: bool,
 }
 
 /// One media send: forwarded for another member ([`AvLinkSender::send_media_relayed`])
@@ -555,7 +566,7 @@ pub const CONTROL_SETTLE: std::time::Duration = std::time::Duration::from_millis
 /// retries under the fan-out: this bounds what a C3 frame can cost other legs.
 pub const C3_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 /// CIRISEdge#805 — the pause between retries of a settling leg's chunk.
-const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+pub const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// CIRISEdge#805 item 5 — what one fan-out did on one downstream leg.
 #[derive(Debug)]
@@ -568,6 +579,9 @@ pub enum LegSend {
     Gone,
     /// The send failed (`Congested`, `ChunkTooLarge`, or a send error).
     Failed(AvDispatcherError),
+    /// G8 — a settling leg refused it and keeps it for one more try
+    /// ([`AvDispatcher::flush_parked`]); a newer chunk replaces it.
+    Parked,
 }
 
 /// Wire-driver for realtime A/V publisher / relay / subscriber paths.
@@ -599,6 +613,10 @@ pub struct AvDispatcher {
     /// CIRISEdge#866 — where each retired `(transit key, link_id)` pair's
     /// counter stopped; a re-admission resumes it, never restarts it.
     link_seqs: crate::transport::realtime_av::LinkSeqLedger,
+    /// G8 — parked chunks a newer one replaced, and parked chunks whose
+    /// leg's settle window ended unsent: both never left the process.
+    parked_replaced: u64,
+    parked_dropped: u64,
 }
 
 impl AvDispatcher {
@@ -659,6 +677,7 @@ impl AvDispatcher {
                     policy: ReceiverLayerPolicy::UNCAPPED,
                     settle_until: None,
                     last_media: None,
+                    parked: None,
                 },
             );
         }
@@ -670,6 +689,8 @@ impl AvDispatcher {
             subscribers,
             inbound_links: config.inbound_links,
             link_seqs: crate::transport::realtime_av::LinkSeqLedger::default(),
+            parked_replaced: 0,
+            parked_dropped: 0,
         })
     }
 
@@ -777,7 +798,7 @@ impl AvDispatcher {
     /// per-link state, advances its `link_seq`, and sends.
     async fn fan_out(&mut self, inner: &InnerSealed) -> Result<(), AvDispatcherError> {
         let mut first_err: Option<AvDispatcherError> = None;
-        for (_, leg) in self.fan_out_report(inner, &[], false).await? {
+        for (_, leg) in self.fan_out_report(inner, &[], false, false).await? {
             if let LegSend::Failed(e) = leg {
                 first_err.get_or_insert(e);
             }
@@ -794,7 +815,7 @@ impl AvDispatcher {
         &mut self,
         inner: &InnerSealed,
     ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
-        self.fan_out_report(inner, &[], false).await
+        self.fan_out_report(inner, &[], false, false).await
     }
 
     /// CIRISEdge#805 item 5 — fan a chunk this node RELAYS out to every
@@ -808,7 +829,7 @@ impl AvDispatcher {
         inner: &InnerSealed,
         except: &[PeerKeyId],
     ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
-        self.fan_out_report(inner, except, false).await
+        self.fan_out_report(inner, except, false, true).await
     }
 
     /// Calls cut — [`Self::relay_inner_report`] for a chunk this node
@@ -823,7 +844,7 @@ impl AvDispatcher {
         inner: &InnerSealed,
         except: &[PeerKeyId],
     ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
-        self.fan_out_report(inner, except, true).await
+        self.fan_out_report(inner, except, true, true).await
     }
 
     /// CIRISEdge#805 — send control frames (not chunks) to every downstream
@@ -831,8 +852,9 @@ impl AvDispatcher {
     /// whose messages carry at most `limit` bytes, sent in order. A control
     /// frame takes no outer A/V seal and no `link_seq` (the link seal still
     /// covers it), and no layer policy applies. A congested leg is retried
-    /// briefly; a leg that stays congested gives up the rest of its frames.
-    /// A leg whose link is gone is pruned.
+    /// briefly (under this borrow: only for a caller that must hold the
+    /// publisher, the epoch roll); a leg that stays congested gives up the
+    /// rest of its frames. A leg whose link is gone is pruned.
     pub async fn send_control_report(
         &mut self,
         except: &[PeerKeyId],
@@ -840,6 +862,36 @@ impl AvDispatcher {
     ) -> Vec<(PeerKeyId, LegSend)> {
         const CONGESTED_RETRIES: u32 = 20;
         const CONGESTED_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+        let mut progress = HashMap::new();
+        let mut report = self
+            .send_control_from(except, frames_for, &mut progress)
+            .await;
+        for _ in 0..CONGESTED_RETRIES {
+            if !report
+                .iter()
+                .any(|(_, l)| matches!(l, LegSend::Failed(AvDispatcherError::Congested)))
+            {
+                break;
+            }
+            tokio::time::sleep(CONGESTED_PAUSE).await;
+            report = self
+                .send_control_from(except, frames_for, &mut progress)
+                .await;
+        }
+        report
+    }
+
+    /// G8 — ONE try of [`Self::send_control_report`], resumable: `progress`
+    /// holds how many of each leg's frames already went, so a caller that
+    /// retries a congested leg (after letting the publisher go) sends only
+    /// what is left. A leg whose frames all went reports `Sent`; a leg that
+    /// refused a frame reports `Failed(Congested)` and keeps its place.
+    pub async fn send_control_from(
+        &mut self,
+        except: &[PeerKeyId],
+        frames_for: &(dyn Fn(Option<usize>) -> Vec<Vec<u8>> + Send + Sync),
+        progress: &mut HashMap<PeerKeyId, usize>,
+    ) -> Vec<(PeerKeyId, LegSend)> {
         let mut report = Vec::with_capacity(self.subscribers.len());
         let mut gone = Vec::new();
         for (subscriber, state) in &mut self.subscribers {
@@ -847,26 +899,24 @@ impl AvDispatcher {
                 continue;
             }
             let frames = frames_for(state.sender.message_limit());
+            let done = progress.entry(subscriber.clone()).or_insert(0);
+            if *done >= frames.len() {
+                report.push((subscriber.clone(), LegSend::Sent));
+                continue;
+            }
             state.settle_until = Some(std::time::Instant::now() + CONTROL_SETTLE);
             let mut leg = LegSend::Sent;
-            'frames: for frame in &frames {
-                let mut tries = 0;
-                loop {
-                    match state.sender.send(frame).await {
-                        Ok(()) => break,
-                        Err(AvDispatcherError::Congested) if tries < CONGESTED_RETRIES => {
-                            tries += 1;
-                            tokio::time::sleep(CONGESTED_PAUSE).await;
-                        }
-                        Err(AvDispatcherError::LinkGone(_)) => {
-                            gone.push(subscriber.clone());
-                            leg = LegSend::Gone;
-                            break 'frames;
-                        }
-                        Err(e) => {
-                            leg = LegSend::Failed(e);
-                            break 'frames;
-                        }
+            for frame in &frames[*done..] {
+                match state.sender.send(frame).await {
+                    Ok(()) => *done += 1,
+                    Err(AvDispatcherError::LinkGone(_)) => {
+                        gone.push(subscriber.clone());
+                        leg = LegSend::Gone;
+                        break;
+                    }
+                    Err(e) => {
+                        leg = LegSend::Failed(e);
+                        break;
                     }
                 }
             }
@@ -879,36 +929,96 @@ impl AvDispatcher {
     }
 
     /// ALM stage 2 — send one control frame (C3) to ONE subscriber's leg,
-    /// retrying brief backpressure, and settle the leg for [`C3_SETTLE`] so
-    /// the frame does not cost the chunk behind it. `None` when `subscriber`
-    /// has no leg.
+    /// ONE try, and settle the leg for [`C3_SETTLE`] so the frame does not
+    /// cost the chunk behind it. A congested leg reports
+    /// `Failed(Congested)`: the caller retries with the publisher let go
+    /// (G8: a retry here held every publish). `None` when `subscriber` has
+    /// no leg.
     pub async fn send_control_to(
         &mut self,
         subscriber: &PeerKeyId,
         frame: &[u8],
     ) -> Option<LegSend> {
-        const TRIES: u32 = 5;
-        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
         let state = self.subscribers.get_mut(subscriber)?;
-        let mut tries = 0;
-        loop {
-            match state.sender.send(frame).await {
+        match state.sender.send(frame).await {
+            Ok(()) => {
+                let until = std::time::Instant::now() + C3_SETTLE;
+                state.settle_until = Some(state.settle_until.map_or(until, |u| u.max(until)));
+                Some(LegSend::Sent)
+            }
+            Err(AvDispatcherError::LinkGone(_)) => {
+                self.subscribers.remove(subscriber);
+                Some(LegSend::Gone)
+            }
+            Err(e) => Some(LegSend::Failed(e)),
+        }
+    }
+
+    /// G8 — whether any leg holds a parked chunk.
+    #[must_use]
+    pub fn has_parked(&self) -> bool {
+        self.subscribers.values().any(|s| s.parked.is_some())
+    }
+
+    /// G8 — parked chunks replaced by a newer one, and parked chunks dropped
+    /// when their leg's settle window ended, since the last call.
+    pub fn take_parked_losses(&mut self) -> (u64, u64) {
+        (
+            std::mem::take(&mut self.parked_replaced),
+            std::mem::take(&mut self.parked_dropped),
+        )
+    }
+
+    /// G8 — try every parked chunk once (no waiting): sent, it takes its
+    /// counter; refused while its leg still settles, it stays; refused past
+    /// the settle window, it is dropped and counted. The caller runs this
+    /// off the publish path, every [`SETTLE_RETRY`] while anything is
+    /// parked. Returns what each tried leg did.
+    pub async fn flush_parked(&mut self) -> Vec<(PeerKeyId, LegSend)> {
+        let now = std::time::Instant::now();
+        let mut report = Vec::new();
+        let mut gone = Vec::new();
+        for (subscriber, state) in &mut self.subscribers {
+            let Some(p) = state.parked.take() else {
+                continue;
+            };
+            let sent = send_media_as(state.sender.as_ref(), &p.wire, p.forwarded).await;
+            let leg = match sent {
                 Ok(()) => {
-                    let until = std::time::Instant::now() + C3_SETTLE;
-                    state.settle_until = Some(state.settle_until.map_or(until, |u| u.max(until)));
-                    return Some(LegSend::Sent);
+                    state.next_link_seq = state.next_link_seq.wrapping_add(1);
+                    LegSend::Sent
                 }
-                Err(AvDispatcherError::Congested) if tries < TRIES => {
-                    tries += 1;
-                    tokio::time::sleep(PAUSE).await;
+                Err(AvDispatcherError::Congested)
+                    if state.settle_until.is_some_and(|until| now < until) =>
+                {
+                    state.parked = Some(p);
+                    LegSend::Parked
+                }
+                Err(e @ (AvDispatcherError::Congested | AvDispatcherError::ChunkTooLarge(_))) => {
+                    self.parked_dropped += 1;
+                    LegSend::Failed(e)
                 }
                 Err(AvDispatcherError::LinkGone(_)) => {
-                    self.subscribers.remove(subscriber);
-                    return Some(LegSend::Gone);
+                    gone.push(subscriber.clone());
+                    LegSend::Gone
                 }
-                Err(e) => return Some(LegSend::Failed(e)),
+                Err(e) => {
+                    state.next_link_seq = state.next_link_seq.wrapping_add(1);
+                    LegSend::Failed(e)
+                }
+            };
+            if state
+                .settle_until
+                .is_some_and(|until| std::time::Instant::now() >= until)
+            {
+                state.settle_until = None;
             }
+            report.push((subscriber.clone(), leg));
         }
+        for subscriber in &gone {
+            self.subscribers.remove(subscriber);
+        }
+        report
     }
 
     /// CIRISEdge#805 — mark `subscriber`'s leg SETTLING for
@@ -954,11 +1064,16 @@ impl AvDispatcher {
         self.subscribers.keys().cloned().collect()
     }
 
+    /// `park` (G8): a settling leg's refused chunk is parked for the
+    /// caller's flusher instead of retried here ([`Self::flush_parked`]).
+    /// Off for the plain [`Self::publish_inner`] / [`Self::relay_chunk`]
+    /// callers, which have no flusher: they retry the settle window inline.
     async fn fan_out_report(
         &mut self,
         inner: &InnerSealed,
         except: &[PeerKeyId],
         forwarded: bool,
+        park: bool,
     ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
         // CIRISEdge#805 item 8 — EVERY subscriber is attempted. This
         // loop used to return on the first refusal, so one congested or closed
@@ -997,8 +1112,18 @@ impl AvDispatcher {
                 state.settle_until = Some(state.settle_until.map_or(until, |u| u.max(until)));
             }
             state.last_media = Some(now);
+            let settling = state.settle_until.is_some_and(|until| now < until);
+            // G8 — no waiting here: this is the host's capture loop. A chunk
+            // a settling leg refuses is PARKED (one per leg, the newest),
+            // and the caller's flusher retries it; a parked chunk this one
+            // was sealed over (it shares its counter: neither left the
+            // process) is replaced, and counted.
+            if state.parked.take().is_some() {
+                self.parked_replaced += 1;
+            }
             let mut sent = send_media_as(state.sender.as_ref(), &wire, forwarded).await;
-            while matches!(sent, Err(AvDispatcherError::Congested))
+            while !park
+                && matches!(sent, Err(AvDispatcherError::Congested))
                 && state
                     .settle_until
                     .is_some_and(|until| std::time::Instant::now() < until)
@@ -1006,6 +1131,11 @@ impl AvDispatcher {
                 tokio::time::sleep(SETTLE_RETRY).await;
                 sent = send_media_as(state.sender.as_ref(), &wire, forwarded).await;
             }
+            let settling = settling
+                && park
+                && state
+                    .settle_until
+                    .is_some_and(|until| std::time::Instant::now() < until);
             if state
                 .settle_until
                 .is_some_and(|until| std::time::Instant::now() >= until)
@@ -1013,6 +1143,10 @@ impl AvDispatcher {
                 state.settle_until = None;
             }
             let leg = match sent {
+                Err(AvDispatcherError::Congested) if settling => {
+                    state.parked = Some(ParkedChunk { wire, forwarded });
+                    LegSend::Parked
+                }
                 Ok(()) => {
                     state.next_link_seq = state.next_link_seq.wrapping_add(1);
                     LegSend::Sent
@@ -1188,6 +1322,7 @@ impl AvDispatcher {
                 policy: ReceiverLayerPolicy::UNCAPPED,
                 settle_until: None,
                 last_media: None,
+                parked: None,
             },
         );
         Ok(())
@@ -1384,6 +1519,78 @@ mod tests {
             link_id: name.as_bytes().to_vec(),
             outbound_send: Box::new(RefusingSender { err }),
         }
+    }
+
+    /// A leg that refuses while `busy` is set, else delivers.
+    struct ToggleSender {
+        busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AvLinkSender for ToggleSender {
+        async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            if self.busy.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(AvDispatcherError::Congested);
+            }
+            self.tx
+                .send(bytes.to_vec())
+                .map_err(|e| AvDispatcherError::SendFailed(e.to_string()))
+        }
+    }
+
+    /// G8 — the call's fan-out never waits: a settling leg (a fresh one, in
+    /// its MEDIA_RAMP) that refuses a chunk PARKS it and the fan-out returns
+    /// at once; a newer chunk replaces the parked one (counted), and the
+    /// flusher sends the newest once the leg takes it, at the counter the
+    /// receiver expects.
+    #[tokio::test]
+    async fn a_settling_leg_parks_one_chunk_and_the_fan_out_never_waits() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![AvSubscriberLink {
+            subscriber: "slow".to_owned(),
+            transit_key: [0x33; 32],
+            link_id: b"slow".to_vec(),
+            outbound_send: Box::new(ToggleSender {
+                busy: std::sync::Arc::clone(&busy),
+                tx,
+            }),
+        }]);
+        let t = std::time::Instant::now();
+        let r = d
+            .relay_inner_report(&inner(&dek, 0, 64), &[])
+            .await
+            .expect("report");
+        assert!(matches!(r[0].1, LegSend::Parked), "{r:?}");
+        let r = d
+            .relay_inner_report(&inner(&dek, 1, 64), &[])
+            .await
+            .expect("report");
+        assert!(matches!(r[0].1, LegSend::Parked), "{r:?}");
+        assert!(
+            t.elapsed() < MEDIA_RAMP / 4,
+            "no settle-window wait inside the fan-out: {:?}",
+            t.elapsed()
+        );
+        assert!(d.has_parked());
+        assert_eq!(d.take_parked_losses(), (1, 0), "the older one was replaced");
+        busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        let r = d.flush_parked().await;
+        assert!(matches!(r[..], [(_, LegSend::Sent)]), "{r:?}");
+        assert!(!d.has_parked());
+        let wire = rx.try_recv().expect("the parked chunk went");
+        let sealed = SealedAvChunk::from_bytes(&wire).expect("a chunk");
+        open_av_chunk(&sealed, &[0x33; 32], b"slow", 0, &dek).expect("opens at counter 0");
+        assert_eq!(sealed.chunk_seq, ChunkSeq(1), "the newest one");
+        // The next chunk takes the next counter.
+        d.relay_inner_report(&inner(&dek, 2, 64), &[])
+            .await
+            .expect("report");
+        let wire = rx.try_recv().expect("sent at once");
+        let sealed = SealedAvChunk::from_bytes(&wire).expect("a chunk");
+        assert!(open_av_chunk(&sealed, &[0x33; 32], b"slow", 1, &dek).is_ok());
     }
 
     /// CIRISEdge#805 item 8 — a subscriber whose link is gone is

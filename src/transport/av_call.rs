@@ -1857,6 +1857,9 @@ struct Shared {
     /// ALM C5 — the oldest frame age seen in the inbound queues this window
     /// (ms), for the ladder's `edge:av_queue_age` signal.
     queue_age_ms: AtomicU64,
+    /// G8 — rung when a fan-out parks a chunk: the flusher retries it with
+    /// the publisher lock taken briefly, never inside `publish`.
+    parked_wake: tokio::sync::Notify,
     /// G8 — the legs (by peer) whose oldest unproved Channel message is
     /// backlogged ([`alm::UPLINK_BACKLOG_MS`]): their periodic offers are
     /// held until it is proved.
@@ -2567,6 +2570,7 @@ impl Call {
             own_share_codecs: StdMutex::new(HashMap::new()),
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
+            parked_wake: tokio::sync::Notify::new(),
             backlogged_legs: StdMutex::new(std::collections::HashSet::new()),
             load,
             setup_began: std::time::Instant::now(),
@@ -2610,6 +2614,7 @@ impl Call {
                 Arc::clone(&counts),
             )),
             tokio::spawn(watch_loop(Arc::clone(&shared))),
+            tokio::spawn(flush_parked_loop(Arc::clone(&shared))),
         ];
         reconcile_legs(&shared);
         Ok(Self {
@@ -4003,6 +4008,8 @@ fn leg_outcome(leg: LegSend) -> LegOutcome {
         LegSend::Failed(AvDispatcherError::Congested) => LegOutcome::Congested,
         LegSend::Failed(AvDispatcherError::ChunkTooLarge(_)) => LegOutcome::TooLarge,
         LegSend::Failed(e) => LegOutcome::Failed(e.to_string()),
+        // G8 — not on the wire now; the leg keeps it for one more try.
+        LegSend::Parked => LegOutcome::Congested,
     }
 }
 
@@ -4350,65 +4357,45 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     let link_id = link.link_id;
     let media_ttl = link.sender.media_ttl();
     let leg_inbound = link.inbound;
+    // G8 — the bindings go on the new link BEFORE the publisher lock is
+    // taken: a congested leg waits them out (`send_patiently`, up to the
+    // hello budget), and under the lock that wait held every publish. Under
+    // the lock, what changed meanwhile (a roll, a share, a relayed binding,
+    // CAPS saying v2) is sent too, so no roll lands between the leg's
+    // bindings and the leg joining the roster.
+    let first = leg_binding_wires(shared, member).await;
+    if !send_binding_wires(
+        shared,
+        member,
+        &link.sender,
+        link_id,
+        channel_limit,
+        &first,
+        deadline,
+    )
+    .await
     {
-        // Under the publisher lock, so no roll lands between the binding and
-        // the leg joining the roster: the stream's current binding (and, for a
-        // relay, every binding it holds but the member's own), then the leg.
+        return false;
+    }
+    {
         let mut publisher = shared.publisher.lock().await;
-        // Whether the member's CAPS already came, on the link it dialled
-        // first, and say it takes v2. Then its v2 bindings go here, ahead of
-        // the v1 ones (CC rc18: v2 first), so the framing is known when the
-        // first chunk lands. Read under the publisher lock: CAPS that land
-        // after this read send the v2 bindings themselves
-        // (`send_v2_bindings_to`, which waits for this lock and then finds
-        // the leg).
-        let v2_ok = Shared::lock(&shared.alm).sends_binding_v2_to(member);
-        let camera_live = !shared.primary_ended.load(Ordering::Acquire);
-        let (own_v1, own_v2) = {
-            let k = Shared::lock(&shared.own_key);
-            (Arc::clone(&k.wire), k.wire_v2.clone())
-        };
-        let mut v1: Vec<Arc<Vec<u8>>> = camera_live.then_some(own_v1).into_iter().collect();
-        let mut v2: Vec<Arc<Vec<u8>>> = own_v2
-            .filter(|_| camera_live && v2_ok)
+        let now: Vec<Arc<Vec<u8>>> = leg_binding_wires(shared, member)
+            .await
             .into_iter()
+            .filter(|w| !first.iter().any(|f| f.as_slice() == w.as_slice()))
             .collect();
-        // v45 — and every share's.
-        for share in shared.shares.lock().await.values() {
-            v1.push(Arc::clone(&share.key.wire));
-            v2.extend(share.key.wire_v2.clone().filter(|_| v2_ok));
-        }
-        if shared.relay_on.load(Ordering::Relaxed) {
-            for w in shared.auth.bindings_except(member, v2_ok) {
-                if StreamKeyBinding::version_of(&w)
-                    == Some(crate::transport::av_chunk_auth::BINDING_VERSION_V2)
-                {
-                    v2.push(w);
-                } else {
-                    v1.push(w);
-                }
-            }
-        }
-        let mut wires = v2;
-        wires.append(&mut v1);
-        for wire in &wires {
-            let parts = StreamKeyBinding::parts(wire, Some(channel_limit));
-            if parts.is_empty() {
-                tracing::warn!(
-                    peer = %member,
-                    channel_limit,
-                    "call leg: the link is too small to carry a stream key binding"
-                );
-                let _ = shared.transport.link_teardown(&link_id).await;
-                return false;
-            }
-            for part in &parts {
-                if let Err(e) = send_patiently(&link.sender, part, deadline).await {
-                    tracing::debug!(peer = %member, error = %e, "call leg: binding not sent");
-                    let _ = shared.transport.link_teardown(&link_id).await;
-                    return false;
-                }
-            }
+        if !send_binding_wires(
+            shared,
+            member,
+            &link.sender,
+            link_id,
+            channel_limit,
+            &now,
+            deadline,
+        )
+        .await
+        {
+            return false;
         }
         if let Err(e) = publisher.add_subscriber(AvSubscriberLink {
             subscriber: member.to_owned(),
@@ -4462,6 +4449,77 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         channel_limit,
         "call leg UP: this node's stream rides a keyed link to the member (CIRISEdge#805)"
     );
+    true
+}
+
+/// The stream key bindings a new leg to `member` needs now: v2 first where
+/// the member said it parses v2 (CC rc18), then v1; this stream's (while its
+/// camera is live), every share's, and, as a relay, every binding held but
+/// the member's own.
+async fn leg_binding_wires(shared: &Arc<Shared>, member: &str) -> Vec<Arc<Vec<u8>>> {
+    let v2_ok = Shared::lock(&shared.alm).sends_binding_v2_to(member);
+    let camera_live = !shared.primary_ended.load(Ordering::Acquire);
+    let (own_v1, own_v2) = {
+        let k = Shared::lock(&shared.own_key);
+        (Arc::clone(&k.wire), k.wire_v2.clone())
+    };
+    let mut v1: Vec<Arc<Vec<u8>>> = camera_live.then_some(own_v1).into_iter().collect();
+    let mut v2: Vec<Arc<Vec<u8>>> = own_v2
+        .filter(|_| camera_live && v2_ok)
+        .into_iter()
+        .collect();
+    // v45 — and every share's.
+    for share in shared.shares.lock().await.values() {
+        v1.push(Arc::clone(&share.key.wire));
+        v2.extend(share.key.wire_v2.clone().filter(|_| v2_ok));
+    }
+    if shared.relay_on.load(Ordering::Relaxed) {
+        for w in shared.auth.bindings_except(member, v2_ok) {
+            if StreamKeyBinding::version_of(&w)
+                == Some(crate::transport::av_chunk_auth::BINDING_VERSION_V2)
+            {
+                v2.push(w);
+            } else {
+                v1.push(w);
+            }
+        }
+    }
+    let mut wires = v2;
+    wires.append(&mut v1);
+    wires
+}
+
+/// Send `wires` on a new leg's link, part by part, each waiting out
+/// backpressure until `deadline`. A link too small for a binding, or a part
+/// not sent, tears the link down: `false`.
+async fn send_binding_wires(
+    shared: &Arc<Shared>,
+    member: &str,
+    sender: &crate::transport::realtime_av_runtime::LeviculumAvSender,
+    link_id: [u8; 16],
+    channel_limit: usize,
+    wires: &[Arc<Vec<u8>>],
+    deadline: tokio::time::Instant,
+) -> bool {
+    for wire in wires {
+        let parts = StreamKeyBinding::parts(wire, Some(channel_limit));
+        if parts.is_empty() {
+            tracing::warn!(
+                peer = %member,
+                channel_limit,
+                "call leg: the link is too small to carry a stream key binding"
+            );
+            let _ = shared.transport.link_teardown(&link_id).await;
+            return false;
+        }
+        for part in &parts {
+            if let Err(e) = send_patiently(sender, part, deadline).await {
+                tracing::debug!(peer = %member, error = %e, "call leg: binding not sent");
+                let _ = shared.transport.link_teardown(&link_id).await;
+                return false;
+            }
+        }
+    }
     true
 }
 
@@ -4569,6 +4627,10 @@ fn note_leg_outcomes(
     // accepted is all the uplink meter can know it delivered.
     // Lock order: `leg_ttl`, then `alm`, then `leg_cong` (nothing takes
     // `leg_ttl` while holding `alm`).
+    // G8 — a parked chunk is the flusher's to retry, off the publish path.
+    if report.iter().any(|(_, l)| matches!(l, LegSend::Parked)) {
+        shared.parked_wake.notify_one();
+    }
     let ttl = Shared::lock(&shared.leg_ttl);
     let mut alm = Shared::lock(&shared.alm);
     let mut cong = Shared::lock(&shared.leg_cong);
@@ -4766,13 +4828,20 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
         }
     }
     if let Some(caps) = reply {
-        let _ = shared
-            .publisher
-            .lock()
-            .await
-            .dispatcher_mut()
-            .send_control_to(&peer.to_owned(), &caps)
-            .await;
+        // G8 — a congested leg is retried with the publisher let go.
+        for _ in 0..5 {
+            let sent = shared
+                .publisher
+                .lock()
+                .await
+                .dispatcher_mut()
+                .send_control_to(&peer.to_owned(), &caps)
+                .await;
+            if !matches!(sent, Some(LegSend::Failed(AvDispatcherError::Congested))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     send_alm(shared, out).await;
 }
@@ -5081,21 +5150,37 @@ async fn send_binding_paced(
     except: &[String],
     gap: Option<Duration>,
 ) {
+    // G8 — a congested leg's part is retried (CONTROL_RETRIES, CONTROL_PAUSE
+    // apart) with the publisher let go between tries; the legs that took it
+    // are not sent it again.
+    const CONTROL_RETRIES: u32 = 20;
+    const CONTROL_PAUSE: Duration = Duration::from_millis(10);
     for i in 0.. {
         let more = AtomicBool::new(false);
-        shared
-            .publisher
-            .lock()
-            .await
-            .dispatcher_mut()
-            .send_control_report(except, &|limit| {
-                let part = StreamKeyBinding::parts(wire, limit).into_iter().nth(i);
-                if part.is_some() {
-                    more.store(true, Ordering::Relaxed);
-                }
-                part.into_iter().collect()
-            })
-            .await;
+        let frames_for = |limit: Option<usize>| -> Vec<Vec<u8>> {
+            let part = StreamKeyBinding::parts(wire, limit).into_iter().nth(i);
+            if part.is_some() {
+                more.store(true, Ordering::Relaxed);
+            }
+            part.into_iter().collect()
+        };
+        let mut progress = HashMap::new();
+        for attempt in 0..=CONTROL_RETRIES {
+            let report = shared
+                .publisher
+                .lock()
+                .await
+                .dispatcher_mut()
+                .send_control_from(except, &frames_for, &mut progress)
+                .await;
+            let congested = report
+                .iter()
+                .any(|(_, l)| matches!(l, LegSend::Failed(AvDispatcherError::Congested)));
+            if !congested || attempt == CONTROL_RETRIES {
+                break;
+            }
+            tokio::time::sleep(CONTROL_PAUSE).await;
+        }
         if !more.load(Ordering::Relaxed) {
             return;
         }
@@ -5550,6 +5635,45 @@ async fn announce_attendees(shared: &Arc<Shared>) {
             .unwrap_or_default();
         Shared::lock(&shared.attendee_nodes).extend(nodes);
         shared.emit(CallEvent::AttendeeJoined { key_id });
+    }
+}
+
+/// G8 — retry the chunks settling legs parked, every
+/// [`crate::transport::realtime_av_dispatcher::SETTLE_RETRY`] while any is
+/// parked, each pass one brief hold of the publisher lock (one try per
+/// leg). What a pass replaced or dropped is counted.
+async fn flush_parked_loop(shared: Arc<Shared>) {
+    loop {
+        shared.parked_wake.notified().await;
+        loop {
+            if shared.ended.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::time::sleep(crate::transport::realtime_av_dispatcher::SETTLE_RETRY).await;
+            let (report, more, (replaced, dropped)) = {
+                let mut p = shared.publisher.lock().await;
+                let d = p.dispatcher_mut();
+                let report = d.flush_parked().await;
+                (report, d.has_parked(), d.take_parked_losses())
+            };
+            for (peer, leg) in &report {
+                if matches!(leg, LegSend::Sent) {
+                    shared.count(crate::observability::AV_CHUNK_PARKED_SENT);
+                } else if matches!(leg, LegSend::Gone) {
+                    Shared::lock(&shared.out_legs).remove(peer);
+                    Shared::lock(&shared.alm).on_child_link_down(peer);
+                }
+            }
+            for _ in 0..replaced {
+                shared.count(crate::observability::AV_CHUNK_PARKED_REPLACED);
+            }
+            for _ in 0..dropped {
+                shared.count(crate::observability::AV_CHUNK_DROPPED_CONGESTED);
+            }
+            if !more {
+                break;
+            }
+        }
     }
 }
 
