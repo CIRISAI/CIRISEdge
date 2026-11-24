@@ -850,6 +850,27 @@ impl<P: PeerRef> Admission<P> {
         std::mem::take(&mut self.preempted)
     }
 
+    /// Row E2 — a publisher left with no PRIMARY but holding a standby:
+    /// promote the oldest standby to primary (priced as one) and return it;
+    /// the caller tells it with an ADMIT as primary. `None` when a primary
+    /// stands, there is no standby, or this is not a publisher.
+    pub fn promote_standby_if_no_primary(&mut self) -> Option<P> {
+        if !self.is_root || self.ledger.values().any(|c| c.role == Role::Primary) {
+            return None;
+        }
+        let p = self
+            .ledger
+            .iter()
+            .filter(|(_, c)| c.role == Role::Standby)
+            .min_by_key(|(_, c)| c.order)
+            .map(|(p, _)| p.clone())?;
+        let bps = self.cfg.role_bps(Role::Primary);
+        let c = self.ledger.get_mut(&p).expect("present");
+        c.role = Role::Primary;
+        c.bps = bps;
+        Some(p)
+    }
+
     /// A subscriber left (or its link is gone).
     pub fn release(&mut self, sub: &P) -> bool {
         let drained = self.draining.remove(sub).is_some();

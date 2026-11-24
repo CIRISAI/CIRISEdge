@@ -586,6 +586,27 @@ impl<P: PeerRef> ParentSelector<P> {
             role, was_standby, ..
         } = link
         else {
+            // Row E2, the child's side: the publisher promoted this node's
+            // STANDBY subscription to primary (its last primary was lost).
+            // With no primary of its own, take it as the primary now.
+            if matches!(
+                decision,
+                AdmitDecision::Admit {
+                    role: Role::Primary
+                }
+            ) && link == Link::Standby
+                && self.primary.is_none()
+            {
+                if self.standby.as_ref() == Some(from) {
+                    self.standby = None;
+                }
+                let c = self.cands.get_mut(from).expect("present");
+                c.link = Link::Primary;
+                c.failures = 0;
+                c.meter.restart();
+                self.set_primary(now_ms, from.clone(), log, "promoted by parent");
+                return out;
+            }
             // Stale answer for something we no longer want.
             if matches!(decision, AdmitDecision::Admit { .. }) && !link.subscribed() {
                 out.push(SelectorAction::Unsubscribe {

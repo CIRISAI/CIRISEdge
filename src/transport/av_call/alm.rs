@@ -62,6 +62,46 @@ pub(super) const STALL_PROBE_HOLD_MS: u64 = 10_000;
 /// Row B1b — under a latched stall verdict, how often a member that holds no
 /// commitment here is sent this node's offers (the leg's liveness minimum).
 pub(super) const STALL_NONCHILD_OFFER_MS: u64 = 2_000;
+/// Row B2 — the longest a non-child's offer interval stretches under the
+/// budget (the model accepts ~3.5 s of dead detection on such a leg).
+pub(super) const STALL_NONCHILD_OFFER_MAX_MS: u64 = 3_500;
+/// Row B2 — what one sealed offer costs on the wire beyond its plaintext
+/// (E1 link seal, the Channel and RNS headers), for the budget's arithmetic.
+const OFFER_WIRE_OVERHEAD: usize = 120;
+
+/// Row B2, the transition: latched verdict → this node's periodic control
+/// (its offers) stays within ¼ of what the uplink carries beyond one media
+/// copy (`ceiling − one`, the admission's measured ceiling). Children and
+/// parents keep 1 s (F14a); the non-children's interval stretches from
+/// [`STALL_NONCHILD_OFFER_MS`] up to [`STALL_NONCHILD_OFFER_MAX_MS`] to fit
+/// what is left. Unmeasured: the 2 s minimum.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub(super) fn stall_offer_interval_ms(
+    ceiling_bps: Option<f64>,
+    one_copy_bps: u64,
+    offer_len: usize,
+    keep: usize,
+    rest: usize,
+) -> u64 {
+    let Some(c) = ceiling_bps else {
+        return STALL_NONCHILD_OFFER_MS;
+    };
+    let budget = ((c - one_copy_bps as f64) / 4.0).max(0.0);
+    let bits = ((offer_len + OFFER_WIRE_OVERHEAD) * 8) as f64;
+    let left = budget - keep as f64 * bits;
+    if rest == 0 {
+        return STALL_NONCHILD_OFFER_MS;
+    }
+    if left <= 0.0 {
+        return STALL_NONCHILD_OFFER_MAX_MS;
+    }
+    let ms = (rest as f64 * bits * 1000.0 / left).ceil() as u64;
+    ms.clamp(STALL_NONCHILD_OFFER_MS, STALL_NONCHILD_OFFER_MAX_MS)
+}
 /// G8 slow start — how long a member refused for room still gets the
 /// publisher's chunks: two offer periods, so a child's OFFER has reached it
 /// and it has moved before the bridge ends.
@@ -845,6 +885,34 @@ impl AlmState {
             a.release(&p);
         }
         self.provisional.retain(|(_, c), _| c != peer);
+        self.ensure_own_primaries();
+    }
+
+    /// Row E2 — every own stream with any subscriber keeps a PRIMARY: when
+    /// its last primary is lost by any cause (a link close, an unsubscribe, a
+    /// shed), the oldest standby is promoted at once and told with an ADMIT
+    /// as primary (sent with the next tick's frames); its media resumes
+    /// because it now holds a primary commitment. With no standby, the next
+    /// SUBSCRIBE is admitted whatever the room reads (row S3).
+    fn ensure_own_primaries(&mut self) {
+        let streams: Vec<StreamId> = self.own_admissions().map(|(s, _)| s).collect();
+        for s in streams {
+            let promoted = self
+                .own_admission_mut(s)
+                .and_then(Admission::promote_standby_if_no_primary);
+            if let Some(child) = promoted {
+                self.label(crate::observability::ALM_ADMIT);
+                self.pending_out.push(Outgoing {
+                    to: child,
+                    frame: encode(
+                        s,
+                        &ControlMsg::Decision(AdmitDecision::Admit {
+                            role: Role::Primary,
+                        }),
+                    ),
+                });
+            }
+        }
     }
 
     /// The service tier now.
@@ -1471,6 +1539,7 @@ impl AlmState {
                     if let Some(a) = self.own_admission_mut(stream) {
                         a.release(&p);
                     }
+                    self.ensure_own_primaries();
                 } else if let Some(a) = self.relays.get_mut(&stream) {
                     a.release(&p);
                 }
@@ -1918,13 +1987,26 @@ impl AlmState {
             } else {
                 BTreeSet::new()
             };
+            let nonchild_every = if self.uplink_stall {
+                let keep = c3_legs.iter().filter(|p| children.contains(*p)).count();
+                let rest = c3_legs.len().saturating_sub(keep);
+                stall_offer_interval_ms(
+                    self.own.ceiling_bps(),
+                    self.own_rate.costs().0,
+                    own_frame.len(),
+                    keep,
+                    rest,
+                )
+            } else {
+                OFFER_EVERY_MS
+            };
             for peer in c3_legs {
                 if !self.members.iter().any(|m| m == peer) {
                     continue;
                 }
                 if self.uplink_stall && !children.contains(peer) {
                     let last = self.offered_at.get(peer).copied().unwrap_or(0);
-                    if last != 0 && now.saturating_sub(last) < STALL_NONCHILD_OFFER_MS {
+                    if last != 0 && now.saturating_sub(last) < nonchild_every {
                         continue;
                     }
                 }
@@ -2862,6 +2944,77 @@ mod tests {
         }
         assert!(to_b >= 4, "the child keeps 1 s: {to_b}");
         assert!(to_c <= 2, "a non-child at 2 s: {to_c}");
+    }
+
+    /// Row B2 — the non-children's offer interval fits ¼ of the leftover
+    /// capacity, between 2 s and 3.5 s.
+    #[test]
+    fn the_stall_offer_budget_stretches_non_children_within_bounds() {
+        // A roomy leftover: the 2 s floor.
+        assert_eq!(
+            stall_offer_interval_ms(Some(2_000_000.0), 100_000, 100, 1, 2),
+            2_000
+        );
+        // ~30 kbit/s leftover -> 7.5 kbit/s budget; one kept leg at 1 s
+        // (~1.8 kbit/s) leaves ~5.7 for two others: ~0.6 s, so the floor.
+        assert_eq!(
+            stall_offer_interval_ms(Some(130_000.0), 100_000, 100, 1, 2),
+            2_000
+        );
+        // Many non-children on a thin leftover stretch to the cap.
+        assert_eq!(
+            stall_offer_interval_ms(Some(104_000.0), 100_000, 100, 1, 10),
+            3_500
+        );
+        assert_eq!(stall_offer_interval_ms(None, 100_000, 100, 1, 2), 2_000);
+    }
+
+    /// The ADMIT-as-primary frames in `out`, by recipient.
+    fn primary_admits(out: &[Outgoing]) -> Vec<String> {
+        out.iter()
+            .filter(|o| {
+                matches!(
+                    decode(&o.frame, "a"),
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Decision(AdmitDecision::Admit {
+                            role: Role::Primary
+                        }),
+                        ..
+                    }))
+                )
+            })
+            .map(|o| o.to.clone())
+            .collect()
+    }
+
+    /// Row E2, cause: a link close — the publisher's last primary's leg goes
+    /// while a standby remains: the standby is promoted at once and told.
+    #[test]
+    fn a_lost_primary_link_promotes_the_standby() {
+        let mut a = publisher_with(&["b"]);
+        admit_as(&mut a, "c", Role::Standby);
+        a.on_child_link_down("b");
+        assert_eq!(a.own_children(), vec![("c".to_owned(), Role::Primary)]);
+        assert_eq!(primary_admits(&a.tick(&[])), vec!["c".to_owned()]);
+    }
+
+    /// Row E2, cause: an unsubscribe — the same when the last primary leaves.
+    #[test]
+    fn an_unsubscribing_primary_promotes_the_standby() {
+        let mut a = publisher_with(&["b"]);
+        admit_as(&mut a, "c", Role::Standby);
+        let _ = a.on_control(
+            "b",
+            ControlFrame {
+                stream: s(1),
+                msg: ControlMsg::Unsubscribe {
+                    subscriber: "b".to_owned(),
+                },
+            },
+            10.0,
+        );
+        assert_eq!(a.own_children(), vec![("c".to_owned(), Role::Primary)]);
+        assert_eq!(primary_admits(&a.tick(&[])), vec!["c".to_owned()]);
     }
 
     /// G8 — a stalled uplink with ONE child has nothing to shed: the verdict
