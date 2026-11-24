@@ -148,10 +148,11 @@ const C3_RESEND_BUDGET: Duration = Duration::from_secs(30);
 const C3_RESEND_PAUSE: Duration = Duration::from_millis(25);
 /// ALM C3 — the longest pause between those retries.
 const C3_RESEND_PAUSE_MAX: Duration = Duration::from_millis(250);
-/// ALM C3 — a periodic frame (an OFFER) refused by the link's pacing gate is
-/// tried once more after this (the gate spaces a Channel's sends by
-/// rtt / window; a period's offers to one leg go back to back).
-const OFFER_RETRY_AFTER: Duration = Duration::from_millis(60);
+/// ALM C3 — how long into its period a periodic frame (an OFFER) is retried
+/// against a link that refuses it (the Channel's pacing gate spaces sends by
+/// rtt / window): a quarter of the ~1 s offer period, so a period's offers
+/// never pile onto the next's.
+const OFFER_SEND_WINDOW: Duration = Duration::from_millis(250);
 
 /// The tag of the frame a publisher sends first on its own link, after the
 /// transit KEX: `"CHLO" ‖ version ‖ stream_id[32]`.
@@ -4995,8 +4996,17 @@ fn note_leg_outcomes(
 /// one, else on the reverse direction of the member's link to this node.
 /// Never to a member that has not said it speaks C3.
 async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
+    // A period's OFFERs to one member go in order on its link, each tried
+    // until the link takes it (OFFER_SEND_WINDOW): back to back, the second
+    // met the Channel's pacing gate (rtt / window) and was refused every
+    // period on every leg (rxmove's baseline trace, uncapped).
+    let mut offers: HashMap<String, Vec<alm::Outgoing>> = HashMap::new();
     for o in out {
         if !Shared::lock(&shared.alm).speaks_c3(&o.to) {
+            continue;
+        }
+        if is_periodic(&o.frame) {
+            offers.entry(o.to.clone()).or_default().push(o);
             continue;
         }
         // F14a — no offer is held on any leg, backlogged or not: the ~1 s
@@ -5065,11 +5075,6 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
         if ok {
             Shared::lock(&shared.alm).counts.c3_sent += 1;
             shared.count(crate::observability::ALM_C3_SENT);
-        } else if is_periodic(&o.frame) {
-            // Once more after the pacing gate's interval, then the next
-            // period's offer replaces it.
-            let s = Arc::clone(shared);
-            tokio::spawn(async move { retry_offer_once(&s, o).await });
         } else {
             // Everything else changes state on one side only: it must arrive,
             // and it must not hold up the pump or the watch tick waiting.
@@ -5077,11 +5082,17 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             tokio::spawn(async move { resend_c3(&s, o).await });
         }
     }
+    for (_, frames) in offers {
+        let s = Arc::clone(shared);
+        tokio::spawn(async move { send_offers_paced(&s, frames).await });
+    }
 }
 
 /// Retry a C3 frame a congested link refused, until [`C3_RESEND_BUDGET`]
-/// (shorter than a subscriber's request timeout, so a late answer still
-/// counts). Each try is one send: the publisher lock is never held to wait.
+/// or the peer has no link left. An answer that lands after the
+/// subscriber's request timeout is still read: a stale ADMIT is answered
+/// with an UNSUBSCRIBE, which releases the slot. Each try is one send: the
+/// publisher lock is never held to wait.
 async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
     let deadline = tokio::time::Instant::now() + C3_RESEND_BUDGET;
     let mut pause = C3_RESEND_PAUSE;
@@ -5138,14 +5149,9 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
     Shared::lock(&shared.alm).on_admit_undelivered(&o.to, &o.frame);
 }
 
-/// A periodic OFFER the link refused (its pacing gate, usually): one more try
-/// after [`OFFER_RETRY_AFTER`]; if that fails too, it is counted and the
-/// next period's offer replaces it.
-async fn retry_offer_once(shared: &Arc<Shared>, o: alm::Outgoing) {
-    tokio::time::sleep(OFFER_RETRY_AFTER).await;
-    if shared.ended.load(Ordering::Relaxed) {
-        return;
-    }
+/// One send of a C3 frame to `o.to`: its own leg first, else the reverse
+/// direction of the member's link here.
+async fn try_send_c3(shared: &Arc<Shared>, o: &alm::Outgoing) -> bool {
     let sent = shared
         .publisher
         .lock()
@@ -5153,26 +5159,59 @@ async fn retry_offer_once(shared: &Arc<Shared>, o: alm::Outgoing) {
         .dispatcher_mut()
         .send_control_to(&o.to, &o.frame)
         .await;
-    // Gone, or a leg the dispatcher no longer holds (dial_leg adds it
-    // there before `out_legs`, so this is a real mismatch).
+    // Gone, or a leg the dispatcher no longer holds (dial_leg adds it there
+    // before `out_legs`, so this is a real mismatch).
     if matches!(sent, Some(LegSend::Gone) | None) {
         out_leg_gone(shared, &o.to);
     }
-    let mut ok = matches!(sent, Some(LegSend::Sent));
-    if !ok {
-        let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
-        if let Some(s) = sender {
-            ok = crate::transport::realtime_av_dispatcher::AvLinkSender::send(s.as_ref(), &o.frame)
-                .await
-                .is_ok();
-        }
+    if matches!(sent, Some(LegSend::Sent)) {
+        return true;
     }
-    if ok {
-        Shared::lock(&shared.alm).counts.c3_sent += 1;
-        shared.count(crate::observability::ALM_C3_SENT);
-        shared.count(crate::observability::ALM_C3_RESENT);
-    } else {
-        shared.count(crate::observability::ALM_C3_SEND_FAILED);
+    let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
+    match sender {
+        Some(s) => {
+            crate::transport::realtime_av_dispatcher::AvLinkSender::send(s.as_ref(), &o.frame)
+                .await
+                .is_ok()
+        }
+        None => false,
+    }
+}
+
+/// A period's OFFERs to one member, in order: each is tried from a 1 ms
+/// pause doubling to 25 ms until the link takes it, within
+/// [`OFFER_SEND_WINDOW`] of the period's start (the Channel's pacing gate
+/// frees the link rtt / window after the last send; its window, one proof
+/// later). What is still refused then is counted, and the next period's
+/// offer replaces it.
+async fn send_offers_paced(shared: &Arc<Shared>, frames: Vec<alm::Outgoing>) {
+    let deadline = tokio::time::Instant::now() + OFFER_SEND_WINDOW;
+    for o in frames {
+        let mut pause = Duration::from_millis(1);
+        loop {
+            if shared.ended.load(Ordering::Relaxed) {
+                return;
+            }
+            if try_send_c3(shared, &o).await {
+                Shared::lock(&shared.alm).counts.c3_sent += 1;
+                shared.count(crate::observability::ALM_C3_SENT);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::debug!(
+                    target: "ciris_edge::c3_fail",
+                    node = %shared.own,
+                    peer = %o.to,
+                    kind = crate::transport::realtime_av_runtime::send_diag::kind_of(&o.frame),
+                    why = "offer window spent",
+                    "C3 send failed"
+                );
+                shared.count(crate::observability::ALM_C3_SEND_FAILED);
+                break;
+            }
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_millis(25));
+        }
     }
 }
 

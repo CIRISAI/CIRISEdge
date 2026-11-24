@@ -3645,6 +3645,13 @@ async fn every_pair_keeps_both_legs_uncapped() {
         "every pair has both legs within {SETUP_BOUND:?} of the last join: {setup:?}; timeline {timeline:?}"
     );
     let mut failed: Vec<String> = Vec::new();
+    let c3_failed = |nodes: &[Node]| -> Vec<u64> {
+        nodes
+            .iter()
+            .map(|n| av(&n.metrics, "alm_c3_send_failed"))
+            .collect()
+    };
+    let c3_before = c3_failed(&nodes);
     let mut seq = 0;
     for second in 0..20u64 {
         seq = publish_timed_for(&mut cp, 1, seq).await.0;
@@ -3662,6 +3669,18 @@ async fn every_pair_keeps_both_legs_uncapped() {
                 ));
             }
         }
+    }
+    // Uncapped, no C3 frame is ever given up on: a period's offers to one
+    // member are paced onto its link, not refused by its pacing gate.
+    let c3_after = c3_failed(&nodes);
+    let c3_lost: Vec<u64> = c3_after
+        .iter()
+        .zip(&c3_before)
+        .map(|(a, b)| a.saturating_sub(*b))
+        .collect();
+    eprintln!("[LEGS] C3 frames given up on, per node, over 20 s: {c3_lost:?}");
+    if c3_lost.iter().any(|n| *n > 0) {
+        failed.push(format!("C3 frames given up on, per node: {c3_lost:?}"));
     }
     assert!(
         failed.is_empty(),
