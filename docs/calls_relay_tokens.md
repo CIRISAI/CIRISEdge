@@ -7,7 +7,7 @@ Every token in this file is **frozen for 45.x**. Later releases only add tokens;
 ## Host defaults (the host decides, edge does not)
 
 - `CallOptions::relay: bool` is unchanged. The server passes `true` for member nodes and `false` for canonicals and for a client on a metered or mobile network.
-- Edge adds one rule of its own: **a serve seat never relays call media, audio included**, whatever `relay` says. The lever is `av_call::CANONICAL_AV_FALLBACK = false` on 45.x.
+- Edge adds one rule of its own: **a serve seat never relays call media, audio included**, whatever `relay` says. The rule is applied on every transport the Edge was built with, whichever builder method registered it. A call on a transport that was given no seat set logs an ERROR. The lever is `av_call::CANONICAL_AV_FALLBACK = false` on 45.x.
 
 ## Calls (Rust `Call`, Python `Call`)
 
@@ -52,6 +52,7 @@ The other members see such a node as simply not in the call: no path event names
 - its leg reached this node;
 - its stream or key binding reached this node, directly or through a relay;
 - a call row names its person, mapped to that person's nodes.
+- in a two-person room, the other member always counts. There the direct path is the only way the call can work, so a path event can fire before the other person has joined.
 
 `tried` is a list of `{kind: PathKind, outcome: PathOutcome, attempts, elapsed_ms, knocks_sent, sockets}`. `local_nat` and `peer_nat.report` are `NatReport` dicts: `mapping`, `allocation`, `filtering`, `port_preserving`, `router_mapping`, `family`, `evidence`, `legacy_class`, `measured_at` (ms). `peer_nat` also has `source`. All of these are Diag. `legacy_class` may appear in the "?" panel.
 
