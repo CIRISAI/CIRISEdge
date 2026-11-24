@@ -19661,11 +19661,13 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             ctx.alm_links.forget(&link_id.into_bytes());
             // G8 — the punched interface goes with its link: forget the
             // peer's direct path so its next dial proposes at once.
-            if let Some(peer) = ctx
+            // Bound first: the tracker's std guard must not live across the
+            // path request's await below.
+            let released = ctx
                 .direct_paths
                 .tracker()
-                .link_closed(link_id, std::time::Instant::now())
-            {
+                .link_closed(link_id, std::time::Instant::now());
+            if let Some(peer) = released {
                 tracing::info!(
                     peer = %peer,
                     link = %hex::encode(link_id.as_bytes()),
@@ -19675,6 +19677,45 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 );
                 if let Some(m) = ctx.metrics {
                     m.inc_direct_link(crate::observability::DIRECT_LINK_RELEASED_LINK_CLOSED);
+                }
+                // G8 C — the route to the peer's announced destination rode
+                // the punched interface and is gone with it: the next dial
+                // (the call leg's redial, which proposes the new punch) met
+                // "no route" and its backoff until an announce came back
+                // (14 s measured). Ask for the relayed path now.
+                let dest = ctx.peers.lock().await.get(&peer).map(|r| r.peer.dest_hash);
+                if let Some(dest) = dest {
+                    if let Err(e) = ctx.node.request_path(&dest).await {
+                        tracing::debug!(peer = %peer, error = %e, "path request after a direct-path release not sent");
+                    } else if let Some(m) = ctx.metrics {
+                        m.inc_direct_link(
+                            crate::observability::DIRECT_LINK_RELEASED_PATH_REQUESTED,
+                        );
+                    }
+                }
+                // G8 C — the A/V links this node dialled to the peer rode the
+                // punched interface (a call's scope-derived address answers
+                // only a direct neighbour): they are dead with it, but an
+                // idle one waits out its Channel's retries before anyone
+                // knows (2-10 s measured). Close them now, so the call's leg
+                // redials at once (its redial proposes the new punch); the
+                // peer's own release closes the ones it dialled here.
+                let av_links: Vec<LinkId> = ctx
+                    .av_dialed_peer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .filter(|(_, p)| **p == peer)
+                    .map(|(l, _)| *l)
+                    .collect();
+                for l in av_links {
+                    let closed = ctx.node.close_link(&l).await;
+                    tracing::info!(
+                        peer = %peer,
+                        link = %hex::encode(l.as_bytes()),
+                        closed = ?closed,
+                        "an A/V link on the released punched interface closed with it (G8 C)"
+                    );
                 }
             }
             if pooled {

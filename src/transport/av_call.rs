@@ -2615,6 +2615,7 @@ impl Call {
             )),
             tokio::spawn(watch_loop(Arc::clone(&shared))),
             tokio::spawn(flush_parked_loop(Arc::clone(&shared))),
+            tokio::spawn(redial_on_direct_path(Arc::clone(&shared))),
         ];
         reconcile_legs(&shared);
         Ok(Self {
@@ -4257,6 +4258,57 @@ async fn readdress(shared: &Arc<Shared>, room_epoch: u64, members: &[String]) {
             epoch: room_epoch,
             reason,
         });
+    }
+}
+
+/// G8 C — a member's direct path just came up (a punch, or a re-punch after
+/// the link that held the old one closed): if this node has no leg to it and
+/// is only waiting out a failed dial's backoff, dial now. A leg whose punched
+/// interface went with its link failed its redials while no path stood (the
+/// backoff doubled 1 s → 8 s), and would otherwise wait the rest of it with
+/// the new path already up (CIRISEdge 45.2.0: 15.5 s from close to direct).
+/// A dial in flight is left alone.
+async fn redial_on_direct_path(shared: Arc<Shared>) {
+    use crate::transport::direct_path::DirectPathEvent;
+    let mut events = shared.transport.subscribe_direct_path_events();
+    loop {
+        let peer = match events.recv().await {
+            Ok(DirectPathEvent::Established {
+                peer: Some(peer), ..
+            }) => peer,
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        if shared.ended.load(Ordering::Relaxed) {
+            return;
+        }
+        if !Shared::lock(&shared.members).contains(&peer)
+            || Shared::lock(&shared.out_legs).contains_key(&peer)
+        {
+            continue;
+        }
+        let now = Instant::now();
+        let waiting_backoff = {
+            let mut dialling = Shared::lock(&shared.dialling);
+            // A dial in flight holds its entry an hour ahead; a backoff at
+            // most DIAL_BACKOFF_MAX.
+            let backing_off = dialling
+                .get(&peer)
+                .is_some_and(|until| *until > now && *until <= now + DIAL_BACKOFF_MAX);
+            if backing_off {
+                dialling.remove(&peer);
+            }
+            backing_off
+        };
+        if waiting_backoff {
+            Shared::lock(&shared.backoff).remove(&peer);
+            tracing::debug!(
+                peer = %peer,
+                "call leg: a direct path came up while the leg waited out a dial backoff; dialling now (G8 C)"
+            );
+            shared.count(crate::observability::AV_LEG_REDIAL_ON_DIRECT_PATH);
+            reconcile_legs(&shared);
+        }
     }
 }
 

@@ -1111,6 +1111,9 @@ pub const ALM_OFFER_HELD_BACKLOG: &str = "alm_offer_held:backlog";
 pub const AV_CHUNK_PARKED_SENT: &str = "av_chunk_parked_sent";
 /// G8 — a parked chunk replaced by a newer one (it never left the process).
 pub const AV_CHUNK_PARKED_REPLACED: &str = "av_chunk_parked_replaced";
+/// G8 C — a call leg waiting out a failed dial's backoff dialled at once
+/// because the member's direct path came up.
+pub const AV_LEG_REDIAL_ON_DIRECT_PATH: &str = "av_leg_redial_on_direct_path";
 /// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
 /// unshaped links only (Eric 2026-11-06).
 pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
@@ -1550,6 +1553,9 @@ pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// G8 — a direct path forgotten because its LINK closed (the punched
 /// interface went with it): the next dial proposes at once.
 pub const DIRECT_LINK_RELEASED_LINK_CLOSED: &str = "direct_link_released_link_closed";
+/// G8 C — at a direct path's release, a path request for the peer's
+/// announced destination went out (its route rode the punched interface).
+pub const DIRECT_LINK_RELEASED_PATH_REQUESTED: &str = "direct_link_released_path_requested";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
@@ -2906,6 +2912,7 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_FAILED_PEER_FELL_BACK,
     DIRECT_LINK_LOST,
     DIRECT_LINK_RELEASED_LINK_CLOSED,
+    DIRECT_LINK_RELEASED_PATH_REQUESTED,
     DIRECT_LINK_LEG_FELL_BACK,
     DIRECT_LINK_OFF_PROPOSING_OFF,
     DIRECT_LINK_OFF_NO_FACILITATOR,
@@ -2990,6 +2997,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_OFFER_HELD_BACKLOG,
     AV_CHUNK_PARKED_SENT,
     AV_CHUNK_PARKED_REPLACED,
+    AV_LEG_REDIAL_ON_DIRECT_PATH,
     SHAPED_ONLY_NO_MEDIA,
     AV_CALL_ENDED_MEDIA_REFUSED,
     ALM_FORWARDED,

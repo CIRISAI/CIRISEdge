@@ -1984,6 +1984,13 @@ async fn next_established(
     .ok()
 }
 
+/// G8 C — from a punched link's close to the call leg back on a punched
+/// interface: ONE redial (the identity link over the relayed route asked for
+/// at the release, and its proposal: ~0.45 s measured) plus ONE punch
+/// (~0.86 s) plus the A/V link over it (ms), and the witness's 250 ms poll:
+/// 1.56 s measured. Each step is bounded at about twice what it took.
+const LEG_BACK_BOUND: Duration = Duration::from_secs(3);
+
 /// Whether `call`'s leg to `to` rides a punched interface now.
 fn leg_is_punched(call: &Call, to: &Side) -> bool {
     call.leg_info().iter().any(|l| {
@@ -2041,9 +2048,21 @@ async fn a_punched_link_closed_under_a_call_comes_back_within_seconds() {
         "A's leg to B is back on a punched interface: {:?}",
         call_a.leg_info()
     );
+    let leg_back = closed_at.elapsed();
     eprintln!(
-        "[G8C] link close -> new punched identity link {took:?}; -> call leg punched again {:?}",
-        closed_at.elapsed()
+        "[G8C] link close -> new punched identity link {took:?}; -> call leg punched again {leg_back:?}"
+    );
+    // The leg is back within one redial and one punch (LEG_BACK_BOUND).
+    // Before G8 C (14.5 s and 11.3 s measured): the A/V link on the retired
+    // interface lingered until its Channel exhausted (2-10 s, nothing told
+    // it), and the redial then met "no route" (the relayed route had been
+    // replaced by the punched one and went with it), so its backoff doubled
+    // until an announce came back. Now the release closes the A/V links it
+    // carried and asks for the relayed route at once, and a leg waiting out
+    // a backoff redials as soon as a new direct path is up.
+    assert!(
+        leg_back <= LEG_BACK_BOUND,
+        "the leg came back {leg_back:?} after the close (the direct path {took:?})"
     );
     assert!(
         dl(&p.a.metrics, "direct_link_released_link_closed") >= 1,
