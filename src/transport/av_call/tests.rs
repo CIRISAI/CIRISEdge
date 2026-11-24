@@ -1029,41 +1029,50 @@ fn a_reannounce_skips_backlogged_legs_and_a_stalled_uplink() {
 /// at once as before.
 #[test]
 fn a_stalled_uplink_redials_one_leg_at_a_time() {
+    let g = redial_gate;
     assert_eq!(
-        redial_gate(false, true, 3, false),
+        g(false, true, 3, false, true),
         RedialGate::Dial,
         "unstalled: as before"
     );
     assert_eq!(
-        redial_gate(false, true, 3, true),
+        g(false, true, 3, true, true),
         RedialGate::Dial,
         "publishing, unstalled"
     );
     assert_eq!(
-        redial_gate(true, true, 0, false),
+        g(true, true, 0, false, true),
         RedialGate::Dial,
         "the first setup"
     );
     assert_eq!(
-        redial_gate(true, true, 1, false),
+        g(true, true, 1, false, true),
         RedialGate::Wait,
         "one in flight"
     );
     assert_eq!(
-        redial_gate(true, true, 0, true),
+        g(true, true, 0, true, true),
         RedialGate::Defer,
         "stalled, heard via a relay"
     );
     assert_eq!(
-        redial_gate(false, false, 0, true),
+        g(false, false, 0, true, true),
         RedialGate::Defer,
-        "a silent listener"
+        "a silent listener's redial"
     );
     assert_eq!(
-        redial_gate(false, false, 0, false),
+        g(false, false, 0, false, true),
         RedialGate::Dial,
         "no relay: dial"
     );
+    // A first dial (the call's setup) is never deferred: the merged run left
+    // a silent member's leg undialled while it heard that member relayed.
+    assert_eq!(
+        g(false, false, 0, true, false),
+        RedialGate::Dial,
+        "setup is never deferred"
+    );
+    assert_eq!(g(true, false, 0, true, false), RedialGate::Dial);
 }
 
 /// G8 pacing — a re-announce puts at most one binding part per leg per

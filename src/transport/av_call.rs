@@ -1863,6 +1863,9 @@ struct Shared {
     /// G8 C — members whose direct path came up while a leg dial to them was
     /// in flight: if that dial fails, it is retried at once.
     path_up_mid_dial: StdMutex<std::collections::HashSet<String>>,
+    /// G8 serial redial — members whose leg this node had and lost, not yet
+    /// redialled (a redial may be deferred once; a first dial never is).
+    lost_legs: StdMutex<std::collections::HashSet<String>>,
     /// G8 — re-announce rounds skipped in a row, per leg.
     reannounce_skipped: StdMutex<HashMap<String, u32>>,
     /// G8 pacing — a re-announce is in flight.
@@ -2579,6 +2582,7 @@ impl Call {
             queue_age_ms: AtomicU64::new(0),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
+            lost_legs: StdMutex::new(std::collections::HashSet::new()),
             reannounce_skipped: StdMutex::new(HashMap::new()),
             reannounce_running: AtomicBool::new(false),
             backlogged_legs: StdMutex::new(std::collections::HashSet::new()),
@@ -4345,8 +4349,9 @@ enum RedialGate {
 /// redial at once (the 18.95 s peak).
 /// - verdict latched ∧ legs down → at most ONE setup in flight (the kept
 ///   child first: [`reconcile_legs`] orders it first);
-/// - the member is heard through a relay (every stream it publishes has a
-///   primary other than it) ∧ (verdict latched ∨ this node publishes
+/// - a REDIAL (the leg was had and lost; deferred at most once per loss,
+///   never a first dial) ∧ the member is heard through a relay (every
+///   stream it publishes has a primary other than it) ∧ (verdict latched ∨ this node publishes
 ///   nothing, so the leg would carry no media of its own) → redial deferred
 ///   by [`alm::STALL_PROBE_HOLD_MS`]: a listener that lost its leg to a
 ///   shed publisher pushes no setup through that publisher's queue;
@@ -4356,8 +4361,9 @@ fn redial_gate(
     publishing: bool,
     in_flight: usize,
     heard_through_relay: bool,
+    redial: bool,
 ) -> RedialGate {
-    if heard_through_relay && (stalled || !publishing) {
+    if redial && heard_through_relay && (stalled || !publishing) {
         RedialGate::Defer
     } else if !stalled {
         RedialGate::Dial
@@ -4412,10 +4418,15 @@ fn reconcile_legs(shared: &Arc<Shared>) {
             if dialling.get(&m).is_some_and(|until| *until > now) {
                 continue;
             }
-            match redial_gate(stalled, publishing, in_flight, relayed.contains(&m)) {
+            // A REDIAL only (this node had a leg to `m` and lost it), and
+            // deferred at most once per loss: a first dial (the call's setup)
+            // is never deferred, nor is the retry after the hold.
+            let redial = Shared::lock(&shared.lost_legs).contains(&m);
+            match redial_gate(stalled, publishing, in_flight, relayed.contains(&m), redial) {
                 RedialGate::Dial => {}
                 RedialGate::Wait => continue,
                 RedialGate::Defer => {
+                    Shared::lock(&shared.lost_legs).remove(&m);
                     // Heard through a relay: no reason to push a setup
                     // through this uplink now; try again after the hold.
                     dialling.insert(
@@ -4445,6 +4456,7 @@ fn reconcile_legs(shared: &Arc<Shared>) {
                 dialling.remove(&m);
                 Shared::lock(&s.backoff).remove(&m);
                 Shared::lock(&s.path_up_mid_dial).remove(&m);
+                Shared::lock(&s.lost_legs).remove(&m);
             } else if Shared::lock(&s.path_up_mid_dial).remove(&m) {
                 // G8 C — the member's direct path came up while this dial was
                 // in flight (it started with no path and failed on that):
@@ -5101,6 +5113,7 @@ async fn out_leg_reader(
         .is_some_and(|l| l.link_id != link_id);
     if !replaced {
         Shared::lock(&shared.out_legs).remove(&peer);
+        Shared::lock(&shared.lost_legs).insert(peer.clone());
         let mut a = Shared::lock(&shared.alm);
         a.on_child_link_down(&peer);
         // Row T1 — this node's OWN leg toward a member it receives a stream
