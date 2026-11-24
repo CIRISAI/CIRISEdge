@@ -6328,6 +6328,14 @@ impl ReticulumTransport {
         self.av_sink.set_datagram_handling_delay(delay);
     }
 
+    /// Test seam — every `every`, the Reticulum event loop holds the event in
+    /// hand for `hold` before handling it (a starved host held it 290-530 ms):
+    /// everything queued behind it waits. `every` zero ends it.
+    #[doc(hidden)]
+    pub fn hold_event_loop_for_test(&self, every: Duration, hold: Duration) {
+        self.av_sink.set_loop_hold(every, hold);
+    }
+
     /// v44 LTS test seam — the next decapsulation panics.
     #[doc(hidden)]
     pub fn panic_next_decap_for_test(&self) {
@@ -12407,6 +12415,9 @@ impl ReticulumTransport {
                     };
                     let label = event_label(&event);
                     let began = std::time::Instant::now();
+                    if let Some(hold) = self.av_sink.take_loop_hold() {
+                        tokio::time::sleep(hold).await;
+                    }
                     if matches!(event, NodeEvent::LinkDatagramReceived { .. }) {
                         if let Some(delay) = self.av_sink.datagram_handling_delay() {
                             tokio::time::sleep(delay).await;
