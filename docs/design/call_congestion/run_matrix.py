@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -141,6 +141,34 @@ def scenarios():
     yield "f13-ship-pace5-expire", dict(f13, BINDPACE="5", BINDEXP="TRUE")
     yield "f13-ship-pace5-expire-skip3", dict(f13, BINDPACE="5", BINDEXP="TRUE", BINDSKIP="TRUE")
     yield "f13-ship-pace9-expire-skip3", dict(f13, BINDPACE="9", BINDEXP="TRUE", BINDSKIP="TRUE")
+    # F14: silent listeners (nothing periodic on their leg to P), the
+    # both-sides keep-fresh rule (D1), and tree repair; 2.25x, cap held, the
+    # standby fix in, the re-announce off (F13 handled apart).
+    f14 = dict(SHIP, M="12", RCAP="16", CAPUNTIL="1000", FEED='"fix2"', SILENT="TRUE")
+    # where the verdict latches: the edge test's configuration (no RM yet), and
+    # the shipping set with the re-announce bursts (paced + expiring + skip)
+    f14t = dict(MIN, **on("SS"), INIT="2", HOLDT="100", M="12", RCAP="16", CAPUNTIL="1000",
+                FEED='"fix2"', SILENT="TRUE")
+    yield "f14-test-silent", f14t
+    yield "f14-test-silent-keepfresh", dict(f14t, KEEPFRESH="TRUE")
+    f14b = dict(f14, BINDEVERY="100", BINDPACE="9", BINDEXP="TRUE", BINDSKIP="TRUE")
+    yield "f14-bind-silent", f14b
+    yield "f14-bind-silent-keepfresh", dict(f14b, KEEPFRESH="TRUE")
+    yield "f14-silent", f14
+    yield "f14-silent-keepfresh", dict(f14, KEEPFRESH="TRUE")
+    yield "f14-silent-repair", dict(f14, REPAIR="TRUE")
+    yield "f14-silent-keepfresh-repair", dict(f14, KEEPFRESH="TRUE", REPAIR="TRUE")
+    yield "f14-silent-keepfresh-repair-lift", dict(f14, KEEPFRESH="TRUE", REPAIR="TRUE", CAPUNTIL="50")
+    yield "f14-silent-keepfresh-repair-dead-A", dict(f14, KEEPFRESH="TRUE", REPAIR="TRUE",
+                                                    DEAD='"A"', DEADAT="30")
+    yield "f14-silent-keepfresh-dead-A", dict(f14, KEEPFRESH="TRUE", DEAD='"A"', DEADAT="30")
+    yield "f14-silent-keepfresh-repair-cleanup-dead-A", dict(f14, KEEPFRESH="TRUE", REPAIR="TRUE",
+                                                            CLEANUP="TRUE", DEAD='"A"', DEADAT="30")
+    yield "f14-silent-keepfresh-cleanup-dead-A", dict(f14, KEEPFRESH="TRUE", CLEANUP="TRUE",
+                                                     DEAD='"A"', DEADAT="30")
+    yield "f14-test-silent-keepfresh-cleanup", dict(f14t, KEEPFRESH="TRUE", CLEANUP="TRUE")
+    yield "f14-test-silent-keepfresh-repair-cleanup", dict(f14t, KEEPFRESH="TRUE", REPAIR="TRUE",
+                                                          CLEANUP="TRUE")
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)

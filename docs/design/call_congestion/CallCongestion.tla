@@ -71,6 +71,13 @@ CONSTANTS
                         \* member), "child" (the lowest-ranked of P's direct children,
                         \* exactly), "offer" (the same, as the members' offers show it)
     StallHold,          \* no widening for this long after the last congestion (ticks)
+    SilentListener,     \* F14a: a listener sends nothing periodic on its leg to P
+    KeepFresh,          \* D1 both sides: P never holds per-leg control past OfferEvery,
+                        \* and a listener sends >= 1 fresh message per OfferEvery on its
+                        \* leg to every node it receives from
+    TreeRepair,         \* F14b: no new media on any path for RepairTicks -> re-subscribe
+    AdmitCleanup,       \* an Admit nobody is waiting for is answered by an Unsubscribe
+    RepairTicks,
     BindEvery,          \* F13: P re-announces its stream binding every BindEvery (0: off)
     BindParts,          \* ... as this many Channel messages per leg
     BindSize,           \* ... each this many units (a hybrid-signed part)
@@ -367,7 +374,8 @@ RelayAdmit(S, x, l) ==
     ELSE SendCtrl(S, <<x, l>>, Pay("refuse"))
 
 OnAdmit(S, l, x) ==
-    IF S.pendSub[l] /= x THEN S
+    IF S.pendSub[l] /= x
+    THEN IF AdmitCleanup /\ S.parent[l] /= x THEN SendCtrl(S, <<l, x>>, Pay("unsub")) ELSE S
     ELSE LET old == S.parent[l]
              S1 == [S EXCEPT !.parent[l] = x, !.pendSub[l] = None,
                              !.reparents[l] = @ + 1, !.lastSwitch[l] = S.now,
@@ -613,45 +621,51 @@ LWatch1(S, l, k) ==
                    THEN [S1 EXCEPT !.boUntil[l][S1.pendSub[l]] = S1.now + Backoff,
                                    !.pendSub[l] = None]
                    ELSE S1
-             c == Cands(S2, l)
+             \* TreeRepair: nothing new on any path for RepairTicks while the
+             \* stream is live (P is publishing): drop the parent and look again
+             S2r == IF TreeRepair /\ S2.parent[l] /= None /\ S2.pendSub[l] = None
+                        /\ S2.now - S2.lastNewAt[l] >= RepairTicks /\ Alive(S2, "P")
+                    THEN [S2 EXCEPT !.boUntil[l][S2.parent[l]] = S2.now + Backoff, !.parent[l] = None]
+                    ELSE S2
+             c == Cands(S2r, l)
              \* HashRank: the lowest-ranked MEMBER never moves on late media
              \* (computable by everyone); else P's oldest child (the rank rides
              \* the Admit, a wire addition)
              \* who l believes P's direct children are (itself included when
              \* its own parent is P)
-             believed == IF RankScope = "child" THEN S2.children
-                         ELSE {x \in L : x = l \/ (S2.offerDirect[l][x] /\ S2.now - S2.offerAt[l][x] <= DownSilence)}
+             believed == IF RankScope = "child" THEN S2r.children
+                         ELSE {x \in L : x = l \/ (S2r.offerDirect[l][x] /\ S2r.now - S2r.offerAt[l][x] <= DownSilence)}
              spared == IF RankScope = "member" THEN RankSeq[1]
                        ELSE LET o == SelectSeq(RankSeq, LAMBDA x : x \in believed)
                             IN IF o = <<>> THEN None ELSE o[1]
              first == IF HashRank THEN spared
-                      ELSE LET o == SelectSeq(S2.order, LAMBDA x : x \in S2.children)
+                      ELSE LET o == SelectSeq(S2r.order, LAMBDA x : x \in S2r.children)
                            IN IF o = <<>> THEN None ELSE o[1]
              relays == SelectSeq(c, LAMBDA x : x /= "P")
-         IN IF S2.pendSub[l] = None /\ S2.parent[l] = None /\ c /= <<>>
-            THEN Subscribe(S2, l, Pick(c, k))
+         IN IF S2r.pendSub[l] = None /\ S2r.parent[l] = None /\ c /= <<>>
+            THEN Subscribe(S2r, l, Pick(c, k))
             \* ReceiverMoves: P's media reaches this child late, and it is not
             \* P's first child (the one P keeps; the rank rides the Admit):
             \* move to a relay, keeping P until the relay admits.
-            ELSE IF /\ ReceiverMoves /\ S2.pendSub[l] = None /\ S2.parent[l] = "P"
-                    /\ S2.rxDelay[l] >= RxDelayTicks /\ first /= l /\ relays /= <<>>
+            ELSE IF /\ ReceiverMoves /\ S2r.pendSub[l] = None /\ S2r.parent[l] = "P"
+                    /\ S2r.rxDelay[l] >= RxDelayTicks /\ first /= l /\ relays /= <<>>
                     \* RM6: what another source shows (every other stream this node
                     \* hears carries its own downlink's delay too)
                     /\ ~(OwnDownlinkGuard /\ l = SlowNode /\ 2 * SlowTicks >= RxDelayTicks)
-            THEN Subscribe([S2 EXCEPT !.lateMove[l] = TRUE,
+            THEN Subscribe([S2r EXCEPT !.lateMove[l] = TRUE,
                                       !.slowMoved = @ \/ l = SlowNode], l, relays[Min(k, Len(relays))])
             \* SilenceFailover: the primary delivered nothing for SilentTicks
             \* and another member that hears the stream offers: move to it,
             \* keeping the old parent until the new one admits.
-            ELSE IF /\ SilenceFailover /\ S2.pendSub[l] = None /\ S2.parent[l] /= None
-                    /\ S2.now - S2.lastFromParent[l] >= SilentTicks
-                    /\ SelectSeq(relays, LAMBDA x : x /= S2.parent[l]) /= <<>>
-            THEN LET rs == SelectSeq(relays, LAMBDA x : x /= S2.parent[l])
-                 IN Subscribe(S2, l, rs[Min(k, Len(rs))])
-            ELSE IF /\ S2.pendSub[l] = None /\ S2.parent[l] \notin {None, "P"}
-                    /\ Viable(S2, l, "P") /\ S2.now - S2.lastSwitch[l] >= Dwell
-            THEN Subscribe(S2, l, "P")
-            ELSE S2
+            ELSE IF /\ SilenceFailover /\ S2r.pendSub[l] = None /\ S2r.parent[l] /= None
+                    /\ S2r.now - S2r.lastFromParent[l] >= SilentTicks
+                    /\ SelectSeq(relays, LAMBDA x : x /= S2r.parent[l]) /= <<>>
+            THEN LET rs == SelectSeq(relays, LAMBDA x : x /= S2r.parent[l])
+                 IN Subscribe(S2r, l, rs[Min(k, Len(rs))])
+            ELSE IF /\ S2r.pendSub[l] = None /\ S2r.parent[l] \notin {None, "P"}
+                    /\ Viable(S2r, l, "P") /\ S2r.now - S2r.lastSwitch[l] >= Dwell
+            THEN Subscribe(S2r, l, "P")
+            ELSE S2r
 
 RECURSIVE LWatchOver(_, _, _)
 LWatchOver(S, i, ch) ==
@@ -735,9 +749,12 @@ RECURSIVE OffersOver(_, _)
 OffersOver(S, ns) ==
     IF ns = {} THEN S
     ELSE LET n == CHOOSE n \in ns : TRUE
-             every == IF n = "P" /\ S.stall THEN StallOfferEvery ELSE OfferEvery
+             every == IF n = "P" /\ S.stall /\ ~KeepFresh THEN StallOfferEvery ELSE OfferEvery
+             \* a silent listener offers only to the other listeners (relay
+             \* candidacy), nothing to P, unless KeepFresh (it receives from P)
+             to == IF n /= "P" /\ SilentListener /\ ~KeepFresh THEN Nodes \ {n, "P"} ELSE Nodes \ {n}
              S1 == IF Alive(S, n) /\ S.now - S.lastOffer[n] >= every
-                   THEN OfferLegs([S EXCEPT !.lastOffer[n] = S.now], n, Nodes \ {n})
+                   THEN OfferLegs([S EXCEPT !.lastOffer[n] = S.now], n, to)
                    ELSE S
          IN OffersOver(S1, ns \ {n})
 Offers(S) == Flush(Reannounce(OffersOver(S, Nodes)))
