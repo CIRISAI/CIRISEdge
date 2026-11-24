@@ -1,0 +1,9 @@
+{
+  "name": "run 2: edge capped witness on leviculum c75fdeb01 (per-attempt receipts + #113 hold); edge with the stall verdict",
+  "source": "the brief of 11-23 (F2): first teardown 2.17-2.73 s, the listeners' links toward P first, P sheds to exactly one child too late",
+  "scenario": "pin-c75fdeb01",
+  "first_torn": {"A": [2.17, 2.73], "B": [2.17, 2.73], "C": [2.17, 2.73]},
+  "order": ["A<P", "B<P", "C<P"],
+  "sheds": [2, 2],
+  "note": "per-node values were not recorded in a file this model could read; the ranges are the brief's"
+}

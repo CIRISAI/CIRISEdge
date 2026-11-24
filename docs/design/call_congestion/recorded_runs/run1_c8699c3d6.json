@@ -1,0 +1,13 @@
+{
+  "name": "run 1: edge capped witness on leviculum c8699c3d6 (#113 hold, no per-attempt receipts); edge 45.2.0 with the stall flag, shed at the window",
+  "source": "CIRISAI/leviculum#113 comment 2026-11-24T01:23Z; project_make_the_punch_work.md 11-23 19:45",
+  "scenario": "pin-c8699c3d6",
+  "first_torn": {"P": 1.82, "A": 2.13, "B": 2.13, "C": 1.72},
+  "exhausted": 6,
+  "direct": 0,
+  "relayed": 3,
+  "sheds": 0,
+  "verdicts": [1, 1],
+  "heard_pct": {"A": [15, 30], "B": [15, 30], "C": [15, 30]},
+  "note": "T is not a member and is not modelled; heard 55/56/55 of 265 frames (~21%)"
+}

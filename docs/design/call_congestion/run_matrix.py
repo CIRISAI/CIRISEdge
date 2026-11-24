@@ -35,9 +35,7 @@ ALL_OFF = dict(RPA="FALSE", RTO="FALSE", HOLD="FALSE", SOV="FALSE", RKO="FALSE",
 SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
               SOV="ShedOnVerdict", RKO="RoomKeepsOne", SS="SlowStart",
               RPU="RedialOnPathUp", DRAIN="ShedDrains")
-INVS = ("TypeOK NoSpuriousTeardown KeepsOneChild NeverTwoParents MakeBeforeBreak "
-        "NothingWaitsForever ReparentBound EndParented EndHeard EndFullFanOut "
-        "DeadDetected RecordOutcome")
+INVS = "TypeOK RecordOutcome"   # the properties fold into `bad`, read per terminal state
 BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RCAP="4", CAPAT="10",
             CAPUNTIL="50", HORIZON="100", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
@@ -116,18 +114,31 @@ def tlc(outdir, name, cfgtext, extra=()):
            "-metadir", os.path.join(outdir, name + ".states"),
            os.path.join(outdir, "MCCallCongestion.tla")]
     log = os.path.join(outdir, name + ".log")
-    counts = {}
+    counts, obs = {}, set()
     with open(log, "w") as fh:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 cwd=outdir, text=True, env=env)
+        buf = None
         for line in proc.stdout:
-            m = re.search(r'<<"OUTCOME", "([^"]+)">>', line)
+            # TLC pretty-prints a long value over several lines: join them.
+            if buf is not None or line.lstrip().startswith(('<< "OUTCOME"', '<<"OUTCOME"')):
+                buf = (buf or "") + " " + line.strip()
+                if not line.rstrip().endswith(">>"):
+                    continue
+                line, buf = re.sub(r"\s+", " ", buf).replace("<< ", "<<").replace(" >>", ">>"), None
+            m = re.search(r'<<"OUTCOME", "([^"]+)", \{([^}]*)\}, (\[.*\])>>', line)
             if m:
-                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+                obs.add(m.group(3))
+                bad = ",".join(sorted(x.strip().strip('"') for x in m.group(2).split(",") if x.strip()))
+                key = m.group(1) + (" [" + bad + "]" if bad else "")
+                counts[key] = counts.get(key, 0) + 1
             else:
                 fh.write(line)
         proc.wait()
         fh.write("OUTCOME_COUNTS " + json.dumps(counts) + "\n")
+    # Every distinct observation a terminal state makes (trace_check.py reads it).
+    with open(os.path.join(outdir, name + ".observed.txt"), "w") as fh:
+        fh.write("\n".join(sorted(obs)) + "\n")
     subprocess.run(["rm", "-rf", os.path.join(outdir, name + ".states")])
     return log
 
@@ -135,6 +146,10 @@ def tlc(outdir, name, cfgtext, extra=()):
 def parse_log(log, params):
     t = open(log).read()
     violated = sorted(set(re.findall(r"Invariant (\w+) is violated", t)))
+    for m in re.findall(r"OUTCOME_COUNTS (\{.*\})", t):
+        for k in json.loads(m):
+            if "[" in k:
+                violated = sorted(set(violated) | set(k.split("[")[1].rstrip("]").split(",")))
     temporal = sorted(set(re.findall(r"Temporal propert(?:y|ies) (\w+)? ?(?:is|were) violated", t)))
     if "Temporal properties were violated" in t:
         temporal = temporal or ["(temporal)"]
@@ -299,7 +314,7 @@ def main():
             continue
         if name in results and not only:
             continue
-        log = tlc(outdir, name, cfg_text(params), extra=["-continue"])
+        log = tlc(outdir, name, cfg_text(params), extra=[])
         results[name] = parse_log(log, params)
         json.dump(results, open(resfile, "w"), indent=1)
         r = results[name]

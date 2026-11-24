@@ -135,7 +135,9 @@ VARIABLES
     shedBy, offerAt, offerFwd, offerRoom,
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual,
-    hist                \* the compact history (empty unless TraceOn)
+    hist,               \* the compact history (empty unless TraceOn)
+    choice,             \* this behaviour's choices, fixed at Init (see Choices)
+    bad                 \* the properties this behaviour has violated so far
 
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, dialAt, dialBo, pathAt, children, order,
@@ -143,7 +145,7 @@ vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
           offerFwd, offerRoom, heard, lastHeard, lastFwd, published, torn, dual,
-          hist>>
+          hist, bad, choice>>
 
 ASSUME /\ NL >= 2 /\ RCap >= 1 /\ RFree >= RCap /\ MaxTries >= 1
        /\ CapAt >= 0 /\ Horizon > CapAt /\ Stale > 0 /\ WatchEvery >= 1
@@ -166,7 +168,7 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         reparents |-> reparents, lastSwitch |-> lastSwitch, shedBy |-> shedBy,
         offerAt |-> offerAt, offerFwd |-> offerFwd, offerRoom |-> offerRoom,
         heard |-> heard, lastHeard |-> lastHeard, lastFwd |-> lastFwd,
-        published |-> published, torn |-> torn, dual |-> dual, hist |-> hist]
+        published |-> published, torn |-> torn, dual |-> dual, hist |-> hist, bad |-> bad]
 
 Alive(S, n) == ~(n = DeadNode /\ S.now >= DeadAt)
 
@@ -543,6 +545,66 @@ Dual(S) == [S EXCEPT !.dual = [l \in L |->
                 IF Cardinality({x \in Nodes \ {l} : InLedger(S, x, l)}) > 1
                 THEN @[l] + 1 ELSE 0]]
 
+-----------------------------------------------------------------------------
+(* Derived state, for the properties and the traces. Every property is    *)
+(* written over the state record S, so the runner can also fold them into *)
+(* `bad` (the properties a behaviour has violated so far) and read it at  *)
+(* the terminal states without TLC stopping at the first violation.      *)
+-----------------------------------------------------------------------------
+QDelayS(S) == IF S.backlog = 0 THEN 0 ELSE (S.backlog - 1) \div Rate(S.now)
+AliveLS(S) == {c \in L : Alive(S, c)}
+DirectS(S) == {c \in AliveLS(S) : S.parent[c] = "P"}
+OverS(S) == S.now = Horizon
+
+\* --- Safety ---------------------------------------------------------------
+\* No link is torn down while its peer is alive and reachable (every peer
+\* here is reachable: only P's uplink is slow, nothing is lost).
+NoSpuriousTeardownS(S) == \A t \in S.torn : t.why \in {"exhausted", "stale"} => ~t.peerAlive
+\* A publisher with a subscriber keeps a direct child: no shed leaves zero.
+KeepsOneChildS(S) == ~S.zeroShed
+\* Never two parents: a listener is in two forwarders' ledgers only while a
+\* move is in flight (two ticks on uncapped paths, plus the queue delay when
+\* the old parent is P and the unsubscribe or the shed rides its queue).
+NeverTwoParentsS(S) == \A c \in L : S.dual[c] <= 2 + QDelayS(S)
+\* Make-before-break: a child P shed keeps P's media until it has moved.
+MakeBeforeBreakS(S) == \A c \in AliveLS(S) : S.shedPend[c] /\ S.up[<<"P", c>>] => S.drainTo[c] >= S.now
+\* Every Channel message is proved or its link torn within the held bound.
+NothingWaitsForeverS(S) ==
+    \A l \in Legs : \A i \in 1..Len(S.chan[l]) :
+        S.now - S.chan[l][i].first <= Stale + HeldCap + Wait(MaxTries, Base(SrttCap8))
+\* No oscillation: re-parentings per listener are bounded (the join counts).
+ReparentBoundS(S) == \A c \in L : S.reparents[c] <= MaxReparents
+
+\* --- At the horizon (the terminal states) ---------------------------------
+EndParentedS(S) == OverS(S) => \A c \in AliveLS(S) : S.parent[c] /= None
+EndHeardS(S) == OverS(S) => \A c \in AliveLS(S) : 10 * S.heard[c] >= 7 * S.published
+EndFullFanOutS(S) == (OverS(S) /\ CapUntil + RecoverBy <= Horizon) =>
+                        \A c \in AliveLS(S) : S.parent[c] = "P"
+\* A dead peer is still detected: every link toward it is down at the live
+\* dialer, and every link from it at the live receiver, within the bound
+\* the code already has (an offer period + the retry span at the learned
+\* cap, twice; the stale bound for the receiver side).
+DeadBound == OfferEvery + 2 * Wait(MaxTries, Base(SrttCap8)) + 13 * Base(SrttCap8) + Stale
+DeadDetectedS(S) ==
+    (DeadNode /= None /\ S.now >= DeadAt + DeadBound) =>
+        \A l \in Legs : (l[2] = DeadNode => ~S.up[l]) /\ (l[1] = DeadNode => ~S.peerUp[l])
+
+Bad(S) ==
+    {n \in {"NoSpuriousTeardown", "KeepsOneChild", "NeverTwoParents", "MakeBeforeBreak",
+            "NothingWaitsForever", "ReparentBound", "EndParented", "EndHeard",
+            "EndFullFanOut", "DeadDetected"} :
+        CASE n = "NoSpuriousTeardown" -> ~NoSpuriousTeardownS(S)
+          [] n = "KeepsOneChild" -> ~KeepsOneChildS(S)
+          [] n = "NeverTwoParents" -> ~NeverTwoParentsS(S)
+          [] n = "MakeBeforeBreak" -> ~MakeBeforeBreakS(S)
+          [] n = "NothingWaitsForever" -> ~NothingWaitsForeverS(S)
+          [] n = "ReparentBound" -> ~ReparentBoundS(S)
+          [] n = "EndParented" -> ~EndParentedS(S)
+          [] n = "EndHeard" -> ~EndHeardS(S)
+          [] n = "EndFullFanOut" -> ~EndFullFanOutS(S)
+          [] n = "DeadDetected" -> ~DeadDetectedS(S)}
+
+-----------------------------------------------------------------------------
 LegName(l) == l[1] \o ">" \o l[2]
 Snap(S, T0) ==
     [t |-> S.now, qdelay |-> IF S.backlog = 0 THEN 0 ELSE (S.backlog - 1) \div Rate(S.now),
@@ -566,8 +628,16 @@ Step(S, ch) ==
         S8 == Drain(S7)
         S9 == Dual(S8)
         S10 == IF TraceOn THEN [S9 EXCEPT !.hist = Append(@, Snap(S9, S.torn))] ELSE S9
-    IN [S10 EXCEPT !.now = @ + 1]
+        S11 == [S10 EXCEPT !.now = @ + 1]
+    IN [S11 EXCEPT !.bad = @ \cup Bad(S11)]
 
+\* The environment's and the code's free choices, ONE per behaviour (fixed
+\* at Init, so Next is deterministic and TLC evaluates each tick once): the
+\* room a shed leaves when RoomKeepsOne is off, each listener's tie-break
+\* among equal relays, how long a re-punch takes. Sound for what is checked:
+\* every per-run combination is explored; what it hides is a run in which
+\* the same choice comes out differently at two moments (e.g. one shed
+\* leaves one child and a later one zero).
 Choices == [keep : IF RoomKeepsOne THEN {1} ELSE {0, 1},
             pick : [L -> 1..NPick],
             punch : PunchTimes]
@@ -603,7 +673,8 @@ Init ==
     /\ heard = [c \in L |-> 0] /\ lastHeard = [c \in L |-> -1]
     /\ lastFwd = [c \in L |-> -1] /\ published = 0
     /\ torn = {} /\ dual = [c \in L |-> 0]
-    /\ hist = <<>>
+    /\ hist = <<>> /\ bad = {}
+    /\ choice \in Choices
 
 Assign(S) ==
     /\ now' = S.now /\ fifo' = S.fifo /\ backlog' = S.backlog /\ net' = S.net
@@ -622,69 +693,33 @@ Assign(S) ==
     /\ offerFwd' = S.offerFwd /\ offerRoom' = S.offerRoom /\ heard' = S.heard
     /\ lastHeard' = S.lastHeard /\ lastFwd' = S.lastFwd
     /\ published' = S.published /\ torn' = S.torn /\ dual' = S.dual
-    /\ hist' = S.hist
+    /\ hist' = S.hist /\ bad' = S.bad
 
-Tick == now < Horizon /\ \E ch \in Choices : Assign(Step(Rec, ch))
+Tick == now < Horizon /\ Assign(Step(Rec, choice)) /\ UNCHANGED choice
 
 Next == Tick
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Tick)
 
 -----------------------------------------------------------------------------
-(* Derived state, for the properties and the traces.                       *)
------------------------------------------------------------------------------
-QueueDelay == IF backlog = 0 THEN 0 ELSE (backlog - 1) \div Rate(now)
-AliveL == {c \in L : Alive(Rec, c)}
-Direct == {c \in AliveL : parent[c] = "P"}
-Relayed == {c \in AliveL : parent[c] \notin {None, "P"}}
-Over == now = Horizon
-
------------------------------------------------------------------------------
-(* Safety.                                                                 *)
------------------------------------------------------------------------------
-\* No link is torn down while its peer is alive and reachable (every peer
-\* here is reachable: only P's uplink is slow, nothing is lost).
-NoSpuriousTeardown == \A t \in torn : t.why \in {"exhausted", "stale"} => ~t.peerAlive
-
-\* A publisher with a subscriber keeps a direct child: no shed leaves zero.
-KeepsOneChild == ~zeroShed
-
-\* Never two parents: a listener is in two forwarders' ledgers only while a
-\* move is in flight (one tick on an uncapped path, plus the queue delay
-\* when the old parent is P).
-NeverTwoParents == \A c \in L : dual[c] <= 2 + QueueDelay
-
-\* Make-before-break: a child P shed keeps P's media until it has moved.
-MakeBeforeBreak == \A c \in AliveL : shedPend[c] /\ up[<<"P", c>>] => drainTo[c] >= now
-
-\* Every Channel message is proved or its link torn within the held bound.
-NothingWaitsForever ==
-    \A l \in Legs : \A i \in 1..Len(chan[l]) :
-        now - chan[l][i].first <= Stale + HeldCap + Wait(MaxTries, Base(SrttCap8))
-
-\* No oscillation: re-parentings per listener are bounded (the join counts).
-ReparentBound == \A c \in L : reparents[c] <= MaxReparents
+\* The same properties as state invariants (for cfg INVARIANTS).
+QueueDelay == QDelayS(Rec)
+AliveL == AliveLS(Rec)
+Direct == DirectS(Rec)
+Over == OverS(Rec)
+NoSpuriousTeardown == NoSpuriousTeardownS(Rec)
+KeepsOneChild == KeepsOneChildS(Rec)
+NeverTwoParents == NeverTwoParentsS(Rec)
+MakeBeforeBreak == MakeBeforeBreakS(Rec)
+NothingWaitsForever == NothingWaitsForeverS(Rec)
+ReparentBound == ReparentBoundS(Rec)
+EndParented == EndParentedS(Rec)
+EndHeard == EndHeardS(Rec)
+EndFullFanOut == EndFullFanOutS(Rec)
+DeadDetected == DeadDetectedS(Rec)
 
 TypeOK == /\ now \in 0..Horizon /\ backlog \in Nat
           /\ children \subseteq L /\ parent \in [L -> Nodes \cup {None}]
-
------------------------------------------------------------------------------
-(* At the horizon (the system's terminal states).                          *)
------------------------------------------------------------------------------
-\* Every live listener has a parent at the end.
-EndParented == Over => \A c \in AliveL : parent[c] /= None
-\* Every live listener heard >= 70 % of what P published in the window.
-EndHeard == Over => \A c \in AliveL : 10 * heard[c] >= 7 * published
-\* After the cap lifts, full fan-out is back within RecoverBy.
-EndFullFanOut == (Over /\ CapUntil + RecoverBy <= Horizon) =>
-                    \A c \in AliveL : parent[c] = "P"
-\* A dead peer is still detected: every link to or from it is down at
-\* the live end within the existing bound (one offer period + the retry
-\* span learned at the cap; the stale bound for the peer side).
-DeadBound == OfferEvery + 2 * Wait(MaxTries, Base(SrttCap8)) + 13 * Base(SrttCap8) + Stale
-DeadDetected ==
-    (DeadNode /= None /\ now >= DeadAt + DeadBound) =>
-        \A l \in Legs : (l[2] = DeadNode => ~up[l]) /\ (l[1] = DeadNode => ~peerUp[l])
 
 -----------------------------------------------------------------------------
 (* Liveness (under WF(Tick), on the bounded run: the last state stutters). *)
@@ -693,7 +728,7 @@ EventuallyParented == <>[](\A c \in AliveL : parent[c] /= None)
 EventuallyNothingOutstanding == \A l \in Legs : <>(chan[l] = <<>> \/ ~up[l] \/ Over)
 
 -----------------------------------------------------------------------------
-(* Outcome of a terminal state, for the runner (one line per state).      *)
+(* The terminal states: the outcome and what the behaviour violated.      *)
 -----------------------------------------------------------------------------
 Outcome ==
     LET k == {t \in torn : t.why = "exhausted" /\ t.peerAlive}
@@ -701,8 +736,26 @@ Outcome ==
        ELSE IF \E c \in AliveL : parent[c] = None THEN "Stranded"
        ELSE IF \E c \in AliveL : 10 * heard[c] < 7 * published THEN "Starved"
        ELSE IF Direct = AliveL THEN "FullFanOut"
-       ELSE "OneChildRelayed(" \o ToString(Cardinality(Direct)) \o ")"
-RecordOutcome == Over => PrintT(<<"OUTCOME", Outcome>>)
+       ELSE "Relayed(direct=" \o ToString(Cardinality(Direct)) \o ")"
+\* What a recorded run can be compared with (trace_check.py): per node, the
+\* first tick a leg was torn down AT that node with a cause edge's
+\* `torn_down` counts (exhausted at the dialer, stale at the receiver; -1:
+\* none); the exhausted count; P's direct children and the listeners on a
+\* relay at the end; P's sheds and stall verdicts; heard per listener in
+\* percent of what P published.
+FirstTorn(n) ==
+    LET ts == {t.at : t \in {r \in torn : (r.why = "exhausted" /\ r.leg[1] = n)
+                                         \/ (r.why = "stale" /\ r.leg[2] = n)}}
+    IN IF ts = {} THEN -1 ELSE CHOOSE x \in ts : \A y \in ts : x <= y
+Observed ==
+    [first_torn |-> [n \in Nodes |-> FirstTorn(n)],
+     exhausted |-> Cardinality({r \in torn : r.why = "exhausted"}),
+     direct |-> Cardinality(Direct),
+     relayed |-> Cardinality({c \in AliveL : parent[c] \notin {None, "P"}}),
+     sheds |-> sheds, verdicts |-> verdicts,
+     heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
+\* One line per terminal state: the outcome, the violated set, what is observed.
+RecordOutcome == Over => PrintT(<<"OUTCOME", Outcome, bad, Observed>>)
 
 \* Traced variants: a violation prints the compact history (TraceOn).
 Dump == PrintT(<<"TRACE", hist>>) /\ FALSE
