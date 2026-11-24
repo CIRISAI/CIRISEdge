@@ -146,6 +146,15 @@ pub struct PathChunk {
 
 /// How long an unanswered subscribe waits before it counts as refused.
 pub const REQUEST_TIMEOUT_MS: u64 = 3_000;
+/// Row S3 — a parentless node asks the publisher itself at most this often
+/// (about a stall verdict's latch: a refusal under it is not a reason to
+/// wait longer).
+pub const PUBLISHER_ASK_EVERY_MS: u64 = 2_000;
+/// Row S3 — how many times a node that lost the publisher as its primary
+/// asks it directly before leaving it to the ordinary failover: a bounded
+/// ask (a publisher with primaries refuses; asking forever crowded a
+/// capacity-tight room, the stage-1 sim's t2).
+pub const PUBLISHER_ASKS: u32 = 3;
 
 /// Consecutive offers without room to take over before a standby is replaced.
 pub const STANDBY_NO_ROOM_OFFERS: u32 = 5;
@@ -196,6 +205,12 @@ pub struct ParentSelector<P: PeerRef> {
     parent_changes: u64,
     tiers: BTreeMap<P, Tier>,
     next_r3_probe_ms: u64,
+    /// Row S3 — when the publisher may next be asked by
+    /// [`Self::publisher_fallback`].
+    next_publisher_ask_ms: u64,
+    /// Row S3 — publisher asks left for this loss ([`PUBLISHER_ASKS`]); a
+    /// primary resets it.
+    publisher_asks_left: u32,
     /// Since when this node has had no primary (member-tier R3).
     parentless_since_ms: Option<u64>,
     last_activity_ms: Option<u64>,
@@ -230,6 +245,8 @@ impl<P: PeerRef> ParentSelector<P> {
             parent_changes: 0,
             tiers: BTreeMap::new(),
             next_r3_probe_ms: 0,
+            next_publisher_ask_ms: 0,
+            publisher_asks_left: PUBLISHER_ASKS,
             parentless_since_ms: None,
             last_activity_ms: None,
             activity_since_ms: 0,
@@ -705,6 +722,7 @@ impl<P: PeerRef> ParentSelector<P> {
         log.record(now_ms, &self.me, DecisionKind::Subscribe, Some(&p), 1, why);
         self.last_primary = Some(p.clone());
         self.primary = Some(p);
+        self.publisher_asks_left = PUBLISHER_ASKS;
         self.last_switch_ms = now_ms;
     }
 
@@ -890,6 +908,49 @@ impl<P: PeerRef> ParentSelector<P> {
     /// R3's probe target: the best-scoring member-tier candidate that is
     /// viable in every way but advertised room.
     /// `direct_only`: the stream's publisher alone (a depth-0 offer).
+    /// Row S3, the child's side — the stream's publisher, known from any
+    /// depth-0 offer it ever made, as a primary candidate whatever its health
+    /// (a link down left it Down), its offer's age or a backoff (a refusal
+    /// under a stall verdict is retried after the verdict's latch, not a
+    /// doubling backoff): at most one ask per [`PUBLISHER_ASK_EVERY_MS`].
+    fn publisher_fallback(&self, now_ms: u64) -> Option<P> {
+        // Only for a node whose LOST primary was the publisher itself: at
+        // join the ordinary pick and the publisher's offers do the work, and
+        // a node that lost a relay re-parents in the relays' tree (asking the
+        // publisher for everyone herds onto it).
+        // And only once the ordinary failover has had a request's time
+        // ([`REQUEST_TIMEOUT_MS`]) to find a parent.
+        let parentless_long = self
+            .parentless_since_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) >= REQUEST_TIMEOUT_MS);
+        // Live calls only (`direct_first`, like R1): the stage-1 sim's
+        // capacity-tight worlds (t2) are tuned without it.
+        if !self.cfg.direct_first
+            || now_ms < self.next_publisher_ask_ms
+            || self.last_primary.is_none()
+            || !parentless_long
+            || self.publisher_asks_left == 0
+        {
+            return None;
+        }
+        // The publisher this node was taking the stream from directly (it
+        // lost that link): a node on a relay asks its relays' tree first.
+        let lost = self.last_primary.as_ref()?;
+        self.cands
+            .iter()
+            .find(|(p, c)| {
+                *p == lost
+                    && c.tier == Tier::Member
+                    && c.link == Link::None
+                    && c.eligible
+                    && self.members.contains(p)
+                    && c.offer
+                        .as_ref()
+                        .is_some_and(|o| o.depth == 0 && o.ancestry.is_empty())
+            })
+            .map(|(p, _)| p.clone())
+    }
+
     fn best_member_ignoring_room(&self, now_ms: u64, direct_only: bool) -> Option<P> {
         self.cands
             .iter()
@@ -1208,6 +1269,10 @@ impl<P: PeerRef> ParentSelector<P> {
                     && self.members.contains(s)
                     && now_ms >= c.backoff_until
                     && c.offer.as_ref().is_some_and(|o| o.forwarding)
+                    // Never a parent from inside this node's own subtree: a
+                    // standby taken before the tree moved can be a
+                    // descendant now (its offer's ancestry names this node).
+                    && !c.offer.as_ref().is_some_and(|o| o.ancestry.contains(&self.me))
                     && matches!(
                         c.health.state(),
                         PeerState::Available | PeerState::Degraded | PeerState::Recovering
@@ -1226,6 +1291,14 @@ impl<P: PeerRef> ParentSelector<P> {
                 out.push(self.request(now_ms, &s, Role::Primary, "promote standby", log));
             } else if let Some(p) = self.pick(Role::Primary, now_ms, false, rng) {
                 out.push(self.request(now_ms, &p, Role::Primary, "join", log));
+            } else if let Some(p) = self.publisher_fallback(now_ms) {
+                // Row S3, the child's side: no primary and no viable
+                // candidate → ask the publisher itself, without waiting for
+                // its next offer or for its candidate to revive (it holds the
+                // stream; its admission takes a primary when it has none).
+                self.next_publisher_ask_ms = now_ms + PUBLISHER_ASK_EVERY_MS;
+                self.publisher_asks_left = self.publisher_asks_left.saturating_sub(1);
+                out.push(self.request(now_ms, &p, Role::Primary, "ask publisher", log));
             } else if self.video_unavailable() && now_ms >= self.next_r3_probe_ms {
                 // R3: on the canonical tier, keep ASKING the member tier on a
                 // jittered backoff, even when no member advertises room: a
@@ -1279,6 +1352,11 @@ impl<P: PeerRef> ParentSelector<P> {
             let pc = &self.cands[&p];
             let sc = &self.cands[&s];
             let calm = self.promoting().is_none() && !pending_primary && sc.link == Link::Standby;
+            // Never promote a standby that is now this node's descendant.
+            let looped = sc
+                .offer
+                .as_ref()
+                .is_some_and(|o| o.ancestry.contains(&self.me));
             let depth_ok = !self.has_children
                 || match (pc.offer.as_ref(), sc.offer.as_ref()) {
                     (Some(po), Some(so)) => so.depth <= po.depth,
@@ -1312,6 +1390,7 @@ impl<P: PeerRef> ParentSelector<P> {
                     && self.cands[&p].health.state() == PeerState::Available,
             );
             if calm
+                && !looped
                 && depth_ok
                 && (held || to_direct)
                 && !off_direct
@@ -1785,6 +1864,53 @@ mod tests {
         assert!(matches!(s.primary(), Some(&2 | &3)));
         assert_ne!(s.standby(), Some(&9), "{acts:?}");
         assert!(!s.video_unavailable());
+    }
+
+    /// Row S3 and the loop guard — a node that lost its primary never takes
+    /// a standby or candidate from its own subtree (an offer whose ancestry
+    /// names it), and asks the publisher at once though its candidate is Down.
+    #[test]
+    fn a_parentless_node_never_takes_its_own_descendant_and_asks_the_publisher() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.direct_first = true;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), true);
+        s.set_members([1u32, 2, 3]);
+        // 2 publishes; 3 relays it (depth 1 under 2).
+        let relay = |anc: Vec<u32>| Offer {
+            from: 3,
+            depth: u8::try_from(anc.len()).unwrap_or(1),
+            ancestry: anc,
+            headroom_bps: 4 * cfg.stream_bps,
+            forwarder_headroom_bps: 4 * cfg.stream_bps,
+            upstream_latency_ms: 0,
+            forwarding: true,
+        };
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        let _ = drive(&mut s, &cfg, 0, 10_000, &[(2, 4, 20.0)]);
+        s.on_offer(10_000, relay(vec![2]), 20.0, &mut log);
+        let _ = drive(&mut s, &cfg, 10_000, 20_000, &[(2, 4, 20.0)]);
+        assert_eq!(s.primary(), Some(&2));
+        // The tree moved: 3 is now UNDER this node (its ancestry names 1).
+        s.on_offer(20_000, relay(vec![2, 1]), 20.0, &mut log);
+        s.on_link_down(20_100, &2, &mut log);
+        let mut asked: Vec<(u32, Role)> = Vec::new();
+        for k in 0..24u64 {
+            let t = 20_250 + k * 250;
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    asked.push((parent, role));
+                }
+            }
+        }
+        assert!(
+            !asked.iter().any(|(p, r)| *p == 3 && *r == Role::Primary),
+            "never a primary from its own subtree: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|(p, r)| *p == 2 && *r == Role::Primary),
+            "the publisher is asked at once, Down or not: {asked:?}"
+        );
     }
 
     /// A member with no parent and no candidate advertising room still asks

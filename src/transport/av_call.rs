@@ -137,10 +137,21 @@ pub const MEDIA_STALE_BUDGET: Duration = Duration::from_millis(800);
 const LEG_SHED_AFTER: u32 = 3;
 /// ALM C5 — consecutive clean sends before a shed leg is restored.
 const LEG_RESTORE_AFTER: u32 = 50;
-/// ALM C3 — how long a must-arrive frame is retried against a congested link.
-const C3_RESEND_BUDGET: Duration = Duration::from_secs(2);
-/// ALM C3 — the pause between those retries.
+/// ALM C3 — how long a must-arrive frame (an answer: admit, refuse, shed,
+/// unsubscribe; or a subscribe) is retried against a congested link while
+/// the peer still has a link here. Two seconds lost P's ADMITs on a reverse
+/// in-link whose Channel paced them off (rxmove's come-back trace): an answer
+/// is never dropped while it can still go.
+const C3_RESEND_BUDGET: Duration = Duration::from_secs(30);
+/// ALM C3 — the first pause between those retries; it doubles to
+/// [`C3_RESEND_PAUSE_MAX`].
 const C3_RESEND_PAUSE: Duration = Duration::from_millis(25);
+/// ALM C3 — the longest pause between those retries.
+const C3_RESEND_PAUSE_MAX: Duration = Duration::from_millis(250);
+/// ALM C3 — a periodic frame (an OFFER) refused by the link's pacing gate is
+/// tried once more after this (the gate spaces a Channel's sends by
+/// rtt / window; a period's offers to one leg go back to back).
+const OFFER_RETRY_AFTER: Duration = Duration::from_millis(60);
 
 /// The tag of the frame a publisher sends first on its own link, after the
 /// transit KEX: `"CHLO" ‖ version ‖ stream_id[32]`.
@@ -4941,8 +4952,10 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             Shared::lock(&shared.alm).counts.c3_sent += 1;
             shared.count(crate::observability::ALM_C3_SENT);
         } else if is_periodic(&o.frame) {
-            // The next offer replaces it.
-            shared.count(crate::observability::ALM_C3_SEND_FAILED);
+            // Once more after the pacing gate's interval, then the next
+            // period's offer replaces it.
+            let s = Arc::clone(shared);
+            tokio::spawn(async move { retry_offer_once(&s, o).await });
         } else {
             // Everything else changes state on one side only: it must arrive,
             // and it must not hold up the pump or the watch tick waiting.
@@ -4957,8 +4970,16 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
 /// counts). Each try is one send: the publisher lock is never held to wait.
 async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
     let deadline = tokio::time::Instant::now() + C3_RESEND_BUDGET;
+    let mut pause = C3_RESEND_PAUSE;
     while tokio::time::Instant::now() < deadline && !shared.ended.load(Ordering::Relaxed) {
-        tokio::time::sleep(C3_RESEND_PAUSE).await;
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(C3_RESEND_PAUSE_MAX);
+        // No link to the peer any more: nothing can carry it.
+        let has_link = Shared::lock(&shared.out_legs).contains_key(&o.to)
+            || Shared::lock(&shared.in_senders).contains_key(&o.to);
+        if !has_link {
+            break;
+        }
         let sent = shared
             .publisher
             .lock()
@@ -4996,6 +5017,39 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
     shared.count(crate::observability::ALM_C3_SEND_FAILED);
     // An ADMIT nobody heard holds a slot for nothing: release it.
     Shared::lock(&shared.alm).on_admit_undelivered(&o.to, &o.frame);
+}
+
+/// A periodic OFFER the link refused (its pacing gate, usually): one more try
+/// after [`OFFER_RETRY_AFTER`]; if that fails too, it is counted and the
+/// next period's offer replaces it.
+async fn retry_offer_once(shared: &Arc<Shared>, o: alm::Outgoing) {
+    tokio::time::sleep(OFFER_RETRY_AFTER).await;
+    if shared.ended.load(Ordering::Relaxed) {
+        return;
+    }
+    let sent = shared
+        .publisher
+        .lock()
+        .await
+        .dispatcher_mut()
+        .send_control_to(&o.to, &o.frame)
+        .await;
+    let mut ok = matches!(sent, Some(LegSend::Sent));
+    if !ok {
+        let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
+        if let Some(s) = sender {
+            ok = crate::transport::realtime_av_dispatcher::AvLinkSender::send(s.as_ref(), &o.frame)
+                .await
+                .is_ok();
+        }
+    }
+    if ok {
+        Shared::lock(&shared.alm).counts.c3_sent += 1;
+        shared.count(crate::observability::ALM_C3_SENT);
+        shared.count(crate::observability::ALM_C3_RESENT);
+    } else {
+        shared.count(crate::observability::ALM_C3_SEND_FAILED);
+    }
 }
 
 /// One C3 frame from `peer`. A dialler hearing the responder's CAPS on its
