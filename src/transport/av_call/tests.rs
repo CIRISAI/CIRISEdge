@@ -1070,3 +1070,25 @@ fn a_reannounce_sends_one_part_per_leg_per_second() {
     let per_s = part * legs * 1_000 / REANNOUNCE_PART_GAP.as_millis() as u64;
     assert!(per_s * 8 * 100 / 127_000 < 3 * 8, "{per_s} B/s");
 }
+
+/// G8 — a relayed periodic binding repeat goes only to this node's
+/// children of the stream, and to none of them under a stall verdict or on
+/// a backlogged leg.
+#[test]
+fn a_relayed_binding_repeat_goes_only_to_children() {
+    let legs: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+    let children: Vec<String> = vec!["b".into()];
+    let none = std::collections::HashSet::new();
+    assert_eq!(
+        repeat_binding_skips(&legs, &children, false, &none),
+        vec!["a".to_owned(), "c".to_owned()]
+    );
+    assert_eq!(repeat_binding_skips(&legs, &children, true, &none), legs);
+    let b: std::collections::HashSet<String> = ["b".to_owned()].into_iter().collect();
+    assert_eq!(repeat_binding_skips(&legs, &children, false, &b), legs);
+    assert_eq!(
+        repeat_binding_skips(&legs, &[], false, &none),
+        legs,
+        "no children: nobody"
+    );
+}

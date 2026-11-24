@@ -5307,8 +5307,30 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
             // Before the chunks it keys, which this pump forwards next.
             send_binding_paced(shared, &wire, &except, None).await;
         } else {
-            // A publisher's periodic re-send passing through: never in the
-            // way of the chunks queued behind it on this pump.
+            // A publisher's periodic re-send passing through (a repair copy
+            // of a binding every leg already got when it was installed or
+            // set up). The transition: forward it only to this node's
+            // CHILDREN of that stream (the members it forwards the stream
+            // to), never to a leg the re-announce rule holds (uplink stall
+            // verdict, or the leg backlogged). Forwarding every member's
+            // repeat to every other leg made a relaying publisher push each
+            // listener's ~7 KB of bindings through its own capped uplink
+            // every 10 s: the binding_part term of the capped witness's
+            // egress (20-61 kbit/s), the queue that kept growing.
+            let children: Vec<String> = Shared::lock(&shared.alm)
+                .relay_children(binding.stream)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let stalled = Shared::lock(&shared.alm).uplink_stalled();
+            let backlogged = Shared::lock(&shared.backlogged_legs).clone();
+            let legs = shared
+                .publisher
+                .lock()
+                .await
+                .dispatcher_mut()
+                .subscriber_ids();
+            except.extend(repeat_binding_skips(&legs, &children, stalled, &backlogged));
             let s = Arc::clone(shared);
             tokio::spawn(async move {
                 send_binding_paced(&s, &wire, &except, Some(REANNOUNCE_PART_GAP)).await;
@@ -5439,6 +5461,21 @@ async fn reannounce(shared: &Arc<Shared>) {
     for w in &v1 {
         send_binding_paced(shared, w, &held, Some(REANNOUNCE_PART_GAP)).await;
     }
+}
+
+/// G8 — the legs a relayed periodic binding repeat skips: every leg that is
+/// not this node's child for the stream, and every leg while the uplink
+/// stall verdict holds or the leg is backlogged.
+fn repeat_binding_skips(
+    legs: &[String],
+    children: &[String],
+    stalled: bool,
+    backlogged: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    legs.iter()
+        .filter(|l| !children.contains(*l) || stalled || backlogged.contains(*l))
+        .cloned()
+        .collect()
 }
 
 /// G8 — at most this many re-announce rounds in a row are skipped on one

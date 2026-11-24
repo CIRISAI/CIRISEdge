@@ -1335,7 +1335,7 @@ pub mod send_diag {
     use std::sync::{Mutex, OnceLock};
 
     static ON: AtomicBool = AtomicBool::new(false);
-    type Map = HashMap<([u8; 16], &'static str), (u64, u64)>;
+    type Map = HashMap<(usize, [u8; 16], &'static str), (u64, u64)>;
     static MAP: OnceLock<Mutex<Map>> = OnceLock::new();
 
     /// Start counting.
@@ -1344,7 +1344,7 @@ pub mod send_diag {
     }
 
     /// Record one send.
-    pub fn note(link: [u8; 16], kind: &'static str, bytes: usize, ok: bool) {
+    pub fn note(node: usize, link: [u8; 16], kind: &'static str, bytes: usize, ok: bool) {
         if !ON.load(Ordering::Relaxed) {
             return;
         }
@@ -1352,7 +1352,7 @@ pub mod send_diag {
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let e = m.entry((link, kind)).or_insert((0, 0));
+        let e = m.entry((node, link, kind)).or_insert((0, 0));
         if ok {
             e.0 += bytes as u64;
         } else {
@@ -1360,14 +1360,16 @@ pub mod send_diag {
         }
     }
 
-    /// `(link, kind, bytes sent, bytes refused)` so far.
+    /// `(link, kind, bytes sent, bytes refused)` so far, for the node whose
+    /// transport tag is `node` (`ReticulumTransport::send_diag_tag`).
     #[must_use]
-    pub fn snapshot() -> Vec<([u8; 16], &'static str, u64, u64)> {
+    pub fn snapshot(node: usize) -> Vec<([u8; 16], &'static str, u64, u64)> {
         MAP.get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .map(|((l, k), (s, r))| (*l, *k, *s, *r))
+            .filter(|((n, _, _), _)| *n == node)
+            .map(|((_, l, k), (s, r))| (*l, *k, *s, *r))
             .collect()
     }
 
@@ -1826,6 +1828,7 @@ mod leviculum_link {
             {
                 Ok(_sequence) => {
                     crate::transport::realtime_av_runtime::send_diag::note(
+                        std::sync::Arc::as_ptr(&self.seals) as usize,
                         self.link_id.into_bytes(),
                         "media_datagram",
                         sealed.len(),
@@ -1921,6 +1924,7 @@ mod leviculum_link {
                 None => handle.try_send(&sealed).await,
             };
             crate::transport::realtime_av_runtime::send_diag::note(
+                std::sync::Arc::as_ptr(&self.seals) as usize,
                 self.link_id.into_bytes(),
                 if media {
                     "media_channel"
