@@ -126,6 +126,8 @@ mod alm;
 pub mod frame;
 #[path = "av_call/legs.rs"]
 mod legs;
+#[path = "av_call/rxmove.rs"]
+mod rxmove;
 pub use alm::{AlmCounts, AlmParents, RelayedTo, CANONICAL_AV_FALLBACK};
 
 /// ALM C5 — media older than this in the inbound queue is dropped by age

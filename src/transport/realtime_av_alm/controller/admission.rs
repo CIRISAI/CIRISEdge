@@ -79,6 +79,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sha2::{Digest, Sha256};
+
 use super::decision_log::{DecisionKind, DecisionLog};
 use super::path_meter::EgressWindow;
 use super::{
@@ -223,7 +225,39 @@ pub struct Admission<P: PeerRef> {
     probe_hold_until_ms: u64,
     /// G8 slow start ([`Self::set_slow_start`]).
     slow_start: bool,
+    /// N4 — the probe backoff ([`Self::set_probe_backoff`]).
+    probe_backoff: bool,
+    /// N4 — failed probes, at most [`PROBE_FAILS_MAX`]: each doubles the wait
+    /// before the next widening.
+    probe_fails: u32,
+    /// N4 — the last congestion or widening, and whether it was a widening.
+    probe_event: Option<(u64, bool)>,
+    /// RM4 — the stream id a shed ranks by ([`Self::set_shed_rank`]).
+    shed_rank: Option<[u8; 32]>,
 }
+
+/// RM4 — a member's rank on a stream: the first eight bytes (big-endian) of
+/// sha256(stream id ‖ the member's canonical encoding, [`PeerRef::encode`]).
+/// Every member computes the same order from what it already holds, so the
+/// child a publisher's stall shed keeps ([`Admission::set_shed_rank`]) is
+/// the child the receivers spare, with nothing on the wire. Deliberately
+/// unlike the join order.
+#[must_use]
+pub fn hash_rank<P: PeerRef>(stream: &[u8; 32], member: &P) -> u64 {
+    let mut enc = Vec::new();
+    member.encode(&mut enc);
+    let d = Sha256::new()
+        .chain_update(stream)
+        .chain_update(&enc)
+        .finalize();
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&d[..8]);
+    u64::from_be_bytes(b)
+}
+
+/// N4 — the most failed probes the backoff counts (the wait tops out at
+/// 2 windows × 2^2).
+pub const PROBE_FAILS_MAX: u32 = 2;
 
 impl<P: PeerRef> Admission<P> {
     /// The room roster (membership gate). Fail-closed: until set, and for
@@ -284,6 +318,10 @@ impl<P: PeerRef> Admission<P> {
             draining: BTreeMap::new(),
             probe_hold_until_ms: 0,
             slow_start: false,
+            probe_backoff: false,
+            probe_fails: 0,
+            probe_event: None,
+            shed_rank: None,
         }
     }
 
@@ -386,6 +424,99 @@ impl<P: PeerRef> Admission<P> {
     pub fn hold_probe(&mut self, until_ms: u64) {
         self.probe_hold_until_ms = self.probe_hold_until_ms.max(until_ms);
         self.probe_bps = self.probe_bps.min(self.cfg.stream_bps as f64);
+    }
+
+    /// N4 — the probe backoff (`docs/design/call_congestion`, rows N4 and
+    /// ProbeBackoff). Off by default (the stage-1 sim's worlds are tuned
+    /// without it); the live call's publisher turns it on.
+    ///
+    /// Transition: observable, an egress window closing clean; state, a
+    /// widening is due (the demand step, or the slow-start probe doubling);
+    /// action, widen only once 2 windows × 2^fails have passed since the last
+    /// congestion or widening, fails ≤ [`PROBE_FAILS_MAX`]: a congestion that
+    /// follows a widening before the next one (the probe failed) and a direct
+    /// child's departure ([`Self::on_departure`]) step fails up, a widening
+    /// that comes after one that held steps it down; must never, widen sooner.
+    /// Without it a publisher under a permanent cap re-parents its children
+    /// for ever (probe, late, leave, repeat).
+    pub fn set_probe_backoff(&mut self, on: bool) {
+        self.probe_backoff = on;
+    }
+
+    /// RM4 — shed by rank on `stream` instead of LIFO by admission.
+    ///
+    /// Transition: observable, a window whose limit is below the
+    /// commitments (an uplink-stall verdict, a measured ceiling); state, the
+    /// ledger; action, shed standbys first, then primaries, each highest
+    /// [`hash_rank`] first, so the LOWEST-ranked direct child is the one
+    /// kept; must never, keep a different child than the receivers spare
+    /// (they rank the same way), or take the last primary for a standby.
+    /// `None`: LIFO (the default, and every relay's).
+    pub fn set_shed_rank(&mut self, stream: Option<[u8; 32]>) {
+        self.shed_rank = stream;
+    }
+
+    /// RM5 — a direct child left while this node's stream is live: read it
+    /// as congestion (the model's late departure, `DepartureHolds`).
+    ///
+    /// Transition: observable, a primary child's UNSUBSCRIBE (the caller
+    /// checks it was a primary in the ledger, not one being shed, and that
+    /// the stream is live, and has released it); state, the children left;
+    /// action, room = those children (the ceiling is set so the hard limit
+    /// is what they commit), congested now, and the probe backoff steps up
+    /// one; must never, widen sooner than 2 windows × 2^fails after it.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn on_departure(&mut self, now_ms: u64, log: &mut DecisionLog) {
+        let per = self.class.fraction.unwrap_or(1.0);
+        let room = self.committed_bps() as f64
+            + self.cfg.reserve_bps as f64
+            + self.external_committed as f64;
+        let c = room / per;
+        self.ceiling_bps = Some(c);
+        self.clean_streak = 0;
+        self.last_congested_ms = now_ms;
+        self.note_congestion(now_ms, true);
+        #[allow(clippy::cast_possible_truncation)]
+        log.record(
+            now_ms,
+            &self.me,
+            DecisionKind::Ceiling,
+            None,
+            c as i64,
+            "departure",
+        );
+    }
+
+    /// N4 — failed probes counted now.
+    #[must_use]
+    pub fn probe_fails(&self) -> u32 {
+        self.probe_fails
+    }
+
+    /// N4 — whether the backoff lets the room widen at `now_ms`.
+    fn widen_allowed(&self, now_ms: u64) -> bool {
+        !self.probe_backoff
+            || self.probe_event.is_none_or(|(t, _)| {
+                now_ms >= t + (2 * self.cfg.meter_window_ms << self.probe_fails)
+            })
+    }
+
+    /// N4 — the room widened at `now_ms`.
+    fn note_widen(&mut self, now_ms: u64) {
+        if self.probe_event.is_some_and(|(_, widen)| widen) {
+            // The previous widening held: nothing congested since.
+            self.probe_fails = self.probe_fails.saturating_sub(1);
+        }
+        self.probe_event = Some((now_ms, true));
+    }
+
+    /// N4 — congestion at `now_ms`; `failed`: count it as a failed probe
+    /// whatever came before (a departure, RM5).
+    fn note_congestion(&mut self, now_ms: u64, failed: bool) {
+        if failed || self.probe_event.is_some_and(|(_, widen)| widen) {
+            self.probe_fails = (self.probe_fails + 1).min(PROBE_FAILS_MAX);
+        }
+        self.probe_event = Some((now_ms, false));
     }
 
     /// Whether an upward probe is held now ([`Self::hold_probe`]).
@@ -895,6 +1026,7 @@ impl<P: PeerRef> Admission<P> {
         if let Some(c) = w.capacity_bps.filter(|_| w.congested) {
             self.clean_streak = 0;
             self.last_congested_ms = now_ms;
+            self.note_congestion(now_ms, false);
             self.ceiling_bps = Some(c);
             log.record(
                 now_ms,
@@ -920,6 +1052,9 @@ impl<P: PeerRef> Admission<P> {
         } else {
             self.clean_streak += 1;
             let held = self.probe_held(now_ms);
+            // N4: a widening (the demand step, the probe doubling) also waits
+            // out the probe backoff; a ceiling going stale is not one.
+            let backoff = !self.widen_allowed(now_ms);
             if let Some(c) = self.ceiling_bps {
                 // A clean window that carried more than the ceiling shows the
                 // uplink carries at least that: committable at the meter's
@@ -936,8 +1071,9 @@ impl<P: PeerRef> Admission<P> {
                 // if the uplink really is full, takes it back. Without it a
                 // shed member waited out the staleness (60-120 s) with the
                 // uplink clean the whole time (avmesh4, after the cap lifted).
-                if self.demand && !self.over_claim_flagged && !held {
+                if self.demand && !self.over_claim_flagged && !held && !backoff {
                     self.demand = false;
+                    self.note_widen(now_ms);
                     // From what the hard limit reads now (a publisher's
                     // one-stream floor included), so a step is one stream.
                     let per = self.class.fraction.unwrap_or(1.0);
@@ -970,10 +1106,12 @@ impl<P: PeerRef> Admission<P> {
                 let used = self.committed_bps() as f64 >= 0.8 * (self.floor_bps + self.probe_bps);
                 if (used || self.demand)
                     && !held
+                    && !backoff
                     && self.clean_streak >= self.cfg.probe_clean_windows
                 {
                     self.demand = false;
                     self.clean_streak = 0;
+                    self.note_widen(now_ms);
                     self.probe_bps = (self.probe_bps * 2.0)
                         .min((MAX_PROBE_STREAMS * self.cfg.stream_bps) as f64);
                 }
@@ -988,6 +1126,8 @@ impl<P: PeerRef> Admission<P> {
             // Stall row S3: standbys go first (most recent first); a
             // publisher never sheds its LAST primary (it is the one path
             // nothing replaces), so it is never left with only standbys.
+            // Among primaries, RM4's hash rank (the highest-ranked goes)
+            // when set, else LIFO.
             let primaries = self
                 .ledger
                 .values()
@@ -1003,10 +1143,18 @@ impl<P: PeerRef> Admission<P> {
                 if self.is_root && primaries <= 1 {
                     return None;
                 }
-                self.ledger
-                    .iter()
-                    .max_by_key(|(_, c)| c.order)
-                    .map(|(p, _)| p.clone())
+                match &self.shed_rank {
+                    None => self
+                        .ledger
+                        .iter()
+                        .max_by_key(|(_, c)| c.order)
+                        .map(|(p, _)| p.clone()),
+                    Some(key) => self
+                        .ledger
+                        .iter()
+                        .max_by_key(|(p, _)| hash_rank(key, *p))
+                        .map(|(p, _)| p.clone()),
+                }
             });
             let Some(victim) = victim else {
                 break;
@@ -1564,6 +1712,38 @@ mod tests {
         let shed = a.on_egress_window(10_000, &w, &mut log);
         assert_eq!(shed, vec![6, 5, 4], "0.75 x 4 streams = 3 stay");
         assert_eq!(a.ledger().len(), 3);
+    }
+
+    /// RM4 — a ranked shed takes standbys first, then the highest-ranked
+    /// primaries, and keeps the lowest-ranked primary, whatever the
+    /// admission order.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_ranked_shed_keeps_the_lowest_ranked_primary() {
+        let cfg = ControllerConfig::interactive();
+        let key = [7u8; 32];
+        let mut a = Admission::publisher(0u32, cfg.clone(), None);
+        roster(&mut a);
+        a.set_probe_streams(8);
+        a.set_shed_rank(Some(key));
+        let mut rng = SplitMix64(1);
+        let mut log = DecisionLog::default();
+        for s in 1..=4u32 {
+            assert!(matches!(
+                a.request(0, &req(s, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ));
+        }
+        assert!(matches!(
+            a.request(0, &req(5, Role::Standby), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        let lowest = (1..=4u32).min_by_key(|s| hash_rank(&key, s)).expect("four");
+        let w = window(cfg.stream_bps as f64, true);
+        let shed = a.on_egress_window(1_000, &w, &mut log);
+        assert_eq!(shed.first(), Some(&5), "the standby goes first: {shed:?}");
+        assert_eq!(shed.len(), 4);
+        assert_eq!(a.ledger().keys().copied().collect::<Vec<_>>(), vec![lowest]);
     }
 
     #[test]

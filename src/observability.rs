@@ -1107,6 +1107,18 @@ pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
 /// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
 /// queue behind the backlog and spend that link's retry budget.
 pub const ALM_OFFER_HELD_BACKLOG: &str = "alm_offer_held:backlog";
+/// RM5 (ReceiverMoves) — a direct child left this node's live stream: read
+/// as congestion (room = the children left, the probe backoff up one).
+pub const ALM_DEPARTURE_CONGESTION: &str = "alm_departure_congestion";
+/// RM2/RM3 (ReceiverMoves) — this node left a publisher whose media reached
+/// it late for a member relay, on that relay's admit.
+pub const ALM_LATE_MOVE: &str = "alm_late_move";
+/// RM4 (ReceiverMoves) — a late episode in which this node did not move: it
+/// is the lowest-ranked of the publisher's direct children (the one kept).
+pub const ALM_LATE_SPARED: &str = "alm_late_spared";
+/// RM6 (ReceiverMoves) — a late episode in which this node did not move:
+/// every other source it hears is late too (its own downlink).
+pub const ALM_LATE_OWN_DOWNLINK: &str = "alm_late_guarded:own_downlink";
 /// G8 — a chunk a settling leg had parked went out on the flusher's retry.
 pub const AV_CHUNK_PARKED_SENT: &str = "av_chunk_parked_sent";
 /// G8 — a parked chunk replaced by a newer one (it never left the process).
@@ -3004,6 +3016,10 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
     ALM_OFFER_HELD_BACKLOG,
+    ALM_DEPARTURE_CONGESTION,
+    ALM_LATE_MOVE,
+    ALM_LATE_SPARED,
+    ALM_LATE_OWN_DOWNLINK,
     AV_CHUNK_PARKED_SENT,
     AV_CHUNK_PARKED_REPLACED,
     AV_LEG_REDIAL_ON_DIRECT_PATH,

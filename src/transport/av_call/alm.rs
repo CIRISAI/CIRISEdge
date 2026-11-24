@@ -36,6 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use super::rxmove::{self, LatencyFloor, Reading};
 use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av::StreamId;
 use crate::transport::realtime_av_alm::controller::wire::{
@@ -281,7 +282,8 @@ pub(super) struct AlmState {
     own_rate: Rate,
     rates: BTreeMap<StreamId, Rate>,
     forwarded_seen: BTreeMap<StreamId, SeenRing>,
-    min_offset: BTreeMap<StreamId, (i64, u64)>,
+    /// RM1 — each received stream's latency floor ([`LatencyFloor`]).
+    min_offset: BTreeMap<StreamId, LatencyFloor>,
     last_offer_ms: u64,
     pub(super) counts: AlmCounts,
     pub(super) labels: Vec<&'static str>,
@@ -338,7 +340,24 @@ pub(super) struct AlmState {
     pending_out: Vec<Outgoing>,
     /// Row B1b — when each peer was last sent this node's offers.
     offered_at: BTreeMap<String, u64>,
+    /// RM5 — when this node last published each of its own streams (call
+    /// ms): a stream published within [`STREAM_LIVE_MS`] is live.
+    own_published_ms: BTreeMap<StreamId, u64>,
+    /// RM2 — each (stream, delivering peer)'s latency readings.
+    readings: BTreeMap<(StreamId, String), Reading>,
+    /// RM2 — streams in a late episode this node already moved in (one move
+    /// an episode); the episode ends when the primary reads on time.
+    late_moved: BTreeSet<StreamId>,
+    /// RM4/RM6 — streams whose current late episode was already counted as
+    /// spared or guarded (one label an episode, not one a tick).
+    late_noted: BTreeSet<StreamId>,
+    /// RM4 — offer periods so far (rotates the order offers go out in).
+    offer_round: u64,
 }
+
+/// RM5 — an own stream published this recently is live: a direct child's
+/// departure from it is read as congestion.
+pub(super) const STREAM_LIVE_MS: u64 = 2_000;
 
 /// G8 — a leg whose oldest unproved Channel message has waited this long is
 /// stalled: far above any propagation floor this mesh runs at, and under
@@ -390,6 +409,8 @@ impl AlmState {
         let mut own = Admission::publisher(me.to_owned(), cfg.clone(), None);
         own.set_members(members.iter().cloned());
         own.set_slow_start(true);
+        own.set_probe_backoff(true);
+        own.set_shed_rank(Some(own_stream.0));
         own.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         Self {
             me: me.to_owned(),
@@ -442,6 +463,11 @@ impl AlmState {
             uplink_stall_seen_ms: None,
             pending_out: Vec::new(),
             offered_at: BTreeMap::new(),
+            own_published_ms: BTreeMap::new(),
+            readings: BTreeMap::new(),
+            late_moved: BTreeSet::new(),
+            late_noted: BTreeSet::new(),
+            offer_round: 0,
         }
     }
 
@@ -1059,6 +1085,8 @@ impl AlmState {
     /// This node published `bytes` of its own (primary) stream.
     #[cfg(test)]
     pub(super) fn on_own_published(&mut self, bytes: u64, base_or_audio: bool) {
+        let now = self.now_ms();
+        self.own_published_ms.insert(self.own_stream, now);
         self.own_rate.add(bytes, base_or_audio);
     }
 
@@ -1070,6 +1098,8 @@ impl AlmState {
         bytes: u64,
         base_or_audio: bool,
     ) {
+        let now = self.now_ms();
+        self.own_published_ms.insert(stream, now);
         if stream == self.own_stream {
             self.own_rate.add(bytes, base_or_audio);
         } else if let Some((_, r)) = self.shares.get_mut(&stream) {
@@ -1165,6 +1195,8 @@ impl AlmState {
         let mut a = Admission::publisher(self.me.clone(), self.cfg.clone(), None);
         a.set_members(self.members.iter().cloned());
         a.set_slow_start(true);
+        a.set_probe_backoff(true);
+        a.set_shed_rank(Some(stream.0));
         a.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         self.shares.insert(stream, (a, Rate::default()));
         let now = self.now_ms();
@@ -1280,13 +1312,18 @@ impl AlmState {
         }
         let wall = crate::transport::av_chunk_auth::unix_ms_now();
         let offset = wall as i64 - source_ms as i64;
-        let entry = self.min_offset.entry(stream).or_insert((offset, now));
-        // The floor decays: a better floor wins at once, a stale one is
-        // replaced after 30 s.
-        if offset < entry.0 || now.saturating_sub(entry.1) > 30_000 {
-            *entry = (offset, now);
-        }
-        let latency = (offset - entry.0).max(0) as f64;
+        // RM1: a better floor wins at once; only an on-time sample
+        // re-anchors an old one (drift), never a queued one.
+        let latency = self
+            .min_offset
+            .entry(stream)
+            .or_insert_with(|| LatencyFloor::new(offset, now))
+            .sample(offset, now) as f64;
+        // RM2: per path, so the publisher's own delivery is read alone.
+        self.readings
+            .entry((stream, from.to_owned()))
+            .or_default()
+            .push(now, latency);
         let Some(sel) = self.sels.get_mut(&stream) else {
             return;
         };
@@ -1559,8 +1596,28 @@ impl AlmState {
                 let p = peer.to_owned();
                 if self.is_own(stream) {
                     self.provisional.remove(&(stream, p.clone()));
+                    let live = self
+                        .own_published_ms
+                        .get(&stream)
+                        .is_some_and(|t| now.saturating_sub(*t) <= STREAM_LIVE_MS);
+                    let ext = self.external_except(stream);
+                    let mut log = std::mem::take(&mut self.log);
+                    let mut departed = false;
                     if let Some(a) = self.own_admission_mut(stream) {
+                        // RM5: a direct child (a primary in the ledger, not
+                        // one being shed: that one counts once, at its shed)
+                        // leaving a live stream is congestion.
+                        let direct = a.role_of(&p) == Some(Role::Primary) && !a.is_draining(&p);
                         a.release(&p);
+                        if direct && live {
+                            a.set_external_committed(ext);
+                            a.on_departure(now, &mut log);
+                            departed = true;
+                        }
+                    }
+                    self.log = log;
+                    if departed {
+                        self.label(crate::observability::ALM_DEPARTURE_CONGESTION);
                     }
                     self.ensure_own_primaries();
                 } else if let Some(a) = self.relays.get_mut(&stream) {
@@ -1568,12 +1625,19 @@ impl AlmState {
                 }
             }
             ControlMsg::Decision(d) => {
-                let acts = match self.sels.get_mut(&stream) {
-                    Some(s) => {
-                        s.on_decision(now, &peer.to_owned(), &d, &mut self.rng, &mut self.log)
-                    }
-                    None => Vec::new(),
+                let (acts, late) = match self.sels.get_mut(&stream) {
+                    Some(s) => (
+                        s.on_decision(now, &peer.to_owned(), &d, &mut self.rng, &mut self.log),
+                        s.take_late_moved(),
+                    ),
+                    None => (Vec::new(), false),
                 };
+                if late {
+                    // RM3: switched on the relay's admit; the publisher is
+                    // left in `acts`. One move this late episode.
+                    self.late_moved.insert(stream);
+                    self.label(crate::observability::ALM_LATE_MOVE);
+                }
                 out.extend(self.action_frames(stream, acts));
                 self.sync_upstream(stream);
             }
@@ -1672,6 +1736,8 @@ impl AlmState {
     /// selector learns the new stream id and asks.
     pub(super) fn replace_own_stream(&mut self, stream: StreamId) {
         self.own_stream = stream;
+        // RM4: the receivers rank by the new stream id.
+        self.own.set_shed_rank(Some(stream.0));
         let now = self.now_ms();
         let c3: Vec<String> = self
             .caps
@@ -1705,6 +1771,9 @@ impl AlmState {
         self.rates.remove(&old);
         self.forwarded_seen.remove(&old);
         self.min_offset.remove(&old);
+        self.readings.retain(|(s, _), _| *s != old);
+        self.late_moved.remove(&old);
+        self.late_noted.remove(&old);
         self.last_primary.remove(&old);
         self.told_publisher.remove(&old);
         self.draining_parent.remove(&old);
@@ -1883,6 +1952,8 @@ impl AlmState {
             }
             self.log = log;
             out.extend(self.action_frames(s, acts));
+            let moved = self.receiver_move(s, now);
+            out.extend(moved);
             self.sync_upstream(s);
 
             let sel = &self.sels[&s];
@@ -2038,6 +2109,12 @@ impl AlmState {
             } else {
                 OFFER_EVERY_MS
             };
+            // RM4 — the receivers spare by the relays' offers, so no offer
+            // may be the one always sent last: a leg that refuses the tail
+            // of a burst (a busy Channel; the periodic offer is not retried)
+            // would starve that stream's relay offers for good. The order
+            // rotates each offer period.
+            self.offer_round = self.offer_round.wrapping_add(1);
             for peer in c3_legs {
                 if !self.members.iter().any(|m| m == peer) {
                     continue;
@@ -2049,23 +2126,24 @@ impl AlmState {
                     }
                 }
                 self.offered_at.insert(peer.clone(), now.max(1));
-                out.push(Outgoing {
-                    to: peer.clone(),
-                    frame: own_frame.clone(),
-                });
-                for f in &share_frames {
+                let mut frames: Vec<&Vec<u8>> = std::iter::once(&own_frame)
+                    .chain(share_frames.iter())
+                    .chain(
+                        relay_offers
+                            .iter()
+                            .filter(|(_, skip, _)| !skip.contains(peer))
+                            .map(|(_, _, f)| f),
+                    )
+                    .collect();
+                if !frames.is_empty() {
+                    let k = usize::try_from(self.offer_round).unwrap_or(0) % frames.len();
+                    frames.rotate_left(k);
+                }
+                for f in frames {
                     out.push(Outgoing {
                         to: peer.clone(),
                         frame: f.clone(),
                     });
-                }
-                for (_, skip, f) in &relay_offers {
-                    if !skip.contains(peer) {
-                        out.push(Outgoing {
-                            to: peer.clone(),
-                            frame: f.clone(),
-                        });
-                    }
                 }
             }
         }
@@ -2096,6 +2174,150 @@ impl AlmState {
             self.relay_status_pending = Some(status);
         }
         out
+    }
+
+    /// RM2 — ReceiverMoves, once a watch tick for each received stream: a
+    /// direct child of the publisher whose media from it reads late moves
+    /// itself to a member relay, make-before-break (the relay's admit
+    /// switches and leaves the publisher, RM3, in [`Self::on_control`]).
+    ///
+    /// Transition: observable, the publisher's own delivery of `stream`
+    /// (its signed `source_ts_ms` over the RM1 floor) reads late, ≥
+    /// [`rxmove::LATE_MS`] on two readings not falling; state, the primary is
+    /// the publisher, nothing is pending, this late episode moved nothing
+    /// yet, this node is not the lowest-ranked of the publisher's direct
+    /// children (RM4, from the offers); action, ask the best member relay
+    /// with room, not this node's descendant and offering within 5 s, that
+    /// is not a direct child which may itself move (only the spared one, or
+    /// a member deeper in the tree); must never, move when spared, move to a
+    /// stale offer or one without room, move twice in one episode, or leave
+    /// the publisher before the admit.
+    ///
+    /// Must never (RM2, the loop rule): ask a direct child of the publisher
+    /// that may itself move (any but the lowest-ranked). Two late movers
+    /// asking each other would both be admitted, each the other's parent: a
+    /// loop with the publisher's stream reaching neither.
+    fn receiver_move(&mut self, s: StreamId, now: u64) -> Vec<Outgoing> {
+        let Some(publisher) = self.bound_publisher.get(&s).cloned() else {
+            return Vec::new();
+        };
+        let Some(sel) = self.sels.get(&s) else {
+            return Vec::new();
+        };
+        let primary = sel.primary().cloned();
+        // The episode ends when the primary (wherever it is) reads on time.
+        if let Some(p) = &primary {
+            let on_time = self
+                .readings
+                .get(&(s, p.clone()))
+                .and_then(|r| r.current(now))
+                .is_some_and(|l| l < rxmove::LATE_MS);
+            if on_time {
+                self.late_moved.remove(&s);
+                self.late_noted.remove(&s);
+            }
+        }
+        if primary.as_ref() != Some(&publisher)
+            || sel.primary_pending()
+            || self.late_moved.contains(&s)
+        {
+            return Vec::new();
+        }
+        let late = self
+            .readings
+            .get(&(s, publisher.clone()))
+            .is_some_and(|r| r.sustained_late(now, rxmove::LATE_MS));
+        if !late {
+            return Vec::new();
+        }
+        let directs = sel.direct_children_by_offer(now, &publisher);
+        if rxmove::spared(s, &self.me, &directs) {
+            if self.late_noted.insert(s) {
+                self.label(crate::observability::ALM_LATE_SPARED);
+            }
+            return Vec::new();
+        }
+        if self.own_downlink_slow(s, &publisher, now) {
+            if self.late_noted.insert(s) {
+                self.label(crate::observability::ALM_LATE_OWN_DOWNLINK);
+            }
+            return Vec::new();
+        }
+        // A direct child that is not the spared one may move itself: never
+        // a target (two movers onto each other would loop).
+        let keep = rxmove::lowest(s, &directs).cloned();
+        let allowed = |c: &String| !directs.contains(c) || Some(c) == keep.as_ref();
+        let mut log = std::mem::take(&mut self.log);
+        let act = self
+            .sels
+            .get_mut(&s)
+            .and_then(|sel| sel.late_move(now, &publisher, &allowed, &mut log));
+        self.log = log;
+        if let Some(SelectorAction::Subscribe { parent, .. }) = &act {
+            tracing::debug!(
+                target: "ciris_edge::rxmove",
+                me = %self.me,
+                stream = %crate::transport::realtime_av::stream_label(s),
+                to = %parent,
+                readings = ?self
+                    .readings
+                    .iter()
+                    .map(|((st, from), r)| {
+                        (crate::transport::realtime_av::stream_label(*st), from.clone(), r.current(now))
+                    })
+                    .collect::<Vec<_>>(),
+                "late from its publisher: asking a member relay"
+            );
+        }
+        if act.is_none() && self.late_noted.insert(s) {
+            // Late, not spared, not guarded, and no member relay to move to.
+            tracing::debug!(
+                target: "ciris_edge::rxmove",
+                me = %self.me,
+                stream = %crate::transport::realtime_av::stream_label(s),
+                directs = ?directs,
+                candidates = ?self.sels.get(&s).map(ParentSelector::candidates),
+                "late from its publisher, no member relay to move to"
+            );
+        }
+        act.map(|a| self.action_frames(s, vec![a]))
+            .unwrap_or_default()
+    }
+
+    /// RM6 — the own-downlink guard: whether every other source this node
+    /// hears reads late too, so the lateness is this node's own downlink and
+    /// no relay would help.
+    ///
+    /// Transition: observable, the current reading of every other path
+    /// this node hears (median over the last 250 ms); state, `publisher`'s
+    /// stream reads late from it (RM2); action, no move when at least one
+    /// other publisher's stream is heard and every such stream reads ≥
+    /// [`rxmove::OTHER_LATE_MS`], unless a relayed copy of `publisher`'s
+    /// stream reads on time (then this node's downlink is fine); with no
+    /// other publisher heard (a one-publisher room) the guard cannot run
+    /// and the move goes ahead; must never, move when every source is late.
+    /// A relayed copy of `publisher`'s stream never fires the guard: it left
+    /// through the same uplink, so it is late whenever that uplink is. Paths
+    /// from `publisher` (other streams it relays) are left out for the same
+    /// reason.
+    fn own_downlink_slow(&self, s: StreamId, publisher: &str, now: u64) -> bool {
+        let mut others: Option<bool> = None;
+        for ((st, from), r) in &self.readings {
+            if from == publisher {
+                continue;
+            }
+            let Some(l) = r.current(now) else {
+                continue;
+            };
+            if *st == s {
+                if l < rxmove::OTHER_LATE_MS {
+                    return false;
+                }
+                continue;
+            }
+            others = Some(others.unwrap_or(true) && l >= rxmove::OTHER_LATE_MS);
+        }
+        others == Some(true)
     }
 
     /// Every stream this node receives, with its chosen parents.
@@ -2667,10 +2889,17 @@ mod tests {
         }
         let kids = a.own_children();
         assert_eq!(kids.len(), 1, "one child kept: {kids:?}");
-        assert_eq!(kids[0].0, "b", "the oldest commitment is kept (LIFO shed)");
+        let lowest = ["b", "c", "d"]
+            .into_iter()
+            .min_by_key(|k| spec_rank(s(1), k))
+            .expect("three");
+        assert_eq!(kids[0].0, lowest, "the lowest-ranked child is kept (RM4)");
         let shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
         assert!(
-            shed.contains(&"c".to_owned()) && shed.contains(&"d".to_owned()),
+            ["b", "c", "d"]
+                .iter()
+                .filter(|k| **k != lowest)
+                .all(|k| shed.contains(&(*k).to_owned())),
             "{shed:?}"
         );
         // Row D1: the verdict holds back no offers here (a backlogged leg's
@@ -2755,10 +2984,13 @@ mod tests {
         a.set_uplink_stall(true);
         // The same watch tick: no egress window has closed yet.
         let mut out = a.tick(&legs);
+        // RM4: the kept child is the lowest-ranked; the rest go highest first.
+        let mut by_rank = vec!["b", "c", "d"];
+        by_rank.sort_by_key(|k| spec_rank(s(1), k));
         assert_eq!(
             a.own_children(),
-            vec![("b".to_owned(), Role::Primary)],
-            "shed at the rise, to the oldest child"
+            vec![(by_rank[0].to_owned(), Role::Primary)],
+            "shed at the rise, to the lowest-ranked child"
         );
         // The stalled legs are gone a tick later: nothing is detected.
         a.t0 = a.t0.checked_sub(Duration::from_millis(250)).expect("clock");
@@ -2774,8 +3006,8 @@ mod tests {
         let shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
         assert_eq!(
             shed,
-            vec!["d".to_owned(), "c".to_owned()],
-            "LIFO, once each"
+            vec![by_rank[2].to_owned(), by_rank[1].to_owned()],
+            "highest rank first, once each"
         );
         assert_eq!(a.own_children().len(), 1, "the window keeps one child");
         // The latch ends UPLINK_STALL_LATCH_MS after the last detection.
@@ -3096,6 +3328,488 @@ mod tests {
         }
         assert!(sheds(&out).is_empty(), "{:?}", sheds(&out));
         assert_eq!(a.own_children().len(), 1);
+    }
+
+    // ── ReceiverMoves (docs/design/call_congestion, rows RM1–RM6, N4) ────
+
+    /// The rank every member computes for `member` on `stream` (RM4):
+    /// sha256(stream id ‖ the member's canonical encoding), the first eight
+    /// bytes big-endian. Spelled out here so the test is the specification.
+    fn spec_rank(stream: StreamId, member: &str) -> u64 {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(stream.0);
+        let mut enc = Vec::new();
+        crate::transport::realtime_av_alm::controller::PeerRef::encode(
+            &member.to_owned(),
+            &mut enc,
+        );
+        h.update(&enc);
+        let d = h.finalize();
+        u64::from_be_bytes(d[..8].try_into().expect("eight bytes"))
+    }
+
+    /// A chunk of `stream` from `from`, sent `delay_ms` ago by its signed
+    /// clock.
+    fn late_chunk(n: &mut AlmState, stream: StreamId, from: &str, seq: u64, delay_ms: u64) {
+        let src = crate::transport::av_chunk_auth::unix_ms_now() - delay_ms;
+        n.on_chunk(stream, from, 1, seq, 300, src, true, 0);
+    }
+
+    /// The receiver's floor for `stream` (its minimum clock offset).
+    fn floor_of(n: &AlmState, stream: StreamId) -> i64 {
+        n.min_offset[&stream].floor()
+    }
+
+    /// RM1 — observable: a chunk's signed `source_ts_ms` against the wall
+    /// clock; state: the stream queued 500 ms behind its floor for 40 s;
+    /// action: the floor stays; must never: re-anchor while the stream is
+    /// late. Mutation (45.2.0 before RM1): the floor was replaced once 30 s
+    /// old, so after 30 s of queueing the latency read 0 and the late signal
+    /// was gone.
+    #[test]
+    fn a_stream_late_for_forty_seconds_still_reads_late() {
+        let mut b = AlmState::new("b", s(2), &roster(), true, 2);
+        b.on_caps("a", CAPS_THIS_BUILD);
+        b.note_publisher(s(1), "a");
+        b.note_bound_publisher(s(1), "a");
+        let mut seq = 0;
+        for _ in 0..100 {
+            late_chunk(&mut b, s(1), "a", seq, 0);
+            seq += 1;
+            b.t0 = b.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+        }
+        let on_time = floor_of(&b, s(1));
+        for _ in 0..2_000 {
+            late_chunk(&mut b, s(1), "a", seq, 500);
+            seq += 1;
+            b.t0 = b.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+        }
+        assert!(
+            floor_of(&b, s(1)) - on_time < 50,
+            "the floor moved {} ms during 40 s of queueing",
+            floor_of(&b, s(1)) - on_time
+        );
+    }
+
+    /// N4 — observable: the egress window; state: a permanent cap of one
+    /// stream, a member waiting (demand), each widening read congested at
+    /// once (the probe failed); action: every widening waits 2 windows ×
+    /// 2^fails after the last congestion or widening, fails ≤ 2; must never:
+    /// widen sooner. Mutation (45.2.0 before N4): the demand step widened
+    /// every clean window, so a capped publisher probed, overloaded and shed
+    /// every other second (probe, late, leave, repeat).
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_capped_publishers_probe_backs_off_instead_of_oscillating() {
+        let mut a = publisher_with(&["b"]);
+        let one = a.own_rate.costs().0 as f64;
+        let mut rng = SplitMix64(11);
+        let mut log = DecisionLog::default();
+        let win = |congested: bool, sent: f64| EgressWindow {
+            sent_bps: sent,
+            delivered_bps: sent,
+            dropped_bytes: u64::from(congested) * 1_000,
+            max_queue_ms: if congested { 500.0 } else { 0.0 },
+            congested,
+            capacity_bps: congested.then_some(one),
+        };
+        // The cap is measured: one stream.
+        a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+        let now = a.now_ms();
+        let _ = a.own.on_egress_window(now, &win(true, one), &mut log);
+        let mut widenings = Vec::new();
+        for w in 0..60u64 {
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let now = a.now_ms();
+            let mut admitted = false;
+            for p in ["b", "c"] {
+                if a.own.role_of(&p.to_owned()).is_none() {
+                    let r = SubscribeRequest {
+                        subscriber: p.to_owned(),
+                        role: Role::Primary,
+                        forward_capable: true,
+                        layers: None,
+                    };
+                    admitted |= matches!(
+                        a.own.request(now, &r, &mut rng, &mut log),
+                        AdmitDecision::Admit { .. }
+                    );
+                }
+            }
+            if admitted {
+                widenings.push(w);
+            }
+            // Two copies into a one-copy cap read congested; one is clean.
+            let two = a.own.ledger().len() > 1;
+            let _ = a.own.on_egress_window(now, &win(two, one), &mut log);
+            assert!(!a.own.ledger().is_empty(), "never zero direct children");
+        }
+        assert!(
+            widenings.len() <= 9,
+            "{} widenings in 60 windows under a permanent cap: {widenings:?}",
+            widenings.len()
+        );
+        let gaps: Vec<u64> = widenings.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!(
+            gaps.iter().skip(2).all(|g| *g >= 8),
+            "the wait reaches 8 windows and stays: {gaps:?}"
+        );
+    }
+
+    /// RM4 — observable: an uplink-stall verdict; state: three direct
+    /// children; action: the stall shed keeps the LOWEST-RANKED child by
+    /// hash(stream id ‖ member key), the same order every receiver computes;
+    /// must never: keep a different child than the receivers spare, keep
+    /// zero, or keep two. The lowest-ranked child is admitted last here, so
+    /// the mutation (45.2.0 before RM4: LIFO by admission) sheds it.
+    #[test]
+    fn a_stall_shed_keeps_the_lowest_ranked_child() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| std::cmp::Reverse(spec_rank(s(1), k)));
+        let lowest = *kids.last().expect("three");
+        let mut a = publisher_with(&kids);
+        a.set_uplink_stall(true);
+        let out = a.tick(&["b".into(), "c".into(), "d".into()]);
+        assert_eq!(
+            a.own_children(),
+            vec![(lowest.to_owned(), Role::Primary)],
+            "the lowest-ranked child is kept"
+        );
+        let mut shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
+        shed.sort();
+        let mut want: Vec<String> = kids
+            .iter()
+            .filter(|k| **k != lowest)
+            .map(|k| (*k).to_owned())
+            .collect();
+        want.sort();
+        assert_eq!(shed, want, "every other child is shed, once");
+    }
+
+    /// RM5 — observable: a direct child's UNSUBSCRIBE while this node's
+    /// stream is live; state: two direct children on an unmeasured probe;
+    /// action: room = the children left, no widening for 2 windows × 2^fails
+    /// (fails = 1 now); must never: widen sooner. Mutation (45.2.0 before
+    /// RM5): the slot the leaver freed was offered at once, so the next
+    /// member landed straight back on the congested uplink.
+    #[test]
+    fn a_direct_childs_departure_is_read_as_congestion() {
+        let mut a = publisher_with(&["b", "c"]);
+        let leave = Outgoing {
+            to: "a".to_owned(),
+            frame: encode(
+                s(1),
+                &ControlMsg::Unsubscribe {
+                    subscriber: "b".to_owned(),
+                },
+            ),
+        };
+        let _ = deliver(&mut a, "b", &[leave]);
+        assert_eq!(a.own_children().len(), 1, "the premise: b left");
+        assert_eq!(a.own.offer().headroom_bps, 0, "room = the children left");
+        let mut rng = SplitMix64(13);
+        let mut log = DecisionLog::default();
+        let d = SubscribeRequest {
+            subscriber: "d".to_owned(),
+            role: Role::Primary,
+            forward_capable: true,
+            layers: None,
+        };
+        let mut admitted_after = None;
+        for w in 1..=8u64 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("c", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let _ = a.tick(&[]);
+            let now = a.now_ms();
+            if matches!(
+                a.own.request(now, &d, &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ) {
+                admitted_after = Some(w);
+                break;
+            }
+        }
+        let w = admitted_after.expect("the room widens again after the backoff");
+        assert!(w >= 4, "widened {w} windows after a departure (backoff 4)");
+    }
+
+    /// RM4 — the rank the shed uses is the rank spelled out above.
+    #[test]
+    fn the_shed_rank_is_the_specified_hash() {
+        for m in ["a", "b", "some-longer-member-key"] {
+            assert_eq!(
+                crate::transport::realtime_av_alm::controller::hash_rank(&s(7).0, &m.to_owned()),
+                spec_rank(s(7), m)
+            );
+        }
+    }
+
+    /// A receiver `me` of `a`'s stream s(1) in a room of a, b, c, d: joined
+    /// to `a` directly, with each of `relays` offering it as a direct child
+    /// of `a` (depth 1) with room, every subscribe answered Admit, two
+    /// seconds of on-time media. Returns the receiver and the frames it sent.
+    fn joined_receiver(me: &str, relays: &[&str]) -> (AlmState, Vec<Outgoing>) {
+        let roster4: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let mut n = AlmState::new(me, s(9), &roster4, true, 3);
+        for p in ["a", "b", "c", "d"].into_iter().filter(|p| *p != me) {
+            n.on_caps(p, CAPS_THIS_BUILD | CAP_RELAY);
+        }
+        n.note_publisher(s(1), "a");
+        n.note_bound_publisher(s(1), "a");
+        let mut sent = Vec::new();
+        let mut seq = 0;
+        for step in 0..200u64 {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", seq, 0);
+            if let Some(sb) = n.sels.get(&s(1)).and_then(|x| x.standby().cloned()) {
+                late_chunk(&mut n, s(1), &sb, seq, 0);
+            }
+            seq += 1;
+            if step % 50 == 0 {
+                offers_to(&mut n, relays);
+            }
+            if step % 12 == 0 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits(&mut n, &out));
+                sent.extend(out);
+            }
+        }
+        (n, sent)
+    }
+
+    /// `a`'s offer (depth 0) and each relay's (depth 1 under `a`, room) to `n`.
+    fn offers_to(n: &mut AlmState, relays: &[&str]) {
+        let me = n.me.clone();
+        let a = Outgoing {
+            to: me.clone(),
+            frame: offer_frame(s(1), "a"),
+        };
+        let _ = deliver(n, "a", &[a]);
+        for r in relays {
+            let f = Outgoing {
+                to: me.clone(),
+                frame: wire::encode(
+                    s(1),
+                    &ControlMsg::Offer(crate::transport::realtime_av_alm::controller::Offer {
+                        from: (*r).to_owned(),
+                        depth: 1,
+                        ancestry: vec!["a".to_owned()],
+                        headroom_bps: 100_000_000,
+                        forwarder_headroom_bps: 100_000_000,
+                        upstream_latency_ms: 0,
+                        forwarding: true,
+                    }),
+                ),
+            };
+            let _ = deliver(n, r, &[f]);
+        }
+    }
+
+    /// Answer every SUBSCRIBE in `out` with an Admit from its parent, except
+    /// to `hold` (whose answer the test gives itself).
+    fn answer_admits_but(n: &mut AlmState, out: &[Outgoing], hold: Option<&str>) -> Vec<Outgoing> {
+        let mut more = Vec::new();
+        for o in out {
+            if let Ok(WireFrame::Control(ControlFrame {
+                stream,
+                msg: ControlMsg::Subscribe(req),
+            })) = decode(&o.frame, &n.me)
+            {
+                if Some(o.to.as_str()) == hold {
+                    continue;
+                }
+                let admit = Outgoing {
+                    to: n.me.clone(),
+                    frame: encode(
+                        stream,
+                        &ControlMsg::Decision(AdmitDecision::Admit { role: req.role }),
+                    ),
+                };
+                more.extend(deliver(n, &o.to, &[admit]));
+            }
+        }
+        more
+    }
+
+    fn answer_admits(n: &mut AlmState, out: &[Outgoing]) -> Vec<Outgoing> {
+        answer_admits_but(n, out, None)
+    }
+
+    /// Whether `out` holds a `kind` frame (subscribe / unsubscribe) to `to`.
+    fn sends(out: &[Outgoing], to: &str, subscribe: bool) -> bool {
+        out.iter().filter(|o| o.to == to).any(|o| {
+            matches!(
+                (decode(&o.frame, "x"), subscribe),
+                (
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Subscribe(_),
+                        ..
+                    })),
+                    true
+                ) | (
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Unsubscribe { .. },
+                        ..
+                    })),
+                    false
+                )
+            )
+        })
+    }
+
+    /// RM2 + RM3 — observable: the median latency of `a`'s stream as `a`
+    /// itself delivers it, ≥ 300 ms over the last 250 ms of chunks and not
+    /// falling; state: this node's primary is `a`, nothing pending, it is not
+    /// the lowest-ranked of `a`'s direct children (RM4, from the offers), a
+    /// member that is not its descendant offers the stream with room;
+    /// action: subscribe to that member, keep `a` until it admits (RM3), then
+    /// switch and unsubscribe `a`; must never: unsubscribe `a` before the
+    /// admit, move when spared, move to a direct child that may itself move.
+    /// Mutation (45.2.0 before RM2): nothing moves; the child waits for a
+    /// shed notice queued behind the very backlog that made it late.
+    #[test]
+    fn a_late_direct_child_moves_to_the_kept_child_make_before_break() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let (kept, mover) = (kids[0], kids[2]);
+        let others: Vec<&str> = kids.iter().copied().filter(|k| *k != mover).collect();
+        let (mut n, _) = joined_receiver(mover, &others);
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "the premise");
+        // a's queue: its chunks now arrive 400 ms late.
+        let mut asked_at = None;
+        let mut sent = Vec::new();
+        for step in 0..60u64 {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+            if step % 50 == 0 {
+                offers_to(&mut n, &others);
+            }
+            if step % 12 == 11 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits_but(&mut n, &out, Some(kept)));
+                if asked_at.is_none() && sends(&out, kept, true) {
+                    asked_at = Some(step * 20);
+                }
+                sent.extend(out);
+                if asked_at.is_some() {
+                    break;
+                }
+            }
+        }
+        let at = asked_at.expect("the late child asks the kept child");
+        assert!(at <= 1_000, "asked {at} ms after its media turned late");
+        assert!(
+            !sends(&sent, others[1], true),
+            "never onto a child that may move"
+        );
+        assert!(
+            !sends(&sent, "a", false),
+            "a is kept until the relay admits"
+        );
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"));
+        // The admit: switch, then leave a.
+        let admit = Outgoing {
+            to: mover.to_owned(),
+            frame: encode(
+                s(1),
+                &ControlMsg::Decision(AdmitDecision::Admit {
+                    role: Role::Primary,
+                }),
+            ),
+        };
+        let out = deliver(&mut n, kept, &[admit]);
+        assert_eq!(
+            n.primary_of(s(1)).as_deref(),
+            Some(kept),
+            "switched on the admit"
+        );
+        assert!(sends(&out, "a", false), "and only then left a: {out:?}");
+    }
+
+    /// RM4 — the lowest-ranked of `a`'s direct children never moves on late
+    /// media: it is the child `a`'s shed keeps.
+    #[test]
+    fn the_lowest_ranked_direct_child_is_spared() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let me = kids[0];
+        let (mut n, _) = joined_receiver(me, &kids[1..]);
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "the premise");
+        let mut sent = Vec::new();
+        for step in 0..150u64 {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+            if step % 50 == 0 {
+                offers_to(&mut n, &kids[1..]);
+            }
+            if step % 12 == 11 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits(&mut n, &out));
+                sent.extend(out);
+            }
+        }
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "spared: {sent:?}");
+        assert!(!sends(&sent, "a", false));
+    }
+
+    /// RM6 — observable: `a`'s stream late ≥ 300 ms from `a`, and every
+    /// other source this node hears late ≥ 150 ms; state: as RM2; action: no
+    /// move (it is this node's downlink, and a relay would not help); must
+    /// never: move. With another publisher heard on time the move goes
+    /// ahead, and so it does with no other source at all (the one-publisher
+    /// room). A relayed copy of `a`'s stream rides `a`'s uplink, so late it
+    /// proves nothing; on time it shows this node's downlink is fine.
+    /// Mutation (45.2.0 before RM6): the slow receiver moved for nothing.
+    #[test]
+    fn a_receiver_late_from_every_source_does_not_move() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let (kept, mover, other) = (kids[0], kids[2], kids[1]);
+        for other_late in [true, false] {
+            let (mut n, _) = joined_receiver(mover, &[kept, other]);
+            n.note_publisher(s(5), other);
+            n.note_bound_publisher(s(5), other);
+            // `other` publishes too, heard from it directly: on time first.
+            for step in 0..20u64 {
+                n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+                late_chunk(&mut n, s(1), "a", 9_000 + step, 0);
+                late_chunk(&mut n, s(5), other, step, 0);
+            }
+            let mut sent = Vec::new();
+            for step in 0..100u64 {
+                n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+                late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+                late_chunk(
+                    &mut n,
+                    s(5),
+                    other,
+                    100 + step,
+                    if other_late { 400 } else { 20 },
+                );
+                if step % 50 == 0 {
+                    offers_to(&mut n, &[kept, other]);
+                }
+                if step % 12 == 11 {
+                    let out = n.tick(&[]);
+                    sent.extend(answer_admits_but(&mut n, &out, Some(kept)));
+                    sent.extend(out);
+                }
+            }
+            assert_eq!(
+                sends(&sent, kept, true),
+                !other_late,
+                "other publisher late={other_late}: {sent:?}"
+            );
+            if other_late {
+                assert!(n
+                    .labels
+                    .contains(&crate::observability::ALM_LATE_OWN_DOWNLINK));
+            }
+        }
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────

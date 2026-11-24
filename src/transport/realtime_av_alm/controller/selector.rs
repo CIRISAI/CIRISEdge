@@ -90,6 +90,9 @@ enum Link {
         role: Role,
         at_ms: u64,
         was_standby: bool,
+        /// RM2 — a late move ([`ParentSelector::late_move`]): its admit
+        /// switches at once and leaves the old primary (RM3).
+        late: bool,
     },
     Standby,
     Primary,
@@ -227,6 +230,12 @@ pub struct ParentSelector<P: PeerRef> {
     activity_since_ms: u64,
     /// When a [`PathChunk::full`] chunk last arrived on any path.
     last_full_ms: Option<u64>,
+    /// RM3 — a publisher left by a late move is not asked for a standby
+    /// before this instant (a standby of an opaque or audio stream is fed
+    /// every chunk: the load it was shedding would stay, F12).
+    standby_hold: BTreeMap<P, u64>,
+    /// RM3 — a late move completed since the controller last asked.
+    late_moved: bool,
 }
 
 impl<P: PeerRef> ParentSelector<P> {
@@ -259,6 +268,8 @@ impl<P: PeerRef> ParentSelector<P> {
             last_activity_ms: None,
             activity_since_ms: 0,
             last_full_ms: None,
+            standby_hold: BTreeMap::new(),
+            late_moved: false,
         }
     }
 
@@ -629,7 +640,10 @@ impl<P: PeerRef> ParentSelector<P> {
             }
         }
         let Link::Requested {
-            role, was_standby, ..
+            role,
+            was_standby,
+            late,
+            ..
         } = link
         else {
             // A late answer to a request this node abandoned: it has told the
@@ -773,7 +787,26 @@ impl<P: PeerRef> ParentSelector<P> {
                         // standby's sequence skipped layers: the first full
                         // chunk continues from nothing.
                         self.cands.get_mut(from).expect("present").meter.restart();
-                        if self.primary.is_some() {
+                        if let Some(old) = self.primary.clone().filter(|o| late && o != from) {
+                            // RM3: a late move switches on the admit, and only
+                            // then leaves the old primary, fully: no demotion
+                            // to a (fed) standby.
+                            if was_standby {
+                                self.standby = None;
+                            }
+                            let c = self.cands.get_mut(from).expect("present");
+                            c.link = Link::Primary;
+                            c.failures = 0;
+                            if !was_standby {
+                                c.subscribed_at = now_ms;
+                            }
+                            self.set_primary(now_ms, from.clone(), log, "late move");
+                            log.record(now_ms, &me, DecisionKind::Switch, Some(from), 0, "late");
+                            out.push(self.drop_parent(now_ms, &old, rng, log, "late"));
+                            self.standby_hold
+                                .insert(old, now_ms + self.cfg.min_dwell_ms);
+                            self.late_moved = true;
+                        } else if self.primary.is_some() {
                             let c = self.cands.get_mut(from).expect("present");
                             c.link = Link::Promoting {
                                 since_ms: now_ms,
@@ -897,7 +930,108 @@ impl<P: PeerRef> ParentSelector<P> {
         if role == Role::Standby && self.primary.as_ref() == Some(p) {
             return false;
         }
+        if role == Role::Standby && self.standby_hold.get(p).is_some_and(|t| now_ms < *t) {
+            return false;
+        }
         true
+    }
+
+    /// RM2 — whether a primary subscription is pending (asked, or a
+    /// make-before-break in progress).
+    #[must_use]
+    pub fn primary_pending(&self) -> bool {
+        self.cands.values().any(|c| {
+            matches!(
+                c.link,
+                Link::Requested {
+                    role: Role::Primary,
+                    ..
+                } | Link::Promoting { .. }
+            )
+        })
+    }
+
+    /// RM4 — the members this node believes are `publisher`'s direct
+    /// children: every roster member whose latest offer, fresher than
+    /// `down_silence_ms`, shows `publisher` as its parent (depth 1, ancestry
+    /// `[publisher]`). This node is not among them (it hears no offer of its
+    /// own); the caller adds itself.
+    #[must_use]
+    pub fn direct_children_by_offer(&self, now_ms: u64, publisher: &P) -> Vec<P> {
+        self.cands
+            .iter()
+            .filter(|(p, c)| {
+                *p != publisher
+                    && self.members.contains(*p)
+                    && now_ms.saturating_sub(c.offer_at_ms) <= self.cfg.down_silence_ms
+                    && c.offer.as_ref().is_some_and(|o| {
+                        o.depth == 1 && o.ancestry.len() == 1 && o.ancestry[0] == *publisher
+                    })
+            })
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    /// RM2 — ask a member other than `publisher` to become the primary,
+    /// keeping `publisher` until it admits (RM3, [`Self::on_decision`]).
+    ///
+    /// Transition: observable, the caller's sustained late reading of the
+    /// publisher's own delivery (the caller also checks RM4 and RM6); state,
+    /// the primary is `publisher` and nothing is pending; action, the
+    /// best-scoring member-tier candidate that is viable for the primary
+    /// (an offer within `down_silence_ms`, forwarding, not this node's
+    /// descendant, not backed off, healthy) with room, and that `allowed`
+    /// takes, is asked for the primary (an upgrade if it is the standby);
+    /// must never, ask while something is pending, ask the publisher, or ask
+    /// a stale offer or one without room. Returns the SUBSCRIBE, if any.
+    pub fn late_move(
+        &mut self,
+        now_ms: u64,
+        publisher: &P,
+        allowed: &dyn Fn(&P) -> bool,
+        log: &mut DecisionLog,
+    ) -> Option<SelectorAction<P>> {
+        if self.primary.as_ref() != Some(publisher) || self.primary_pending() {
+            return None;
+        }
+        let pick = self
+            .cands
+            .iter()
+            .filter(|(p, c)| {
+                *p != publisher
+                    && c.tier == Tier::Member
+                    && matches!(c.link, Link::None | Link::Standby)
+                    && self.viable(p, c, Role::Primary, now_ms)
+                    && self.has_room(c)
+                    && allowed(p)
+            })
+            .map(|(p, c)| (p.clone(), self.score(c)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, _)| p)?;
+        let c = self.cands.get_mut(&pick).expect("candidate");
+        c.link = Link::Requested {
+            role: Role::Primary,
+            at_ms: now_ms,
+            was_standby: c.link == Link::Standby,
+            late: true,
+        };
+        log.record(
+            now_ms,
+            &self.me,
+            DecisionKind::Subscribe,
+            Some(&pick),
+            2,
+            "late",
+        );
+        Some(SelectorAction::Subscribe {
+            parent: pick,
+            role: Role::Primary,
+        })
+    }
+
+    /// RM3 — whether a late move completed since last asked (once).
+    pub fn take_late_moved(&mut self) -> bool {
+        std::mem::take(&mut self.late_moved)
     }
 
     /// Whether `c` sits under the current primary (a shared failure domain).
@@ -1096,6 +1230,7 @@ impl<P: PeerRef> ParentSelector<P> {
             role,
             at_ms: now_ms,
             was_standby: c.link == Link::Standby,
+            late: false,
         };
         log.record(
             now_ms,
@@ -1383,11 +1518,11 @@ impl<P: PeerRef> ParentSelector<P> {
                     && c.eligible
                     && self.members.contains(s)
                     && now_ms >= c.backoff_until
-                    && c.offer.as_ref().is_some_and(|o| o.forwarding)
-                    // Never a parent from inside this node's own subtree: a
-                    // standby taken before the tree moved can be a
-                    // descendant now (its offer's ancestry names this node).
-                    && !c.offer.as_ref().is_some_and(|o| o.ancestry.contains(&self.me))
+                    // The loop guard: never a standby that now hears the
+                    // stream through this node.
+                    && c.offer
+                        .as_ref()
+                        .is_some_and(|o| o.forwarding && !o.ancestry.contains(&me))
                     && matches!(
                         c.health.state(),
                         PeerState::Available | PeerState::Degraded | PeerState::Recovering
@@ -1466,7 +1601,10 @@ impl<P: PeerRef> ParentSelector<P> {
         if let (Some(p), Some(s)) = (self.primary.clone(), self.standby.clone()) {
             let pc = &self.cands[&p];
             let sc = &self.cands[&s];
-            let calm = self.promoting().is_none() && !pending_primary && sc.link == Link::Standby;
+            let calm = self.promoting().is_none()
+                && !pending_primary
+                && sc.link == Link::Standby
+                && sc.offer.as_ref().is_some_and(|o| !o.ancestry.contains(&me));
             // Never promote a standby that is now this node's descendant.
             let looped = sc
                 .offer
@@ -1524,9 +1662,13 @@ impl<P: PeerRef> ParentSelector<P> {
             let c = &self.cands[&s];
             let calm = c.link == Link::Standby && self.promoting().is_none();
             let canonical = c.tier == Tier::Canonical;
+            // A standby under this node (its offer's ancestry holds it)
+            // could never take over: drop it like a down one.
+            let looped = c.offer.as_ref().is_some_and(|o| o.ancestry.contains(&me));
             if c.health.state() == PeerState::Down
                 || (!canonical && !self.members.contains(&s))
                 || !c.eligible
+                || looped
             {
                 self.standby = None;
                 out.push(self.drop_parent(now_ms, &s, rng, log, "standby down or ineligible"));
@@ -1750,6 +1892,122 @@ mod tests {
             depth: 1,
             ancestry: vec![2],
             ..offer(from, 4, cfg)
+        }
+    }
+
+    /// RM2 + RM3 at the selector: a late move asks a relay and keeps the
+    /// publisher until the relay admits; a refusal leaves the publisher the
+    /// primary with nothing sent to it; an admit switches at once and leaves
+    /// the publisher fully, never as a (fed) standby.
+    #[test]
+    fn a_late_move_keeps_the_publisher_until_the_admit_and_then_leaves_it() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.direct_first = true;
+        cfg.jitter = false;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), true);
+        s.set_members([1u32, 2, 3]);
+        let (mut rng, mut log) = (SplitMix64(5), DecisionLog::default());
+        let offers = [(2, 4, 20.0)];
+        let _ = drive(&mut s, &cfg, 0, 6_000, &offers);
+        assert_eq!(s.primary(), Some(&2), "the premise: on the publisher");
+        let t = 6_000;
+        s.on_offer(t, relay_offer(3, &cfg), 5.0, &mut log);
+        let allow = |_: &u32| true;
+        assert_eq!(
+            s.late_move(t, &2, &allow, &mut log),
+            Some(SelectorAction::Subscribe {
+                parent: 3,
+                role: Role::Primary
+            })
+        );
+        assert!(s.primary_pending());
+        assert_eq!(s.late_move(t, &2, &allow, &mut log), None, "one at a time");
+        let refused = AdmitDecision::Refuse {
+            reason: super::super::RefuseReason::Capacity,
+            retry_after_ms: 0,
+        };
+        let acts = s.on_decision(t, &3, &refused, &mut rng, &mut log);
+        assert!(acts.is_empty(), "{acts:?}");
+        assert_eq!(s.primary(), Some(&2), "refused: still on the publisher");
+        let t = t + 10_000;
+        s.on_offer(t, offer(2, 4, &cfg), 20.0, &mut log);
+        s.on_offer(t, relay_offer(3, &cfg), 5.0, &mut log);
+        assert!(s.late_move(t, &2, &allow, &mut log).is_some());
+        let admit = AdmitDecision::Admit {
+            role: Role::Primary,
+        };
+        let acts = s.on_decision(t, &3, &admit, &mut rng, &mut log);
+        assert_eq!(s.primary(), Some(&3), "switched on the admit");
+        assert_eq!(acts, vec![SelectorAction::Unsubscribe { parent: 2 }]);
+        assert!(s.take_late_moved() && !s.take_late_moved());
+        for a in s.tick(t + 250, &mut rng, &mut log) {
+            assert_ne!(
+                a,
+                SelectorAction::Subscribe {
+                    parent: 2,
+                    role: Role::Standby
+                },
+                "the publisher is not taken back as a fed standby"
+            );
+        }
+    }
+
+    /// The loop guard on a standby: a standby whose latest offer shows this
+    /// node in its ancestry (it now hears the stream THROUGH this node) is
+    /// never promoted, neither as a failover nor as a voluntary switch.
+    /// Mutation (45.2.0 before): the promotion checked only the standby's
+    /// health and forwarding, so a node with no primary asked its own
+    /// descendant (the kill witness, 734a272).
+    #[test]
+    fn a_standby_that_became_a_descendant_is_never_promoted() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.direct_first = true;
+        cfg.jitter = false;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), true);
+        s.set_members([1u32, 2, 3]);
+        let (mut rng, mut log) = (SplitMix64(5), DecisionLog::default());
+        let offers = [(2, 4, 20.0)];
+        let _ = drive(&mut s, &cfg, 0, 4_000, &offers);
+        assert_eq!(s.primary(), Some(&2), "the premise: on the publisher");
+        // 3 offers as a relay under 2 and becomes this node's standby.
+        let mut t = 4_000;
+        let mut standby = false;
+        while t < 12_000 && !standby {
+            s.on_offer(t, offer(2, 4, &cfg), 20.0, &mut log);
+            s.on_offer(t, relay_offer(3, &cfg), 5.0, &mut log);
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let _ = s.on_decision(
+                        t,
+                        &parent,
+                        &AdmitDecision::Admit { role },
+                        &mut rng,
+                        &mut log,
+                    );
+                }
+            }
+            standby = s.standby() == Some(&3);
+            t += 250;
+        }
+        assert!(standby, "the premise: 3 is the standby");
+        // 3 now hears the stream through this node, and the publisher's link
+        // is gone.
+        let looped = Offer {
+            depth: 2,
+            ancestry: vec![2, 1],
+            ..offer(3, 4, &cfg)
+        };
+        s.on_offer(t, looped, 5.0, &mut log);
+        s.on_link_down(t, &2, &mut log);
+        for k in 0..8u64 {
+            let acts = s.tick(t + k * 250, &mut rng, &mut log);
+            assert!(
+                !acts.contains(&SelectorAction::Subscribe {
+                    parent: 3,
+                    role: Role::Primary
+                }),
+                "promoted its own descendant: {acts:?}"
+            );
         }
     }
 
@@ -2060,6 +2318,7 @@ mod tests {
             role: Role::Standby,
             at_ms: 10_000,
             was_standby: false,
+            late: false,
         };
         let out = s.on_decision(10_100, &other, &admit(Role::Primary), &mut rng, &mut log);
         assert!(out.is_empty(), "{out:?}");
