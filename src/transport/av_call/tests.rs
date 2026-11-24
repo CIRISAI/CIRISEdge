@@ -1004,3 +1004,22 @@ fn only_a_backlogged_leg_holds_its_offer() {
         "only offers are held"
     );
 }
+
+/// G8 — a periodic re-announce skips every leg while the uplink stall
+/// verdict holds, else only the backlogged legs; a clear leg on a clear
+/// uplink still gets it.
+#[test]
+fn a_reannounce_skips_backlogged_legs_and_a_stalled_uplink() {
+    let legs: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+    let backlogged: std::collections::HashSet<String> = ["b".to_owned()].into_iter().collect();
+    assert_eq!(
+        reannounce_skips(&legs, false, &backlogged),
+        vec!["b".to_owned()]
+    );
+    assert_eq!(
+        reannounce_skips(&legs, true, &backlogged),
+        legs,
+        "stalled: none"
+    );
+    assert!(reannounce_skips(&legs, false, &std::collections::HashSet::new()).is_empty());
+}

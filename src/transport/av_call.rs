@@ -5289,16 +5289,58 @@ async fn reannounce(shared: &Arc<Shared>) {
             v2.extend(share.key.wire_v2.clone());
         }
     }
+    // G8 — the transition: re-announce due ∧ (this node's uplink stall
+    // verdict holds ∨ the leg is backlogged) → skip that leg this round
+    // (av_binding_reannounce_held). The re-announce only repeats a binding
+    // the peer already holds (for a part a full inbound queue dropped); on a
+    // queued uplink its ~10 hybrid-signed parts per binding per leg, and
+    // their retransmits, are what kept P's queue from draining after a stall
+    // shed (the capped witness: +5-6 s of queue every 10 s). Never skipped:
+    // a new leg's bindings (dial_leg), an epoch roll's (send_bindings_on), a
+    // v2 upgrade's (send_v2_bindings_to).
+    let held = reannounce_held_legs(shared).await;
+    if !held.is_empty() {
+        for _ in &held {
+            shared.count(crate::observability::AV_BINDING_REANNOUNCE_HELD);
+        }
+    }
     // v2 first (CC rc18), then v1.
     if !v2.is_empty() {
-        let not_v2 = legs_without_binding_v2(shared).await;
+        let mut not_v2 = legs_without_binding_v2(shared).await;
+        not_v2.extend(held.iter().cloned());
         for w in &v2 {
             send_binding_paced(shared, w, &not_v2, Some(REANNOUNCE_PART_GAP)).await;
         }
     }
     for w in &v1 {
-        send_binding_paced(shared, w, &[], Some(REANNOUNCE_PART_GAP)).await;
+        send_binding_paced(shared, w, &held, Some(REANNOUNCE_PART_GAP)).await;
     }
+}
+
+/// G8 — the legs a periodic re-announce skips now: every leg while this
+/// node's uplink stall verdict holds, else the backlogged ones.
+async fn reannounce_held_legs(shared: &Arc<Shared>) -> Vec<String> {
+    let stalled = Shared::lock(&shared.alm).uplink_stalled();
+    let legs = shared
+        .publisher
+        .lock()
+        .await
+        .dispatcher_mut()
+        .subscriber_ids();
+    let backlogged = Shared::lock(&shared.backlogged_legs).clone();
+    reannounce_skips(&legs, stalled, &backlogged)
+}
+
+/// G8 — the pure rule [`reannounce_held_legs`] applies.
+fn reannounce_skips(
+    legs: &[String],
+    stalled: bool,
+    backlogged: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    legs.iter()
+        .filter(|l| stalled || backlogged.contains(*l))
+        .cloned()
+        .collect()
 }
 
 /// v45 — each of `links`' Channel watermark now: its newest message's

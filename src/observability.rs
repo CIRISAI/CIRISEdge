@@ -1114,6 +1114,9 @@ pub const AV_CHUNK_PARKED_REPLACED: &str = "av_chunk_parked_replaced";
 /// G8 C — a call leg waiting out a failed dial's backoff dialled at once
 /// because the member's direct path came up.
 pub const AV_LEG_REDIAL_ON_DIRECT_PATH: &str = "av_leg_redial_on_direct_path";
+/// G8 — a periodic stream-key binding re-announce skipped on one leg: the
+/// uplink stall verdict held or the leg was backlogged.
+pub const AV_BINDING_REANNOUNCE_HELD: &str = "av_binding_reannounce_held";
 /// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
 /// unshaped links only (Eric 2026-11-06).
 pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
@@ -2998,6 +3001,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_CHUNK_PARKED_SENT,
     AV_CHUNK_PARKED_REPLACED,
     AV_LEG_REDIAL_ON_DIRECT_PATH,
+    AV_BINDING_REANNOUNCE_HELD,
     SHAPED_ONLY_NO_MEDIA,
     AV_CALL_ENDED_MEDIA_REFUSED,
     ALM_FORWARDED,
