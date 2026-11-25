@@ -1395,6 +1395,7 @@ pub mod send_diag {
     }
 }
 
+#[cfg(feature = "_reticulum-module")]
 mod leviculum_link {
     use std::collections::HashMap;
     use std::sync::Arc;
