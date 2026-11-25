@@ -1,5 +1,7 @@
 # `outfox-xwing-v1`: the onion packet (edge's submission for CC 5.4.6 item 3)
 
+**Why this exists.** Shaping hides a link's load but not who a node's peers are. An onion packet is wrapped in one layer per relay, so each relay learns only the hop before and the hop after, and no single relay learns both ends. This page is the packet's wire layout.
+
 **Status:** edge's proposal for the CC to pin. It is implemented in
 `src/onion/packet.rs`, and the tier ships dormant in edge v44. The known
 answers in §8 are produced by `kat_outfox_xwing_v1` and

@@ -1,5 +1,7 @@
 # Link shaping: defaults and bandwidth cost per class (edge v44)
 
+**Why this exists.** Encryption hides what a link carries, not when or how much. A shaped link sends fixed-size frames at a steady random rate, busy or idle, so its load cannot be read from the wire; that costs bandwidth and delay, and this page states the cost per class before anyone turns it on.
+
 CC 5.4.3 (rc17), `CLM-link-shaping`, `CLM-shaped-link-bound-refuse`, `CLM-seat-class`. Eric, as steward, ruled the fleet default
 on 2026-11-02; the ruling is final. The shaped frame is 1,400 bytes (CC 5.4.3 rc17, CIRISConstitution a3dd97a;
 edge 44.1.1, CIRISEdge#963): see [The shaped frame](#the-shaped-frame).

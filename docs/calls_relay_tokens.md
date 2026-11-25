@@ -1,5 +1,7 @@
 # Edge 45.2.0 — call paths and peer relay: the frozen token set (for hosts)
 
+**Why this exists.** When a call cannot reach a member, the person should see the real reason, and a client needs stable words to show it. This page is that closed set of tokens, so the server and client render edge's verdict instead of re-deriving it.
+
 Every token in this file is **frozen for 45.x**. Later releases only add tokens; none is renamed or removed in 45.x. A host must accept a token it doesn't know, and show it as the generic case.
 
 **Show** means the client explains it to a person (it needs copy). **Diag** means it goes to the "?" panel, logs or support only.
