@@ -28,13 +28,24 @@ relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`.
 - No receive loop waits on the host: a member whose app stops reading frames kept no control
   plane and stranded its children.
 - A control frame the transport delivered is never shed with media at the receiver.
+- The link stall guard keeps a link whose peer is alive and reaching this node (verified media
+  within 2 s): its acknowledgements are late behind a queue, not lost. The 30 s bound still ends
+  a link whose peer stopped acknowledging. `link_stall_held_peer_alive`.
+- A node that does not propose still answers a direct-link proposal: its facilitator is handed to
+  leviculum whenever one is named (leviculum v0.34.0+ciris.4 answers only through its own).
 - A forwarder sheds an existing child only on a congestion verdict (row NV), never because another
   stream it relays admitted someone.
 - A Capacity refusal is demand only when the publisher is not latched, did not just shed the
   asker, and has drained; demand lapses after a dwell. Re-open steps no longer compound.
 - A child its publisher shed does not ask it straight back.
 
+### Changed
+- With leviculum v0.34.0+ciris.4 a node with no facilitator named, or with proposing off (which
+  resolves none), no longer accepts direct links.
+
 ### Known
+- When an uplink is capped, the first ten seconds lose about half of that publisher's media while
+  the shed and the relays settle.
 - Call events to a host that is not reading are dropped past 64 (counted, logged once per call);
   pair-preserving delivery is planned for 45.2.1.
 - Two members that lose the same relay can promote each other for one round; admission refuses

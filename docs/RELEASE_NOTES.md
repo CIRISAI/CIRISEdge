@@ -23,6 +23,11 @@ call and relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`. Detai
   a busy UI) keeps answering control, keeps its parent and keeps relaying; what its host missed is
   counted (`av_frame_dropped_host_not_reading`). A control frame the transport delivered is never
   shed with media.
+- **A slow acknowledgement is not a dead link.** Under a capped uplink the one child a publisher
+  still fed saw its sends go unacknowledged for three seconds and retired its direct path to the
+  publisher, cutting everyone behind it off for up to 14 s. A link whose peer is plainly alive
+  (its media arrived within 2 s) is now kept, and still ends at 30 s if the peer truly stopped
+  acknowledging (`link_stall_held_peer_alive`).
 - **A publisher sheds a child only on a congestion verdict**, never because another stream it
   relays admitted someone; and a child it shed does not ask it straight back.
 - **Direct links:** leviculum v0.34.0+ciris.4 brings port prediction, many-socket punches, a
@@ -31,10 +36,16 @@ call and relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`. Detai
   from the path's minimum round trip, a path move judged by the old path's round trip).
 - **`README.md` says why each piece exists**, in plain words, with the Constitution, CEWP and the
   kernel linked.
+- **Changed with leviculum v0.34.0+ciris.4:** a device answers a direct-connection request only by
+  probing a helper server (facilitator) of its own, never one the other side names. A device with
+  none named, or with proposing switched off by its operator (which resolves none), no longer
+  accepts direct connections.
 - **Known, for 45.2.1:** call events to a host that is not reading are dropped past 64 (now
   counted, `av_call_event_dropped_host_not_reading`, and logged once per call); pair-preserving
   delivery follows. Two members that lose the same relay can promote each other for one round
-  before admission refuses the second.
+  before admission refuses the second. When an uplink is capped, the first ten seconds lose about
+  half of that publisher's media while the shed and the relays settle; after that about 90 % is
+  heard.
 
 # v45.1.10 — where the bytes go, who the links are, and Python leaves the release
 
