@@ -1416,6 +1416,18 @@ impl AlmState {
                 .sum::<u64>()
     }
 
+    /// 45.3 (row S3) — the RELAY part of [`Self::external_except`]: what the
+    /// streams this node forwards for other members commit. Set beside it on
+    /// every own admission: a publisher with no primary child admits one
+    /// past this, never past its own other streams.
+    fn relay_except(&self, stream: StreamId) -> u64 {
+        self.relays
+            .iter()
+            .filter(|(s, _)| **s != stream)
+            .map(|(_, a)| a.committed_bps())
+            .sum()
+    }
+
     /// The SUBSCRIBE this node sends `parent` for `stream` in `role`: with
     /// this node's layer cap for the stream when the parent takes one.
     fn subscribe_frame(&self, stream: StreamId, parent: &str, role: Role) -> Vec<u8> {
@@ -1544,9 +1556,11 @@ impl AlmState {
                 } else if self.is_own(stream) {
                     self.provisional.remove(&(stream, peer.to_owned()));
                     let ext = self.external_except(stream);
+                    let relay = self.relay_except(stream);
                     let (mut rng, mut log) = (self.rng.clone(), std::mem::take(&mut self.log));
                     let a = self.own_admission_mut(stream).expect("own");
                     a.set_external_committed(ext);
+                    a.set_external_relay_committed(relay);
                     let d = a.request(now, &req, &mut rng, &mut log);
                     let pre = a.take_preempted();
                     let unmeasured = a.ceiling_bps().is_none();
@@ -1648,6 +1662,7 @@ impl AlmState {
                         .get(&stream)
                         .is_some_and(|t| now.saturating_sub(*t) <= STREAM_LIVE_MS);
                     let ext = self.external_except(stream);
+                    let relay = self.relay_except(stream);
                     let mut log = std::mem::take(&mut self.log);
                     let mut departed = false;
                     if let Some(a) = self.own_admission_mut(stream) {
@@ -1658,6 +1673,7 @@ impl AlmState {
                         a.release(&p);
                         if direct && live {
                             a.set_external_committed(ext);
+                            a.set_external_relay_committed(relay);
                             a.on_departure(now, &mut log);
                             departed = true;
                         }
@@ -1911,7 +1927,9 @@ impl AlmState {
             }
         }
         let ext = self.external_except(self.own_stream);
+        let relay = self.relay_except(self.own_stream);
         self.own.set_external_committed(ext);
+        self.own.set_external_relay_committed(relay);
         let drained = self.uplink_drained();
         self.own.set_uplink_drained(now, drained);
         let mut own_w = w;
@@ -1926,8 +1944,10 @@ impl AlmState {
         let shares: Vec<StreamId> = self.shares.keys().copied().collect();
         for s in shares {
             let ext = self.external_except(s);
+            let relay = self.relay_except(s);
             let (a, _) = self.shares.get_mut(&s).expect("present");
             a.set_external_committed(ext);
+            a.set_external_relay_committed(relay);
             self.log.set_stream(Some(stream_label(s)));
             for p in a.on_egress_window(now, &w, &mut self.log) {
                 shed.push((s, p));

@@ -219,6 +219,9 @@ pub struct Admission<P: PeerRef> {
     class: ClassPolicy,
     admit_closed: bool,
     external_committed: u64,
+    /// 45.3 — the share of [`Self::external_committed`] that is RELAY work
+    /// (other members' streams this node forwards), set beside it.
+    external_relay_committed: u64,
     draining: BTreeMap<P, Drain>,
     /// G8 — no upward probe (no demand step, no doubling, no stale reset)
     /// before this instant: set by an uplink-stall verdict.
@@ -336,6 +339,7 @@ impl<P: PeerRef> Admission<P> {
             class: ClassPolicy::default(),
             admit_closed: false,
             external_committed: 0,
+            external_relay_committed: 0,
             draining: BTreeMap::new(),
             probe_hold_until_ms: 0,
             slow_start: false,
@@ -405,6 +409,16 @@ impl<P: PeerRef> Admission<P> {
     /// on the same uplink: subtracted from this one's limit.
     pub fn set_external_committed(&mut self, bps: u64) {
         self.external_committed = bps;
+    }
+
+    /// 45.3 — how much of [`Self::set_external_committed`]'s bits/s is
+    /// RELAY work: other members' streams this node forwards, which another
+    /// member can carry. A publisher with no primary child admits one over
+    /// it (row S3); the node's own other streams (its shares) keep their
+    /// room. Call it after [`Self::set_external_committed`]; it is clamped
+    /// to that.
+    pub fn set_external_relay_committed(&mut self, bps: u64) {
+        self.external_relay_committed = bps.min(self.external_committed);
     }
 
     /// Price commitments at measured rates: a primary costs `stream_bps`, a
@@ -991,11 +1005,17 @@ impl<P: PeerRef> Admission<P> {
         // said. Its uplink is the one path nothing replaces, and the root's
         // floor is one stream; refusing it here left a capped publisher with
         // no children for the rest of a cap (the kept child's link had died).
-        // Only for a publisher whose uplink carries nothing else of its own
-        // (no share or relay commitments): those keep their room.
+        // Only for a publisher whose uplink carries nothing else of its OWN
+        // (no share commitments): those keep their room. RELAY work (other
+        // members' streams, which another forwarder can carry) does not
+        // hold it back (45.3): a capped publisher's kept child died, it took
+        // relay standbys while its own stream had no child, and every member
+        // that asked was refused for the rest of the probe hold (the kill
+        // witness, 1 run in 4). The next verdict sheds the relay work; a
+        // root never sheds its last primary.
         if self.is_root
             && req.role == Role::Primary
-            && self.external_committed == 0
+            && self.external_committed == self.external_relay_committed
             && !self.ledger.values().any(|c| c.role == Role::Primary)
         {
             self.commit(now_ms, req, log);
@@ -1444,6 +1464,75 @@ mod tests {
         ));
         assert!(!matches!(
             a.request(0, &req(2, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+    }
+
+    /// Row S3, under relay work — a capped publisher's kept child died; its
+    /// uplink still carries standby commitments it took as a RELAY for other
+    /// members' streams. The next member to ask is admitted: the publisher's
+    /// own one path ranks ahead of relay work another member can carry (the
+    /// next verdict sheds the relay's, never the last primary). The state is
+    /// the kill witness's at the refusal, read from the run: the stall
+    /// verdict's ceiling (one stream plus the 8 kbit of relay work it then
+    /// held), the probe hold latched, the ledger empty, 16 kbit of relay
+    /// standbys by the time anyone asked. Before: refused `Capacity` (82.9
+    /// kbit of room for a 90.5 kbit stream), not counted as demand (the hold
+    /// was latched and the uplink not drained), so nothing re-opened P for
+    /// the rest of the hold (`a_capped_publishers_kept_child_lost_mid_cap_is_recovered`,
+    /// 1 run in 4).
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_publisher_with_no_primary_admits_one_over_relay_work() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), None);
+        roster(&mut a);
+        a.set_probe_backoff(true);
+        a.set_shed_on_verdict_only(true);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        let one = cfg.stream_bps as f64;
+        let relay = cfg.standby_bps;
+        a.set_external_committed(relay);
+        a.set_external_relay_committed(relay);
+        let _ = a.on_egress_window(19_253, &window(one + relay as f64, true), &mut log);
+        a.hold_probe(28_000);
+        a.set_external_committed(2 * relay);
+        a.set_external_relay_committed(2 * relay);
+        assert!(a.ceiling_bps().is_some() && a.probe_held(20_538));
+        assert!(
+            a.hard_limit_bps() < one,
+            "the room reads short of one stream"
+        );
+        assert!(matches!(
+            a.request(20_538, &req(2, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        // One: a second ask is not the no-primary path.
+        assert!(!matches!(
+            a.request(20_600, &req(3, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+    }
+
+    /// Row S3's other side — the node's OWN other streams (a share) keep
+    /// their room: a publisher with no camera child but a share holding the
+    /// uplink is not admitted past it.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_publisher_with_no_primary_keeps_its_shares_room() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), None);
+        roster(&mut a);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        let one = cfg.stream_bps as f64;
+        let relay = cfg.standby_bps;
+        a.set_external_committed(cfg.stream_bps + relay);
+        a.set_external_relay_committed(relay);
+        let _ = a.on_egress_window(1_000, &window(one, true), &mut log);
+        assert!(!matches!(
+            a.request(1_100, &req(2, Role::Primary), &mut rng, &mut log),
             AdmitDecision::Admit { .. }
         ));
     }

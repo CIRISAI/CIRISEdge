@@ -146,6 +146,10 @@ the whole tree (45.2.0 kill witness). The publisher's ADMIT answering that ask
 clears the Down (a fresh commitment, not an offer), and its offer's
 `upstream_latency_ms` (its own uplink queue) is owed before the first chunk,
 so delivery still has to follow or silence takes the parent down again.
+On the publisher's side, a publisher with no primary child admits one past
+relay work (other members' streams, which other forwarders can carry); only its
+own shares keep their room, and the next verdict sheds the relay work, never
+that last primary (45.3).
 
 ---
 
