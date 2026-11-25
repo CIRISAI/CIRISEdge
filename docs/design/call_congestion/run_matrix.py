@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE", ASKSHED="FALSE", ASKLOSS="FALSE", PLADMIT="FALSE", DGUARD="FALSE", RFREE="40", PROMOTE="FALSE", SU="FALSE", BRIDGE="0", PRESET="FALSE", STARVEAT="0", SUNSUB="FALSE", PFMAX="2", EXT="0", EXTAT="0", OCSHED="FALSE", CRAISE="FALSE", REOPEN="FALSE",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE", ASKSHED="FALSE", ASKLOSS="FALSE", PLADMIT="FALSE", DGUARD="FALSE", RFREE="40", PROMOTE="FALSE", SU="FALSE", BRIDGE="0", PRESET="FALSE", STARVEAT="0", SUNSUB="FALSE", PFMAX="2", EXT="0", EXTAT="0", OCSHED="FALSE", CRAISE="FALSE", REOPEN="FALSE", FAILRULE="FALSE", TTF="2",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -269,6 +269,27 @@ def scenarios():
     yield "ro-combined-cap-held-pf2", dict(combined, CAPUNTIL="1000", PFMAX="2", EXT="0")
     yield "ro-combined-norelay", dict(combined, SLOTS="0", EXT="0", CAPAT="1000", CAPUNTIL="1000", HORIZON="260")
     yield "ro-clean-raise-only", dict(today, OCSHED="FALSE", EXT="0")
+    # The ruled fail count. Reduced: three people, one phase, one choice; a
+    # cap 0.05 copy below the two-copy step (copy 20, RCap 39) so a step takes
+    # seconds to fail; dwell 10 s; horizon 260 s.
+    one = dict(PPH="{3}", LPH="{0}", WPH="{0}", NPICK="1", PUNCH="{10}")
+    fr = dict(combined, **one, LSEQ="Listeners2", RANK="Rank2", M="20", RCAP="39", RFREE="200",
+              EXT="0", HORIZON="2600", CAPUNTIL="100000", PFMAX="6")
+    yield "fr-old-cap-held", fr
+    for f in ["0", "1", "2", "4"]:
+        yield f"fr-rule-ttf{f}-cap-held", dict(fr, FAILRULE="TRUE", TTF=f)
+    for lift in ["1200", "1240", "1280", "1320"]:
+        yield f"fr-old-lift{lift}", dict(fr, CAPUNTIL=lift)
+        yield f"fr-rule-lift{lift}", dict(fr, FAILRULE="TRUE", CAPUNTIL=lift)
+    # The same with the stall verdict as the only congestion signal (no
+    # ReceiverMoves): a step 0.05 copy over the cap takes ~15 s to fail.
+    frv = dict(fr, RXMOVE="FALSE", HASH="FALSE")
+    yield "frv-old-cap-held", frv
+    for f in ["0", "1", "2"]:
+        yield f"frv-rule-ttf{f}-cap-held", dict(frv, FAILRULE="TRUE", TTF=f)
+    for lift in ["600", "700", "800", "900", "1000", "1100"]:
+        yield f"frv-old-lift{lift}", dict(frv, CAPUNTIL=lift)
+        yield f"frv-rule-lift{lift}", dict(frv, FAILRULE="TRUE", CAPUNTIL=lift)
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)

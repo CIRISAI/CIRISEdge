@@ -92,6 +92,12 @@ CONSTANTS
     BridgeEvery,        \* a parentless member with no candidate asks P this often (0: never)
     PresetTree,         \* start from: C on P; A and B on C; A and B each other's standby
     ProbeFailsMax,      \* the backoff's cap: 2 windows x 2^fails, fails <= this
+    FailRule,           \* the ruled fail count: +1 on congestion after a widening (its
+                        \* time-to-fail recorded); -1 only after a widening survives
+                        \* max(its backoff, TtfFactor x the longest time-to-fail); reset
+                        \* by a clean window that carried more than the ceiling, and by
+                        \* the staleness; steps = commitments + one stream
+    TtfFactor,
     ExtCopies, ExtAt,   \* from ExtAt, P also relays ExtCopies other streams' copies on its
                         \* uplink (load, and commitments beside its own stream)
     OverCommitShed,     \* today: own children past (ceiling - external) are shed, no verdict
@@ -234,7 +240,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge, demandAt, maxCeil,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge, demandAt, maxCeil, ttfMax, forgivenFor, fullAfterLift, backlogAtLift, widenLog,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -242,7 +248,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge, demandAt, maxCeil, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge, demandAt, maxCeil, ttfMax, forgivenFor, fullAfterLift, backlogAtLift, widenLog, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -276,6 +282,8 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         askNow |-> askNow, lastShedAt |-> lastShedAt, refusedBy |-> refusedBy,
         repeatDemand |-> repeatDemand, offerUp |-> offerUp, standby |-> standby, lostPrim |-> lostPrim,
         lostPrimAt |-> lostPrimAt, lastBridge |-> lastBridge, demandAt |-> demandAt, maxCeil |-> maxCeil,
+        ttfMax |-> ttfMax, forgivenFor |-> forgivenFor,
+        fullAfterLift |-> fullAfterLift, backlogAtLift |-> backlogAtLift, widenLog |-> widenLog,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -397,6 +405,14 @@ Ext(S) == IF ExtCopies > 0 /\ S.now >= ExtAt THEN ExtCopies ELSE 0
 \* room is P's ceiling in copies (its own stream and what it relays); what
 \* its own stream may hold is that minus the other streams' commitments
 OwnLimit(S) == S.room - Ext(S)
+WidenLatest(S) == S.lastWiden > S.lastCong
+FailBump(S, T) ==
+    IF ~FailRule THEN T
+    ELSE [T EXCEPT !.probeFails = IF WidenLatest(S) THEN Min(S.probeFails + 1, ProbeFailsMax) ELSE S.probeFails,
+                   !.ttfMax = IF WidenLatest(S) THEN Max(S.ttfMax, S.now - S.lastWiden) ELSE S.ttfMax]
+\* the widening step: today room + 1 (it compounds on unused room); under
+\* FailRule, what is committed (own + external) plus one stream
+StepUp(S, r) == IF FailRule THEN Cardinality(S.children) + Ext(S) + 1 ELSE r + 1
 PAdmit(S, l) ==
     IF l \in S.children THEN SendCtrl(S, <<"P", l>>, Pay("admit"))
     ELSE IF Cardinality(S.children) < (IF Reopen \/ OverCommitShed THEN OwnLimit(S) ELSE S.room)
@@ -476,18 +492,19 @@ Handle(S, pay, s, r) ==
       [] pay.p = "shed" -> OnShed(S, r, s)
       [] pay.p = "unsub_late" \/ (pay.p = "unsub" /\ DepartureHolds /\ r = "P" /\ s \in S.children) ->
             LET kids == S.children \ {s}
-            IN [S EXCEPT !.children = kids, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
+            IN FailBump(S, [S EXCEPT !.children = kids, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
                          !.standbys = @ \ {s},
                          !.room = Max(1, Cardinality(kids)), !.lastCong = S.now,
-                         !.probeFails = IF ProbeBackoff THEN Min(@ + 1, ProbeFailsMax) ELSE @]
+                         !.probeFails = IF ProbeBackoff THEN Min(@ + 1, ProbeFailsMax) ELSE @])
       [] pay.p \in {"standby", "standby_late"} /\ r = "P" ->
             LET kids == S.children \ {s}
                 late == pay.p = "standby_late" \/ (DepartureHolds /\ s \in S.children)
-            IN [S EXCEPT !.children = kids, !.standbys = @ \cup {s}, !.drainTo[s] = -1,
+                T == [S EXCEPT !.children = kids, !.standbys = @ \cup {s}, !.drainTo[s] = -1,
                          !.shedPend[s] = FALSE,
                          !.room = IF late THEN Max(1, Cardinality(kids)) ELSE @,
                          !.lastCong = IF late THEN S.now ELSE @,
                          !.probeFails = IF late /\ ProbeBackoff THEN Min(@ + 1, ProbeFailsMax) ELSE @]
+            IN IF late THEN FailBump(S, T) ELSE T
       [] pay.p = "unsub" ->
             IF r = "P"
             THEN [S EXCEPT !.children = @ \ {s}, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
@@ -807,9 +824,9 @@ Watch(S, ch) ==
 Window(S, ch) ==
     IF S.now % WindowTicks /= S.winPhase \/ ~Alive(S, "P") THEN S
     ELSE IF S.stall
-    THEN LET S1 == [S EXCEPT !.lastCong = S.now, !.room = Min(@, 1),
+    THEN LET S1 == FailBump(S, [S EXCEPT !.lastCong = S.now, !.room = Min(@, 1),
                              !.probeFails = IF ProbeAfterDrain /\ ProbeBackoff /\ S.lastWiden > S.lastCong
-                                            THEN Min(@ + 1, ProbeFailsMax) ELSE @]
+                                            THEN Min(@ + 1, ProbeFailsMax) ELSE @])
          IN IF Cardinality(S1.children) > KeepOf(ch) THEN ShedTo(S1, KeepOf(ch)) ELSE S1
     ELSE LET \* any widening waits out the probe backoff: 2 windows x 2^fails
              \* since the last congestion (a late move is one, ReceiverMoves)
@@ -819,7 +836,7 @@ Window(S, ch) ==
              \* congestion serves a refusal at the next window (nobody relays)
              live == ~Reopen \/ (S.demandAt >= 0 /\ S.now - S.demandAt <= Dwell)
              r1 == IF S.demand /\ live /\ S.room < NL + Ext(S) /\ (calm \/ ~ProbeBackoff \/ (DemandGuard /\ ~Reopen /\ S.lastCong < 0 /\ S.repeatDemand))
-                   THEN S.room + 1 ELSE S.room
+                   THEN StepUp(S, S.room) ELSE S.room
              \* SlowStart: two clean windows since the last congestion and the
              \* last widening prove the room it has; widen by one stream (the
              \* probe is the widening; a stall takes it back).
@@ -831,23 +848,38 @@ Window(S, ch) ==
              drained == S.drainedSince >= 0 /\ S.now - S.drainedSince >= DrainHold
              pad == ProbeAfterDrain /\ ~probe /\ r1 = S.room /\ r1 < NL + Ext(S) /\ drained
                     /\ S.now - S.lastWiden >= Dwell /\ (~ProbeBackoff \/ calm)
-             r2 == IF probe \/ pad THEN r1 + 1 ELSE r1
+             r2 == IF probe \/ pad THEN StepUp(S, r1) ELSE r1
              r3a == IF ~SlowStart /\ S.lastCong >= 0 /\ S.now - S.lastCong >= CeilingStale
                     THEN NL + Ext(S) ELSE r2
              \* today's second raise: a clean window that carried more than the
              \* ceiling raises it to what it carried (copies), no backoff
              carried == (Rate(S.now) * WindowTicks) \div (M * WindowTicks)
-             r3 == IF CleanRaise /\ S.lastCong >= 0 /\ S.backlog > 0 /\ carried > r3a THEN carried ELSE r3a
+             cleanOver == CleanRaise /\ S.lastCong >= 0 /\ S.backlog > 0 /\ carried > r3a
+             stale == ~SlowStart /\ S.lastCong >= 0 /\ S.now - S.lastCong >= CeilingStale
+             \* FailRule (3): the raise is one stream per dwell, not to what it carried
+             r3 == IF cleanOver
+                   THEN (IF FailRule THEN (IF S.now - S.lastWiden >= Dwell THEN StepUp(S, r3a) ELSE r3a)
+                         ELSE carried)
+                   ELSE r3a
+             \* FailRule (2): forgive one fail when the latest widening has
+             \* survived max(its backoff wait, TtfFactor x the longest time-to-fail)
+             forgive == FailRule /\ WidenLatest(S) /\ S.lastWiden > S.forgivenFor /\ S.probeFails > 0
+                        /\ S.now - S.lastWiden >= Max(2 * WindowTicks * 2^S.probeFails, TtfFactor * S.ttfMax)
              \* a widening after one that held (no congestion since) steps the
              \* backoff down: the probe that worked is the measurement
              held == S.lastWiden > S.lastCong
              S9 == [S EXCEPT !.room = r3, !.demand = IF r1 /= S.room \/ ~live THEN FALSE ELSE @,
                       !.repeatDemand = IF r1 /= S.room THEN FALSE ELSE @,
                       !.lastWiden = IF r3 /= S.room THEN S.now ELSE @,
-                      !.probeFails = IF r3 /= S.room /\ held THEN Max(0, @ - 1) ELSE @,
+                      !.probeFails = IF FailRule
+                                     THEN (IF cleanOver \/ stale THEN 0 ELSE IF forgive THEN @ - 1 ELSE @)
+                                     ELSE IF r3 /= S.room /\ held THEN Max(0, @ - 1) ELSE @,
+                      !.ttfMax = IF FailRule /\ (cleanOver \/ stale) THEN 0 ELSE @,
+                      !.forgivenFor = IF forgive THEN S.lastWiden ELSE @,
+                      !.widenLog = IF r3 > S.room /\ Len(@) < 16 THEN Append(@, S.now) ELSE @,
                       !.maxCeil = Max(@, r3)]
          IN IF OverCommitShed /\ ~Reopen /\ Cardinality(S9.children) > Max(0, OwnLimit(S9))
-            THEN [ShedTo(S9, Max(0, OwnLimit(S9))) EXCEPT !.room = S9.room]   \* the ceiling stands
+            THEN FailBump(S9, [ShedTo(S9, Max(0, OwnLimit(S9))) EXCEPT !.room = S9.room])   \* the ceiling stands
             ELSE S9
 
 \* F13: P's binding re-announce, every BindEvery on every live leg: BindParts
@@ -1180,6 +1212,10 @@ Step(S, ch) ==
                            !.maxJoins = IF S10.firstShedAt >= 0 \/ S10.lastCong >= 0
                                         THEN Max(@, Cardinality({c \in L : c \in S10.children /\ c \notin S.children}))
                                         ELSE @,
+                           !.backlogAtLift = IF S10.now = CapUntil THEN S10.backlog ELSE @,
+                           !.fullAfterLift = IF @ < 0 /\ CapUntil < Horizon /\ S10.now >= CapUntil
+                                                /\ \A c \in {x \in L : Alive(S10, x)} : S10.parent[c] = "P"
+                                             THEN S10.now ELSE @,
                            !.allOkAt = IF @ < 0 /\ KillAt > 0 /\ S10.now > KillAt
                                           /\ S10.children /= {}
                                           /\ \A c \in {x \in L : Alive(S10, x)} : S10.parent[c] /= None
@@ -1231,7 +1267,8 @@ Init ==
                                                    THEN (IF n = LSeq[3] THEN "P" ELSE LSeq[3]) ELSE None]]
     /\ standby = [c \in L |-> IF (PresetTree /\ NL = 3) /\ c /= LSeq[3] THEN (IF c = LSeq[1] THEN LSeq[2] ELSE LSeq[1]) ELSE None]
     /\ lostPrim = [c \in L |-> None] /\ lostPrimAt = [c \in L |-> -1] /\ lastBridge = [c \in L |-> -100]
-    /\ demandAt = -1 /\ maxCeil = 0
+    /\ demandAt = -1 /\ maxCeil = 0 /\ ttfMax = 0 /\ forgivenFor = -1
+    /\ fullAfterLift = -1 /\ backlogAtLift = -1 /\ widenLog = <<>>
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = IF (PresetTree /\ NL = 3) THEN {LSeq[3]} ELSE {}
@@ -1281,7 +1318,8 @@ Assign(S) ==
     /\ askNow' = S.askNow /\ lastShedAt' = S.lastShedAt /\ refusedBy' = S.refusedBy
     /\ repeatDemand' = S.repeatDemand /\ offerUp' = S.offerUp /\ standby' = S.standby
     /\ lostPrim' = S.lostPrim /\ lostPrimAt' = S.lostPrimAt /\ lastBridge' = S.lastBridge
-    /\ demandAt' = S.demandAt /\ maxCeil' = S.maxCeil /\ dialAt' = S.dialAt
+    /\ demandAt' = S.demandAt /\ maxCeil' = S.maxCeil /\ ttfMax' = S.ttfMax /\ forgivenFor' = S.forgivenFor
+    /\ fullAfterLift' = S.fullAfterLift /\ backlogAtLift' = S.backlogAtLift /\ widenLog' = S.widenLog /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
@@ -1359,7 +1397,9 @@ Observed ==
      first_verdict |-> firstVerdictAt, first_shed |-> firstShedAt, q_at_shed |-> firstShedQ,
      full_at |-> fullAt, parent_gap |-> maxParentGap, media_gap |-> maxMediaGap,
      drain_clear |-> drainClear, cap_end_q |-> capEndQ, zero_direct |-> maxZeroRun,
-     last_shed |-> lastShedAt, max_ceil |-> maxCeil, admits_ignored |-> admitsIgnored, max_parentless |-> maxParentless, probe_fails |-> probeFails,
+     last_shed |-> lastShedAt, max_ceil |-> maxCeil, widen_log |-> widenLog,
+     full_after_lift |-> IF fullAfterLift >= 0 THEN fullAfterLift - CapUntil ELSE -1,
+     backlog_at_lift |-> backlogAtLift, ttf_max |-> ttfMax, admits_ignored |-> admitsIgnored, max_parentless |-> maxParentless, probe_fails |-> probeFails,
      all_ok_after_kill |-> IF allOkAt >= 0 THEN allOkAt - KillAt ELSE IF KillAt > 0 THEN 9999 ELSE -1, stall_copies |-> maxStallCopies, primary_gap |-> maxPrimaryGap, verdict_rises |-> verdicts,
      heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
 \* One line per terminal state: the outcome, the violated set, what is observed.
