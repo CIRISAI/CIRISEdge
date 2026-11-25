@@ -42,8 +42,8 @@ def stats(xs):
 def main():
     outdir = sys.argv[1]
     pat = sys.argv[2] if len(sys.argv) > 2 else ".*"
-    rows = ["| scenario | verdict_s | shed_s | q_at_shed_s | max_q_s | end_q_s | heard_min_pct | full_at_s | parent_gap_s | media_gap_s | drain_clear_s | cap_end_q_s | zero_direct_s | ok_after_kill_s | obs |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    rows = ["| scenario | verdict_s | shed_s | q_at_shed_s | max_q_s | end_q_s | heard_min_pct | full_at_s | parent_gap_s | media_gap_s | drain_clear_s | cap_end_q_s | zero_direct_s | ok_after_kill_s | admits_ignored | max_parentless_s | probe_fails | obs |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for name, params in scenarios():
         if not re.fullmatch(pat, name):
             continue
@@ -75,6 +75,9 @@ def main():
             stats([o["cap_end_q"] / 10 if o["cap_end_q"] >= 0 else None for o in obs]),
             stats([o["zero_direct"] / 10 for o in obs]),
             stats([o["all_ok_after_kill"] / 10 if o.get("all_ok_after_kill", -1) >= 0 else None for o in obs]),
+            stats([o.get("admits_ignored", 0) for o in obs]),
+            stats([o.get("max_parentless", 0) / 10 for o in obs]),
+            stats([o.get("probe_fails", 0) for o in obs]),
             str(len(obs))]) + " |")
     print("\n".join(rows))
 

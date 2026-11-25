@@ -78,6 +78,10 @@ CONSTANTS
     TreeRepair,         \* F14b: no new media on any path for RepairTicks -> re-subscribe
     AdmitCleanup,       \* an Admit nobody is waiting for is answered by an Unsubscribe
     CtrlBg,             \* P's other A/V control, units per tick (load only)
+    ProbeAfterDrain,    \* once drained for DrainHold, a congestion-learned ceiling stops
+                        \* capping the probe: widen one child per Dwell under ProbeBackoff
+    DrainHold,
+    LateAdmitAccept,    \* a parentless listener applies an ADMIT it stopped waiting for
     NonChildEvery,      \* P offers to members that are not its children this often
     KillAt,             \* P's leg to its first direct child is torn at this tick (0: never)
     UpstreamShed,       \* a relay that loses its parent sheds its children (they fail over)
@@ -207,7 +211,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -215,7 +219,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -244,7 +248,8 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         offerDirect |-> offerDirect, zeroRun |-> zeroRun, maxZeroRun |-> maxZeroRun,
         standbys |-> standbys, maxStallCopies |-> maxStallCopies, primaryGapRun |-> primaryGapRun,
         maxPrimaryGap |-> maxPrimaryGap, bindSkips |-> bindSkips, lastOfferNC |-> lastOfferNC,
-        allOkAt |-> allOkAt, lostAt |-> lostAt,
+        allOkAt |-> allOkAt, lostAt |-> lostAt, drainedSince |-> drainedSince,
+        maxParentless |-> maxParentless, admitsIgnored |-> admitsIgnored, maxJoins |-> maxJoins,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -379,8 +384,9 @@ RelayAdmit(S, x, l) ==
     ELSE SendCtrl(S, <<x, l>>, Pay("refuse"))
 
 OnAdmit(S, l, x) ==
-    IF S.pendSub[l] /= x
-    THEN IF AdmitCleanup /\ S.parent[l] /= x THEN SendCtrl(S, <<l, x>>, Pay("unsub")) ELSE S
+    IF S.pendSub[l] /= x /\ ~(LateAdmitAccept /\ S.parent[l] = None)
+    THEN LET S0 == [S EXCEPT !.admitsIgnored = IF S.parent[l] /= x THEN @ + 1 ELSE @]
+         IN IF AdmitCleanup /\ S.parent[l] /= x THEN SendCtrl(S0, <<l, x>>, Pay("unsub")) ELSE S0
     ELSE LET old == S.parent[l]
              S1 == [S EXCEPT !.parent[l] = x, !.pendSub[l] = None,
                              !.reparents[l] = @ + 1, !.lastSwitch[l] = S.now,
@@ -698,7 +704,9 @@ Watch(S, ch) ==
 Window(S, ch) ==
     IF S.now % WindowTicks /= S.winPhase \/ ~Alive(S, "P") THEN S
     ELSE IF S.stall
-    THEN LET S1 == [S EXCEPT !.lastCong = S.now, !.room = Min(@, 1)]
+    THEN LET S1 == [S EXCEPT !.lastCong = S.now, !.room = Min(@, 1),
+                             !.probeFails = IF ProbeAfterDrain /\ ProbeBackoff /\ S.lastWiden > S.lastCong
+                                            THEN Min(@ + 1, 2) ELSE @]
          IN IF Cardinality(S1.children) > KeepOf(ch) THEN ShedTo(S1, KeepOf(ch)) ELSE S1
     ELSE LET \* any widening waits out the probe backoff: 2 windows x 2^fails
              \* since the last congestion (a late move is one, ReceiverMoves)
@@ -711,7 +719,12 @@ Window(S, ch) ==
              probe == SlowStart /\ r1 = S.room /\ r1 < NL   \* one stream a window
                       /\ (IF ProbeBackoff THEN calm
                           ELSE S.now - Max(S.lastCong, S.lastWiden) >= 2 * WindowTicks)
-             r2 == IF probe THEN r1 + 1 ELSE r1
+             \* ProbeAfterDrain: drained (no queue, nothing outstanding) for
+             \* DrainHold: one more stream per Dwell, under the backoff
+             drained == S.drainedSince >= 0 /\ S.now - S.drainedSince >= DrainHold
+             pad == ProbeAfterDrain /\ ~probe /\ r1 = S.room /\ r1 < NL /\ drained
+                    /\ S.now - S.lastWiden >= Dwell /\ (~ProbeBackoff \/ calm)
+             r2 == IF probe \/ pad THEN r1 + 1 ELSE r1
              r3 == IF ~SlowStart /\ S.lastCong >= 0 /\ S.now - S.lastCong >= CeilingStale
                    THEN NL ELSE r2
              \* a widening after one that held (no congestion since) steps the
@@ -853,6 +866,10 @@ StallShedGapS(S) == /\ S.maxParentGap <= GapBound
                     /\ \A c \in AliveLS(S) : S.shedAtL[c] >= 0 => S.now - S.shedAtL[c] <= GapBound
 \* RM6: a receiver whose own downlink is slow never makes a late move.
 OwnSlowStaysS(S) == ~S.slowMoved
+\* Every listener keeps a parent throughout: never parentless past GapBound.
+ParentedThroughoutS(S) == S.maxParentless <= GapBound
+\* Children join P one at a time (a widening invites one).
+OneJoinAtATimeS(S) == S.maxJoins <= 1
 \* RM4: after a shed P is never left with no direct child (beyond two watch
 \* ticks: a move in flight).
 NeverDrainedS(S) == S.maxZeroRun <= 2 * WatchEvery
@@ -904,7 +921,7 @@ Bad(S) ==
     {n \in {"NoSpuriousTeardown", "KeepsOneChild", "NeverTwoParents", "MakeBeforeBreak",
             "NothingWaitsForever", "ReparentBound", "EndParented", "EndHeard",
             "EndFullFanOut", "DeadDetected", "EndQueueDrained",
-            "NoIdleWithOffer", "StallShedGap", "OwnSlowStays", "NeverDrained", "EgressOneCopy", "OnePrimary"} :
+            "NoIdleWithOffer", "StallShedGap", "OwnSlowStays", "NeverDrained", "EgressOneCopy", "OnePrimary", "ParentedThroughout", "OneJoinAtATime"} :
         CASE n = "NoSpuriousTeardown" -> ~NoSpuriousTeardownS(S)
           [] n = "KeepsOneChild" -> ~KeepsOneChildS(S)
           [] n = "NeverTwoParents" -> ~NeverTwoParentsS(S)
@@ -921,7 +938,9 @@ Bad(S) ==
           [] n = "OwnSlowStays" -> ~OwnSlowStaysS(S)
           [] n = "NeverDrained" -> ~NeverDrainedS(S)
           [] n = "EgressOneCopy" -> ~EgressOneCopyS(S)
-          [] n = "OnePrimary" -> ~OnePrimaryS(S)}
+          [] n = "OnePrimary" -> ~OnePrimaryS(S)
+          [] n = "ParentedThroughout" -> ~ParentedThroughoutS(S)
+          [] n = "OneJoinAtATime" -> ~OneJoinAtATimeS(S)}
 
 -----------------------------------------------------------------------------
 LegName(l) == l[1] \o ">" \o l[2]
@@ -1025,6 +1044,13 @@ Step(S, ch) ==
                            !.lostAt = [c \in L |-> IF S10.parent[c] = None
                                                     THEN (IF S.parent[c] /= None \/ @[c] < 0 THEN S10.now ELSE @[c])
                                                     ELSE -1],
+                           !.drainedSince = IF S10.backlog = 0 /\ \A l \in PLegs : S10.chan[l] = <<>>
+                                            THEN (IF @ < 0 THEN S10.now ELSE @) ELSE -1,
+                           !.maxParentless = Max(@, Max0({IF S10.parent[c] = None /\ Alive(S10, c) /\ S.lostAt[c] >= 0
+                                                          THEN S10.now - S.lostAt[c] ELSE 0 : c \in L})),
+                           !.maxJoins = IF S10.firstShedAt >= 0 \/ S10.lastCong >= 0
+                                        THEN Max(@, Cardinality({c \in L : c \in S10.children /\ c \notin S.children}))
+                                        ELSE @,
                            !.allOkAt = IF @ < 0 /\ KillAt > 0 /\ S10.now > KillAt
                                           /\ S10.children /= {}
                                           /\ \A c \in {x \in L : Alive(S10, x)} : S10.parent[c] /= None
@@ -1069,6 +1095,7 @@ Init ==
     /\ offerDirect = [c \in L |-> [n \in Nodes |-> FALSE]] /\ zeroRun = 0 /\ maxZeroRun = 0
     /\ standbys = {} /\ maxStallCopies = 0 /\ primaryGapRun = 0 /\ maxPrimaryGap = 0
     /\ bindSkips = [l \in Legs |-> 0] /\ lastOfferNC = -100 /\ allOkAt = -1 /\ lostAt = [c \in L |-> -1]
+    /\ drainedSince = -1 /\ maxParentless = 0 /\ admitsIgnored = 0 /\ maxJoins = 0
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
@@ -1110,7 +1137,8 @@ Assign(S) ==
     /\ offerDirect' = S.offerDirect /\ zeroRun' = S.zeroRun /\ maxZeroRun' = S.maxZeroRun
     /\ standbys' = S.standbys /\ maxStallCopies' = S.maxStallCopies
     /\ primaryGapRun' = S.primaryGapRun /\ maxPrimaryGap' = S.maxPrimaryGap /\ bindSkips' = S.bindSkips
-    /\ lastOfferNC' = S.lastOfferNC /\ allOkAt' = S.allOkAt /\ lostAt' = S.lostAt /\ dialAt' = S.dialAt
+    /\ lastOfferNC' = S.lastOfferNC /\ allOkAt' = S.allOkAt /\ lostAt' = S.lostAt /\ drainedSince' = S.drainedSince
+    /\ maxParentless' = S.maxParentless /\ admitsIgnored' = S.admitsIgnored /\ maxJoins' = S.maxJoins /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
@@ -1188,6 +1216,7 @@ Observed ==
      first_verdict |-> firstVerdictAt, first_shed |-> firstShedAt, q_at_shed |-> firstShedQ,
      full_at |-> fullAt, parent_gap |-> maxParentGap, media_gap |-> maxMediaGap,
      drain_clear |-> drainClear, cap_end_q |-> capEndQ, zero_direct |-> maxZeroRun,
+     admits_ignored |-> admitsIgnored, max_parentless |-> maxParentless, probe_fails |-> probeFails,
      all_ok_after_kill |-> IF allOkAt >= 0 THEN allOkAt - KillAt ELSE IF KillAt > 0 THEN 9999 ELSE -1, stall_copies |-> maxStallCopies, primary_gap |-> maxPrimaryGap, verdict_rises |-> verdicts,
      heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
 \* One line per terminal state: the outcome, the violated set, what is observed.
@@ -1214,4 +1243,10 @@ EgressOneCopy == EgressOneCopyS(Rec)
 OnePrimary == OnePrimaryS(Rec)
 T_EgressOneCopy == EgressOneCopy \/ Dump
 T_OnePrimary == OnePrimary \/ Dump
+ParentedThroughout == ParentedThroughoutS(Rec)
+T_ParentedThroughout == ParentedThroughout \/ Dump
+OneJoinAtATime == OneJoinAtATimeS(Rec)
+T_OneJoinAtATime == OneJoinAtATime \/ Dump
+EndFullFanOutT == EndFullFanOut
+T_EndFullFanOut2 == EndFullFanOut \/ Dump
 =============================================================================

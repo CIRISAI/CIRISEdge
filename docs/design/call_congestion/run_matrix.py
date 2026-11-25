@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -191,6 +191,22 @@ def scenarios():
                                                  RCAP="16", CAPUNTIL="1000", FEED='"fix2"',
                                                  SILENT="TRUE", KEEPFRESH="TRUE", KILLAT="120",
                                                  UPSHED="TRUE")
+    # ProbeAfterDrain (the ceiling path, no SlowStart), dwell and ceiling at
+    # the code's values (10 s, 60 s): after a lift, and with the cap held.
+    padb = dict(SHIP, SS="FALSE", M="12", RCAP="16", FEED='"fix2"', SILENT="TRUE", KEEPFRESH="TRUE",
+                CLEANUP="TRUE", DWELL="100", CSTALE="600", HORIZON="460")
+    yield "pad-off-lift", dict(padb, RECOVER="350")   # judged against ProbeAfterDrain's bound
+    for h in ["2", "10", "50", "150"]:
+        yield f"pad-hold{h}-lift", dict(padb, PAD="TRUE", DHOLD=h)
+        yield f"pad-hold{h}-cap-held", dict(padb, PAD="TRUE", DHOLD=h, CAPUNTIL="1000")
+    yield "pad-hold10-lift-no-backoff", dict(padb, PAD="TRUE", DHOLD="10", PBO="FALSE")
+    yield "pad-hold10-cap-held-no-backoff", dict(padb, PAD="TRUE", DHOLD="10", PBO="FALSE", CAPUNTIL="1000")
+    # ADMITs set aside: the queue longer than the subscribe timeout (no RM).
+    adm = dict(MIN, M="12", RCAP="16", CAPUNTIL="1000", FEED='"fix2"', SILENT="TRUE", KEEPFRESH="TRUE")
+    yield "admit-aside", adm
+    yield "admit-aside-late-accept", dict(adm, LATEADMIT="TRUE")
+    yield "admit-aside-ship", dict(SHIP, M="12", RCAP="16", CAPUNTIL="1000", FEED='"fix2"', SILENT="TRUE",
+                                   KEEPFRESH="TRUE")
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)
@@ -308,6 +324,12 @@ def recover_by(p):
         if steps:
             steps[0] = max(steps[0], int(p["HOLDT"]))
         grow = sum(steps)
+    elif p.get("PAD") == "TRUE":
+        # ProbeAfterDrain: the drain hold, then n - 1 widenings (the room
+        # restarts from one), each a dwell or the backoff, whichever is longer
+        fmax = 2 if p["PBO"] == "TRUE" else 0
+        grow = int(p["DHOLD"]) + sum(max(int(p["DWELL"]), 2 * w * 2 ** max(0, fmax - i))
+                                     for i in range(n - 1))
     else:
         grow = int(p["CSTALE"])
     return str(20 + w + grow + int(p["DWELL"]) + w)
@@ -338,7 +360,7 @@ def tlc(outdir, name, cfgtext, extra=()):
     cfg = os.path.join(outdir, name + ".cfg")
     open(cfg, "w").write(cfgtext)
     env = dict(os.environ, GRACE_SCHED_OWNER="edge",
-               GRACE_SCHED_KIND="edge: tlc call model", GRACE_SCHED_PEAK_GB="2")
+               GRACE_SCHED_KIND="edge: call model TLC", GRACE_SCHED_PEAK_GB="6")
     cmd = ["timeout", str(CAP_SECS), "nice", "-n", "19", "ionice", "-c3", GUARD,
            "java", "-Xmx2g", "-Xss64m", "-XX:+UseParallelGC", "-cp", JAR, "tlc2.TLC",
            "-workers", "2", *extra, "-config", cfg,
