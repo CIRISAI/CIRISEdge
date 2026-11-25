@@ -241,6 +241,9 @@ async fn try_transport_node(
         config.reticulum.default_ar_target = announce_rate_target;
         builder = builder.config(config);
     }
+    // `DirectLinkSettings` is #[non_exhaustive]: from its default.
+    let mut facilitator = leviculum_std::direct_link::DirectLinkSettings::default();
+    facilitator.facilitator_port = Some(facilitator_port);
     let mut node = builder
         .enable_transport(true)
         .add_interface_config(leviculum_std::config::InterfaceConfig {
@@ -251,10 +254,7 @@ async fn try_transport_node(
             ingress_control: Some(ingress),
             ..Default::default()
         })
-        .direct_link(leviculum_std::direct_link::DirectLinkSettings {
-            facilitator_port: Some(facilitator_port),
-            ..Default::default()
-        })
+        .direct_link(facilitator)
         .storage_path(storage.path().to_path_buf())
         .build()
         .await

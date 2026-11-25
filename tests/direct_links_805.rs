@@ -262,6 +262,9 @@ async fn transport_node_on_free_ports() -> (ReticulumNode, u16, u16) {
 
 async fn try_transport_node(tcp_port: u16, facilitator_port: u16) -> Result<ReticulumNode, String> {
     let storage = tempfile::tempdir().expect("tempdir");
+    // `DirectLinkSettings` is #[non_exhaustive]: from its default.
+    let mut facilitator = leviculum_std::direct_link::DirectLinkSettings::default();
+    facilitator.facilitator_port = Some(facilitator_port);
     let mut node = ReticulumNodeBuilder::new()
         .enable_transport(true)
         .add_interface_config(leviculum_std::config::InterfaceConfig {
@@ -272,10 +275,7 @@ async fn try_transport_node(tcp_port: u16, facilitator_port: u16) -> Result<Reti
             ingress_control: Some(false),
             ..Default::default()
         })
-        .direct_link(leviculum_std::direct_link::DirectLinkSettings {
-            facilitator_port: Some(facilitator_port),
-            ..Default::default()
-        })
+        .direct_link(facilitator)
         .storage_path(storage.path().to_path_buf())
         .build()
         .await

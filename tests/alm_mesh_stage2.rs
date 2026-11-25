@@ -367,6 +367,12 @@ impl CappedUplink {
         })
     }
 
+    /// How long a byte handed over now waits to leave.
+    async fn queue_now(&self) -> Duration {
+        let next = *self.next_free.lock().await;
+        next.saturating_duration_since(tokio::time::Instant::now())
+    }
+
     /// Delay everything others send this node by `ms` (its downlink).
     fn delay_down_ms(&self, ms: u64) {
         self.down_delay_ms.store(ms, Ordering::SeqCst);
@@ -4041,6 +4047,168 @@ async fn a_call_that_starts_on_a_capped_uplink_keeps_every_link() {
     drop(listeners);
     drop(cp);
 }
+
+/// **G8 — the kept child of a capped publisher is lost mid-cap** (the
+/// model's T1/S3 case): the capped witness's room and cap; 12 s into the cap
+/// P's leg to its one direct child is torn down. Then: every listener has a
+/// parent again and P has a primary within [`KEPT_CHILD_RECOVER_BOUND`], no
+/// other link is torn down, and the queue the redial and re-parenting add
+/// stays bounded (serial redial: one leg setup in flight).
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_capped_publishers_kept_child_lost_mid_cap_is_recovered() {
+    let _call = one_call().await;
+    let tag = "alm2-capkill";
+    let uplink = CappedUplink::new();
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    let heard_of = count_frames_from(&mut listeners, &p.key.key_id);
+    let seq = publish_capped_for(&mut cp, 3, 0).await;
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    tracing::info!(
+        target: "ciris_edge::link_close",
+        names = ?nodes
+            .iter()
+            .zip(["P", "A", "B", "C", "T"])
+            .map(|(n, r)| (r, n.key.key_id.clone()))
+            .collect::<Vec<_>>(),
+        "G8 cap on"
+    );
+    let stream = cp.stream();
+    let p_key = p.key.key_id.clone();
+    let ctl = async {
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let kept = listeners
+            .iter()
+            .position(|l| primary_for(l, stream).as_deref() == Some(p_key.as_str()));
+        let _ = uplink.take_peak();
+        let queue_at_kill = uplink.queue_now().await;
+        let killed_at = tokio::time::Instant::now();
+        if let Some(i) = kept {
+            let key = nodes[i + 1].key.key_id.clone();
+            for (peer, l, _, _) in p.transport.av_dialed_links_for_test() {
+                if peer == key {
+                    let _ = p.transport.link_teardown(&l).await;
+                }
+            }
+        }
+        let mut back = None;
+        // Recovery is judged only once the torn child has noticed (its
+        // parent is no longer P); before that the old state reads healthy.
+        let mut noticed = false;
+        let role_of = |k: &Option<String>| {
+            k.as_deref().map_or("none".to_owned(), |k| {
+                nodes
+                    .iter()
+                    .zip(["P", "A", "B", "C", "T"])
+                    .find(|(n, _)| n.key.key_id == k)
+                    .map_or("?".to_owned(), |(_, r)| (*r).to_owned())
+            })
+        };
+        let mut last: Vec<Option<String>> = vec![None; listeners.len()];
+        while killed_at.elapsed() < Duration::from_secs(13) {
+            let parents: Vec<Option<String>> =
+                listeners.iter().map(|l| primary_for(l, stream)).collect();
+            for (i, p_now) in parents.iter().enumerate() {
+                if *p_now != last[i] {
+                    eprintln!(
+                        "[G8KT] +{:.2}s listener {} parent {} -> {}",
+                        killed_at.elapsed().as_secs_f64(),
+                        ["A", "B", "C"][i],
+                        role_of(&last[i]),
+                        role_of(p_now)
+                    );
+                    last[i] = p_now.clone();
+                }
+            }
+            if let Some(i) = kept {
+                noticed |= parents[i].as_deref() != Some(p_key.as_str());
+            }
+            let p_has_primary = parents.iter().any(|x| x.as_deref() == Some(p_key.as_str()));
+            if noticed && parents.iter().all(Option::is_some) && p_has_primary && back.is_none() {
+                back = Some(killed_at.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        (kept, back, uplink.take_peak(), queue_at_kill)
+    };
+    let ((sent, _lat), (kept, back, peak_after, queue_at_kill)) =
+        tokio::join!(publish_timed_for(&mut cp, 25, seq), ctl);
+    let torn: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum::<u64>() - torn_before;
+    let heard = heard_of.read();
+    let parents: Vec<Option<String>> = listeners.iter().map(|l| primary_for(l, stream)).collect();
+    let context = format!(
+        "kept child {kept:?}; back after {back:?}; peak queue after the kill {peak_after:?}; \
+         torn {torn}; parents {parents:?}; P children {:?}; heard {heard:?} of {sent}",
+        cp.alm_own_children()
+    );
+    let mut failed: Vec<String> = Vec::new();
+    if kept.is_none() {
+        failed.push("no listener had P as its primary 12 s into the cap".to_owned());
+    }
+    // The mechanism's bound: the torn leg's close reaches the child through
+    // P's queue, then the re-subscribe's ADMIT crosses it again: two queue
+    // crossings + one offer period + one watch tick.
+    let bound = queue_at_kill * 2 + Duration::from_secs(1) + Duration::from_millis(250);
+    eprintln!("[G8K] queue at the kill {queue_at_kill:?}; recovery bound {bound:?}");
+    if back.is_none_or(|b| b > bound) {
+        failed.push(format!("not recovered within {bound:?}"));
+    }
+    if torn != 0 {
+        failed.push(format!("links torn down besides the forced one: {torn}"));
+    }
+    // What was queued at the kill plus ONE leg's setup (link, PQC transit
+    // KEX, hello, bindings: ~1 s at the cap): serial redial adds no more.
+    let peak_bound = queue_at_kill + KEPT_CHILD_SETUP_QUEUE;
+    if peak_after > peak_bound {
+        failed.push(format!(
+            "peak queue after the kill {peak_after:?} over {peak_bound:?}"
+        ));
+    }
+    eprintln!("[G8K] kept child lost mid-cap: {context}; failed {failed:?}");
+    eprintln!("[G8KL] P alm_log: {:?}", cp.alm_log().2);
+    for (i, l) in listeners.iter().enumerate() {
+        eprintln!("[G8KL] {} alm_log: {:?}", ["A", "B", "C"][i], l.alm_log().2);
+    }
+    assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(listeners);
+    drop(cp);
+}
+
+/// G8 — what one leg's setup (link, PQC transit KEX, hello, bindings) adds
+/// to the queue at the cap: serial redial allows one in flight.
+const KEPT_CHILD_SETUP_QUEUE: Duration = Duration::from_secs(1);
 
 /// **45.2.0 — no calls on a shaped-only node** (Eric 2026-11-06: live A/V
 /// rides unshaped links only). Node `S` sets `require_shaped_links`:

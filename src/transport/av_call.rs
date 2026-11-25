@@ -4350,6 +4350,9 @@ async fn redial_on_direct_path(shared: Arc<Shared>) {
     }
 }
 
+/// [`dial_now_if_backing_off`]'s reason when the member dialled this node.
+const RACE_ON_INBOUND: &str = "the member dialled this node";
+
 /// `peer` is reachable now (a direct path came up, or it just dialled this
 /// node): if this node has no leg to it and is only waiting out a failed
 /// dial's backoff, dial now; a dial in flight that fails redials at once.
@@ -4358,9 +4361,6 @@ async fn redial_on_direct_path(shared: Arc<Shared>) {
 /// longer, while the member's own leg here was already up (rxmove's
 /// come-back trace: P had no leg to any member for ~5 s, and its ADMITs rode
 /// the members' paced in-links).
-/// [`dial_now_if_backing_off`]'s reason when the member dialled this node.
-const RACE_ON_INBOUND: &str = "the member dialled this node";
-
 fn dial_now_if_backing_off(shared: &Arc<Shared>, peer: &str, why: &'static str) {
     {
         let peer = peer.to_owned();
@@ -5179,11 +5179,6 @@ fn note_publisher_evidence(shared: &Arc<Shared>, publisher: &str) {
     }
 }
 
-/// Retry a C3 frame a congested link refused, until [`C3_RESEND_BUDGET`]
-/// or the peer has no link left. An answer that lands after the
-/// subscriber's request timeout is still read: a stale ADMIT is answered
-/// with an UNSUBSCRIBE, which releases the slot. Each try is one send: the
-/// publisher lock is never held to wait.
 /// One member's queue of refused must-arrive frames: the front retried
 /// ([`resend_c3`]) until it goes or is given up, then the next, in order.
 async fn c3_worker(shared: &Arc<Shared>, to: &str) {
@@ -5212,6 +5207,11 @@ async fn c3_worker(shared: &Arc<Shared>, to: &str) {
     }
 }
 
+/// Retry a C3 frame a congested link refused, until [`C3_RESEND_BUDGET`]
+/// or the peer has no link left. An answer that lands after the
+/// subscriber's request timeout is still read: a stale ADMIT is answered
+/// with an UNSUBSCRIBE, which releases the slot. Each try is one send: the
+/// publisher lock is never held to wait.
 async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
     let deadline = tokio::time::Instant::now() + C3_RESEND_BUDGET;
     let mut pause = C3_RESEND_PAUSE;

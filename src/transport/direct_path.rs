@@ -451,8 +451,8 @@ impl DirectLinksConfig {
     /// so the node never runs on a leviculum default edge did not choose.
     #[must_use]
     pub fn leviculum_settings(&self) -> leviculum_std::direct_link::DirectLinkSettings {
-        // g8-lev113 measurement only: `DirectLinkSettings` is
-        // #[non_exhaustive] at leviculum c8699c3d6 (start from Default).
+        // `DirectLinkSettings` is #[non_exhaustive]: start from its default and
+        // set every field edge chooses.
         let mut settings = leviculum_std::direct_link::DirectLinkSettings::default();
         settings.policy = match self.accept {
             // Asked per request, answered by `should_accept_direct`.

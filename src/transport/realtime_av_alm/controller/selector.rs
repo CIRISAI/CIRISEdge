@@ -1128,12 +1128,6 @@ impl<P: PeerRef> ParentSelector<P> {
         }
     }
 
-    /// The voluntary-switch dwell: `min_dwell · 2^k`, k = voluntary switches
-    /// in the last [`FLAP_WINDOW_MS`] (capped at 8×), so a noisy pair cannot
-    /// flap at the base dwell.
-    /// R3's probe target: the best-scoring member-tier candidate that is
-    /// viable in every way but advertised room.
-    /// `direct_only`: the stream's publisher alone (a depth-0 offer).
     /// Row S3, the child's side — the stream's publisher, known from any
     /// depth-0 offer it ever made, as a primary candidate whatever its health
     /// (a link down left it Down), its offer's age or a backoff (a refusal
@@ -1177,6 +1171,9 @@ impl<P: PeerRef> ParentSelector<P> {
             .map(|(p, _)| p.clone())
     }
 
+    /// R3's probe target: the best-scoring member-tier candidate that is
+    /// viable in every way but advertised room.
+    /// `direct_only`: the stream's publisher alone (a depth-0 offer).
     fn best_member_ignoring_room(&self, now_ms: u64, direct_only: bool) -> Option<P> {
         self.cands
             .iter()
@@ -1204,6 +1201,9 @@ impl<P: PeerRef> ParentSelector<P> {
             .map(|(p, _)| p)
     }
 
+    /// The voluntary-switch dwell: `min_dwell · 2^k`, k = voluntary switches
+    /// in the last [`FLAP_WINDOW_MS`] (capped at 8×), so a noisy pair cannot
+    /// flap at the base dwell.
     fn dwell_ms(&self, now_ms: u64) -> u64 {
         let k = self
             .recent_switches
