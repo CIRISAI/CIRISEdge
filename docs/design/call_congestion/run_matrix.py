@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE", ASKSHED="FALSE", ASKLOSS="FALSE", PLADMIT="FALSE", DGUARD="FALSE", RFREE="40", PROMOTE="FALSE", SU="FALSE", BRIDGE="0", PRESET="FALSE", STARVEAT="0", SUNSUB="FALSE",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE", ASKSHED="FALSE", ASKLOSS="FALSE", PLADMIT="FALSE", DGUARD="FALSE", RFREE="40", PROMOTE="FALSE", SU="FALSE", BRIDGE="0", PRESET="FALSE", STARVEAT="0", SUNSUB="FALSE", PFMAX="2", EXT="0", EXTAT="0", OCSHED="FALSE", CRAISE="FALSE", REOPEN="FALSE",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -252,6 +252,23 @@ def scenarios():
     # RO (i) with the 2 s bridge renewal (nobody relays).
     yield "norelay-guard-bridge-uncapped", dict(nr, DGUARD="TRUE", BRIDGE="20", CAPAT="1000", CAPUNTIL="1000")
     yield "s3-ask-after-loss-guard-bridge", dict(s3, ASKLOSS="TRUE", DGUARD="TRUE", BRIDGE="20")
+    # Several admissions on one uplink: P also relays EXT other streams' copies
+    # from 6 s (after the lift at 5 s). Today's code: demand on every refusal,
+    # ageless; over-committed shed with no verdict; the clean-window raise;
+    # fails <= 2. The combined rule (Reopen + ProbeAfterDrain, drained for 2 s,
+    # fails <= 6). Uncapped 80 units = 6.7 copies; own 3 + external 2 fit.
+    today = dict(s3, ASKLOSS="TRUE", EXT="2", EXTAT="60", OCSHED="TRUE", CRAISE="TRUE", PAD="FALSE",
+                 HORIZON="460", DWELL="100", CSTALE="600")
+    combined = dict(today, REOPEN="TRUE", DGUARD="TRUE", PAD="TRUE", DHOLD="20", PFMAX="6")
+    yield "ro-today", today
+    yield "ro-today-no-ext", dict(today, EXT="0")
+    yield "ro-combined", combined
+    yield "ro-combined-no-clean-raise", dict(combined, CRAISE="FALSE")
+    yield "ro-combined-no-ext", dict(combined, EXT="0")
+    yield "ro-combined-cap-held", dict(combined, CAPUNTIL="1000", EXT="0")   # relayed load is not sheddable in the model
+    yield "ro-combined-cap-held-pf2", dict(combined, CAPUNTIL="1000", PFMAX="2", EXT="0")
+    yield "ro-combined-norelay", dict(combined, SLOTS="0", EXT="0", CAPAT="1000", CAPUNTIL="1000", HORIZON="260")
+    yield "ro-clean-raise-only", dict(today, OCSHED="FALSE", EXT="0")
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)

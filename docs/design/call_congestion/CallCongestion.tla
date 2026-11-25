@@ -91,6 +91,15 @@ CONSTANTS
                         \* I just lost is no candidate until a fresh offer shows otherwise
     BridgeEvery,        \* a parentless member with no candidate asks P this often (0: never)
     PresetTree,         \* start from: C on P; A and B on C; A and B each other's standby
+    ProbeFailsMax,      \* the backoff's cap: 2 windows x 2^fails, fails <= this
+    ExtCopies, ExtAt,   \* from ExtAt, P also relays ExtCopies other streams' copies on its
+                        \* uplink (load, and commitments beside its own stream)
+    OverCommitShed,     \* today: own children past (ceiling - external) are shed, no verdict
+    CleanRaise,         \* today: a clean window that carried more than the ceiling raises it
+    Reopen,             \* the combined re-open rule (RO + ProbeAfterDrain): admission fits
+                        \* beside everything committed; no shed without a verdict; demand
+                        \* guarded and lapsing after a dwell; drained = queue < 150 ms and
+                        \* nothing outstanding for DrainHold
     SilenceUnsub,       \* a member that drops its parent for silence unsubscribes it
     StarveAt,           \* from this tick P sends its first child no media, link up, for
     StarveTicks,        \* this long (0: never): C starves silently
@@ -225,7 +234,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge, demandAt, maxCeil,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -233,7 +242,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge, demandAt, maxCeil, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -266,7 +275,7 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         maxParentless |-> maxParentless, admitsIgnored |-> admitsIgnored, maxJoins |-> maxJoins,
         askNow |-> askNow, lastShedAt |-> lastShedAt, refusedBy |-> refusedBy,
         repeatDemand |-> repeatDemand, offerUp |-> offerUp, standby |-> standby, lostPrim |-> lostPrim,
-        lostPrimAt |-> lostPrimAt, lastBridge |-> lastBridge,
+        lostPrimAt |-> lostPrimAt, lastBridge |-> lastBridge, demandAt |-> demandAt, maxCeil |-> maxCeil,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -384,15 +393,20 @@ MediaTo(S, s, set, t) ==
     ELSE LET c == CHOOSE c \in set : TRUE
          IN MediaTo(Media1(S, s, c, t), s, set \ {c}, t)
 
+Ext(S) == IF ExtCopies > 0 /\ S.now >= ExtAt THEN ExtCopies ELSE 0
+\* room is P's ceiling in copies (its own stream and what it relays); what
+\* its own stream may hold is that minus the other streams' commitments
+OwnLimit(S) == S.room - Ext(S)
 PAdmit(S, l) ==
     IF l \in S.children THEN SendCtrl(S, <<"P", l>>, Pay("admit"))
-    ELSE IF Cardinality(S.children) < S.room \/ (PrimarylessAdmit /\ S.children = {})
+    ELSE IF Cardinality(S.children) < (IF Reopen \/ OverCommitShed THEN OwnLimit(S) ELSE S.room)
+            \/ (PrimarylessAdmit /\ S.children = {})
     THEN SendCtrl([S EXCEPT !.children = @ \cup {l}, !.standbys = @ \ {l},
                             !.order = Append(SelectSeq(@, LAMBDA x : x /= l), l),
                             !.drainTo[l] = -1, !.shedPend[l] = FALSE],
                   <<"P", l>>, Pay("admit"))
     ELSE LET drained == S.drainedSince >= 0 /\ S.now - S.drainedSince >= DrainHold
-             counts == ~DemandGuard
+             counts == (~DemandGuard /\ ~Reopen)
                        \/ (/\ ~S.stall
                            /\ ~(S.shedAtL[l] >= 0 /\ S.now - S.shedAtL[l] <= Dwell)
                            /\ (S.lastCong < 0 \/ drained))
@@ -400,6 +414,7 @@ PAdmit(S, l) ==
              \* nowhere else to go: the fast path's trigger
              repeat == S.refusedBy[l] >= 0 /\ S.now - S.refusedBy[l] <= 40
          IN SendCtrl([S EXCEPT !.demand = @ \/ counts, !.refusedBy[l] = S.now,
+                               !.demandAt = IF counts THEN S.now ELSE @,
                                !.repeatDemand = @ \/ (counts /\ repeat)], <<"P", l>>, Pay("refuse"))
 
 RelayAdmit(S, x, l) ==
@@ -464,7 +479,7 @@ Handle(S, pay, s, r) ==
             IN [S EXCEPT !.children = kids, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
                          !.standbys = @ \ {s},
                          !.room = Max(1, Cardinality(kids)), !.lastCong = S.now,
-                         !.probeFails = IF ProbeBackoff THEN Min(@ + 1, 2) ELSE @]
+                         !.probeFails = IF ProbeBackoff THEN Min(@ + 1, ProbeFailsMax) ELSE @]
       [] pay.p \in {"standby", "standby_late"} /\ r = "P" ->
             LET kids == S.children \ {s}
                 late == pay.p = "standby_late" \/ (DepartureHolds /\ s \in S.children)
@@ -472,7 +487,7 @@ Handle(S, pay, s, r) ==
                          !.shedPend[s] = FALSE,
                          !.room = IF late THEN Max(1, Cardinality(kids)) ELSE @,
                          !.lastCong = IF late THEN S.now ELSE @,
-                         !.probeFails = IF late /\ ProbeBackoff THEN Min(@ + 1, 2) ELSE @]
+                         !.probeFails = IF late /\ ProbeBackoff THEN Min(@ + 1, ProbeFailsMax) ELSE @]
       [] pay.p = "unsub" ->
             IF r = "P"
             THEN [S EXCEPT !.children = @ \ {s}, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
@@ -794,7 +809,7 @@ Window(S, ch) ==
     ELSE IF S.stall
     THEN LET S1 == [S EXCEPT !.lastCong = S.now, !.room = Min(@, 1),
                              !.probeFails = IF ProbeAfterDrain /\ ProbeBackoff /\ S.lastWiden > S.lastCong
-                                            THEN Min(@ + 1, 2) ELSE @]
+                                            THEN Min(@ + 1, ProbeFailsMax) ELSE @]
          IN IF Cardinality(S1.children) > KeepOf(ch) THEN ShedTo(S1, KeepOf(ch)) ELSE S1
     ELSE LET \* any widening waits out the probe backoff: 2 windows x 2^fails
              \* since the last congestion (a late move is one, ReceiverMoves)
@@ -802,29 +817,38 @@ Window(S, ch) ==
                      /\ (S.lastCong < 0 \/ S.now - S.lastCong >= StallHold)
              \* DemandGuard's fast path: a publisher that has never learned
              \* congestion serves a refusal at the next window (nobody relays)
-             r1 == IF S.demand /\ S.room < NL /\ (calm \/ ~ProbeBackoff \/ (DemandGuard /\ S.lastCong < 0 /\ S.repeatDemand))
+             live == ~Reopen \/ (S.demandAt >= 0 /\ S.now - S.demandAt <= Dwell)
+             r1 == IF S.demand /\ live /\ S.room < NL + Ext(S) /\ (calm \/ ~ProbeBackoff \/ (DemandGuard /\ ~Reopen /\ S.lastCong < 0 /\ S.repeatDemand))
                    THEN S.room + 1 ELSE S.room
              \* SlowStart: two clean windows since the last congestion and the
              \* last widening prove the room it has; widen by one stream (the
              \* probe is the widening; a stall takes it back).
-             probe == SlowStart /\ r1 = S.room /\ r1 < NL   \* one stream a window
+             probe == SlowStart /\ r1 = S.room /\ r1 < NL + Ext(S)   \* one stream a window
                       /\ (IF ProbeBackoff THEN calm
                           ELSE S.now - Max(S.lastCong, S.lastWiden) >= 2 * WindowTicks)
              \* ProbeAfterDrain: drained (no queue, nothing outstanding) for
              \* DrainHold: one more stream per Dwell, under the backoff
              drained == S.drainedSince >= 0 /\ S.now - S.drainedSince >= DrainHold
-             pad == ProbeAfterDrain /\ ~probe /\ r1 = S.room /\ r1 < NL /\ drained
+             pad == ProbeAfterDrain /\ ~probe /\ r1 = S.room /\ r1 < NL + Ext(S) /\ drained
                     /\ S.now - S.lastWiden >= Dwell /\ (~ProbeBackoff \/ calm)
              r2 == IF probe \/ pad THEN r1 + 1 ELSE r1
-             r3 == IF ~SlowStart /\ S.lastCong >= 0 /\ S.now - S.lastCong >= CeilingStale
-                   THEN NL ELSE r2
+             r3a == IF ~SlowStart /\ S.lastCong >= 0 /\ S.now - S.lastCong >= CeilingStale
+                    THEN NL + Ext(S) ELSE r2
+             \* today's second raise: a clean window that carried more than the
+             \* ceiling raises it to what it carried (copies), no backoff
+             carried == (Rate(S.now) * WindowTicks) \div (M * WindowTicks)
+             r3 == IF CleanRaise /\ S.lastCong >= 0 /\ S.backlog > 0 /\ carried > r3a THEN carried ELSE r3a
              \* a widening after one that held (no congestion since) steps the
              \* backoff down: the probe that worked is the measurement
              held == S.lastWiden > S.lastCong
-         IN [S EXCEPT !.room = r3, !.demand = IF r1 /= S.room THEN FALSE ELSE @,
+             S9 == [S EXCEPT !.room = r3, !.demand = IF r1 /= S.room \/ ~live THEN FALSE ELSE @,
                       !.repeatDemand = IF r1 /= S.room THEN FALSE ELSE @,
                       !.lastWiden = IF r3 /= S.room THEN S.now ELSE @,
-                      !.probeFails = IF r3 /= S.room /\ held THEN Max(0, @ - 1) ELSE @]
+                      !.probeFails = IF r3 /= S.room /\ held THEN Max(0, @ - 1) ELSE @,
+                      !.maxCeil = Max(@, r3)]
+         IN IF OverCommitShed /\ ~Reopen /\ Cardinality(S9.children) > Max(0, OwnLimit(S9))
+            THEN [ShedTo(S9, Max(0, OwnLimit(S9))) EXCEPT !.room = S9.room]   \* the ceiling stands
+            ELSE S9
 
 \* F13: P's binding re-announce, every BindEvery on every live leg: BindParts
 \* Channel messages of BindSize. BindSkip: a leg is skipped while the verdict
@@ -893,9 +917,12 @@ Publish(S) ==
              S1 == [S EXCEPT !.published = IF InWin(S.now) THEN @ + 1 ELSE @,
                              !.maxStallCopies = IF S.stall THEN Max(@, Cardinality(to)) ELSE @]
              per == IF StallDrain /\ S.stall THEN Max(1, (M * DrainPct) \div 100) ELSE M
-             S1b == IF CtrlBg > 0
-                    THEN Emit(S1, "P", Item("close", <<"none", "none">>, -1, 0, 0, NoPay, "P", {}, S.now), CtrlBg)
+             S1x == IF Ext(S) > 0
+                    THEN Emit(S1, "P", Item("close", <<"none", "none">>, -1, 0, 0, NoPay, "P", {}, S.now), M * Ext(S))
                     ELSE S1
+             S1b == IF CtrlBg > 0
+                    THEN Emit(S1x, "P", Item("close", <<"none", "none">>, -1, 0, 0, NoPay, "P", {}, S.now), CtrlBg)
+                    ELSE S1x
          IN IF to = {} THEN S1b
             ELSE Emit(S1b, "P", Item("media", <<"P", "P">>, 0, 0, 0, NoPay, "P", to, S.now),
                       per * Cardinality(to))
@@ -1145,7 +1172,8 @@ Step(S, ch) ==
                            !.lostAt = [c \in L |-> IF S10.parent[c] = None
                                                     THEN (IF S.parent[c] /= None \/ @[c] < 0 THEN S10.now ELSE @[c])
                                                     ELSE -1],
-                           !.drainedSince = IF S10.backlog = 0 /\ \A l \in PLegs : S10.chan[l] = <<>>
+                           !.drainedSince = IF (IF Reopen THEN QDelayS(S10) <= 1 ELSE S10.backlog = 0)
+                                               /\ \A l \in PLegs : S10.chan[l] = <<>>
                                             THEN (IF @ < 0 THEN S10.now ELSE @) ELSE -1,
                            !.maxParentless = Max(@, Max0({IF S10.parent[c] = None /\ Alive(S10, c) /\ S.lostAt[c] >= 0
                                                           THEN S10.now - S.lostAt[c] ELSE 0 : c \in L})),
@@ -1203,6 +1231,7 @@ Init ==
                                                    THEN (IF n = LSeq[3] THEN "P" ELSE LSeq[3]) ELSE None]]
     /\ standby = [c \in L |-> IF (PresetTree /\ NL = 3) /\ c /= LSeq[3] THEN (IF c = LSeq[1] THEN LSeq[2] ELSE LSeq[1]) ELSE None]
     /\ lostPrim = [c \in L |-> None] /\ lostPrimAt = [c \in L |-> -1] /\ lastBridge = [c \in L |-> -100]
+    /\ demandAt = -1 /\ maxCeil = 0
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = IF (PresetTree /\ NL = 3) THEN {LSeq[3]} ELSE {}
@@ -1251,7 +1280,8 @@ Assign(S) ==
     /\ maxParentless' = S.maxParentless /\ admitsIgnored' = S.admitsIgnored /\ maxJoins' = S.maxJoins
     /\ askNow' = S.askNow /\ lastShedAt' = S.lastShedAt /\ refusedBy' = S.refusedBy
     /\ repeatDemand' = S.repeatDemand /\ offerUp' = S.offerUp /\ standby' = S.standby
-    /\ lostPrim' = S.lostPrim /\ lostPrimAt' = S.lostPrimAt /\ lastBridge' = S.lastBridge /\ dialAt' = S.dialAt
+    /\ lostPrim' = S.lostPrim /\ lostPrimAt' = S.lostPrimAt /\ lastBridge' = S.lastBridge
+    /\ demandAt' = S.demandAt /\ maxCeil' = S.maxCeil /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
@@ -1329,7 +1359,7 @@ Observed ==
      first_verdict |-> firstVerdictAt, first_shed |-> firstShedAt, q_at_shed |-> firstShedQ,
      full_at |-> fullAt, parent_gap |-> maxParentGap, media_gap |-> maxMediaGap,
      drain_clear |-> drainClear, cap_end_q |-> capEndQ, zero_direct |-> maxZeroRun,
-     last_shed |-> lastShedAt, admits_ignored |-> admitsIgnored, max_parentless |-> maxParentless, probe_fails |-> probeFails,
+     last_shed |-> lastShedAt, max_ceil |-> maxCeil, admits_ignored |-> admitsIgnored, max_parentless |-> maxParentless, probe_fails |-> probeFails,
      all_ok_after_kill |-> IF allOkAt >= 0 THEN allOkAt - KillAt ELSE IF KillAt > 0 THEN 9999 ELSE -1, stall_copies |-> maxStallCopies, primary_gap |-> maxPrimaryGap, verdict_rises |-> verdicts,
      heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
 \* One line per terminal state: the outcome, the violated set, what is observed.
