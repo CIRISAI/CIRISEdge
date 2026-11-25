@@ -630,6 +630,31 @@ mod tests {
         );
     }
 
+    /// 45.2.0 — a control frame is never shed with media: with the media
+    /// queue full, an ALM C3 frame is still queued and is the next frame
+    /// the consumer takes, ahead of the media waiting. Mutation (one queue
+    /// for both): it was dropped as the newest frame, and a listener behind
+    /// a media flood lost answers the transport had delivered.
+    #[tokio::test]
+    async fn a_control_frame_is_never_shed_with_media_and_goes_first() {
+        use crate::transport::realtime_av_alm::controller::wire::{encode_caps, is_control_frame};
+        use crate::transport::realtime_av_runtime::AV_LINK_QUEUE_DEPTH;
+        let sink = AvSink::new();
+        let rx = sink.claim(link(3));
+        for i in 0..=AV_LINK_QUEUE_DEPTH {
+            let _ = sink.deliver(link(3), Some(i.to_be_bytes().to_vec()), |_| unreachable!());
+        }
+        let control = encode_caps(1);
+        assert!(is_control_frame(&control));
+        assert_eq!(
+            sink.deliver(link(3), Some(control.clone()), |_| unreachable!()),
+            AvDelivery::Queued,
+            "queued though the media queue is full"
+        );
+        let first = rx.recv_frame().await.expect("frame");
+        assert_eq!(first.bytes, control, "the control frame is taken first");
+    }
+
     fn test_node() -> std::sync::Arc<leviculum_std::driver::ReticulumNode> {
         let mut priv_bytes = [0u8; 64];
         for (i, b) in priv_bytes.iter_mut().enumerate() {

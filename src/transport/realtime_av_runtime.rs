@@ -1416,6 +1416,12 @@ mod leviculum_link {
     /// transport's event loop, which replication shares — waiting.
     pub const AV_LINK_QUEUE_DEPTH: usize = 256;
 
+    /// 45.2.0 — bound on each link's queue of ALM C3 control frames, kept
+    /// apart from the media queue so a media flood never sheds them: an
+    /// offer a second per stream and a handful of answers fill it only
+    /// under abuse, where the newest is dropped like media.
+    pub const AV_LINK_CONTROL_DEPTH: usize = 1024;
+
     /// What [`AvLinkQueue::offer`] did with a frame.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum QueueOffer {
@@ -1437,6 +1443,9 @@ mod leviculum_link {
     /// cannot drift.
     pub(crate) struct AvLinkQueue {
         tx: mpsc::Sender<InboundWireFrame>,
+        /// 45.2.0 — the link's ALM C3 control frames: never shed with media
+        /// (a listener behind a media flood lost its admits, delivered).
+        control_tx: mpsc::Sender<InboundWireFrame>,
         dropped_since_queued: u64,
     }
 
@@ -1451,13 +1460,16 @@ mod leviculum_link {
         /// while the arrivals queue was full, CIRISEdge#805).
         pub(crate) fn with_dropped(link_id: LinkId, dropped: u64) -> (Self, PumpReceiver) {
             let (tx, rx) = mpsc::channel::<InboundWireFrame>(AV_LINK_QUEUE_DEPTH);
+            let (control_tx, control_rx) = mpsc::channel::<InboundWireFrame>(AV_LINK_CONTROL_DEPTH);
             (
                 Self {
                     tx,
+                    control_tx,
                     dropped_since_queued: dropped,
                 },
                 PumpReceiver {
                     rx: Mutex::new(rx),
+                    control_rx: Mutex::new(control_rx),
                     link_id,
                 },
             )
@@ -1473,6 +1485,20 @@ mod leviculum_link {
 
         /// Offer one frame. Never awaits.
         pub(crate) fn offer(&mut self, bytes: Vec<u8>) -> QueueOffer {
+            // A control frame takes no hop counter: its own queue, and the
+            // media's drop count waits for the next media frame.
+            if crate::transport::realtime_av_alm::controller::wire::is_control_frame(&bytes) {
+                let frame = InboundWireFrame {
+                    dropped_before: 0,
+                    bytes,
+                    queued_at: Some(std::time::Instant::now()),
+                };
+                return match self.control_tx.try_send(frame) {
+                    Ok(()) => QueueOffer::Queued,
+                    Err(mpsc::error::TrySendError::Full(_)) => QueueOffer::DroppedFull,
+                    Err(mpsc::error::TrySendError::Closed(_)) => QueueOffer::ConsumerGone,
+                };
+            }
             let frame = InboundWireFrame {
                 dropped_before: self.dropped_since_queued,
                 bytes,
@@ -1977,6 +2003,8 @@ mod leviculum_link {
     /// sink or by [`LinkDataPump`].
     pub struct PumpReceiver {
         rx: Mutex<mpsc::Receiver<InboundWireFrame>>,
+        /// The link's control frames, taken before any media waiting.
+        control_rx: Mutex<mpsc::Receiver<InboundWireFrame>>,
         link_id: LinkId,
     }
 
@@ -1995,7 +2023,19 @@ mod leviculum_link {
         }
 
         async fn recv_frame(&self) -> Result<InboundWireFrame, AvDispatcherError> {
-            self.rx.lock().await.recv().await.ok_or_else(|| {
+            let mut control = self.control_rx.lock().await;
+            let mut media = self.rx.lock().await;
+            // Control first: an answer never waits behind media.
+            let got = tokio::select! {
+                biased;
+                Some(f) = control.recv() => Some(f),
+                f = media.recv() => match f {
+                    Some(f) => Some(f),
+                    // The media half closed: whatever control is left.
+                    None => control.try_recv().ok(),
+                },
+            };
+            got.ok_or_else(|| {
                 AvDispatcherError::RecvFailed(format!(
                     "leviculum link {:?} inbound queue closed (link closed or node down)",
                     self.link_id
