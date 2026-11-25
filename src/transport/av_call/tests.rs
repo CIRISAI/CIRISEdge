@@ -1004,7 +1004,7 @@ fn a_reannounce_skips_backlogged_legs_and_a_stalled_uplink() {
     assert!(reannounce_skips(&legs, false, &std::collections::HashSet::new(), &mut n).is_empty());
     let mut n = HashMap::new();
     let mut sent_b = 0;
-    for _ in 0..(REANNOUNCE_MAX_SKIPS + 1) {
+    for _ in 0..=REANNOUNCE_MAX_SKIPS {
         if !reannounce_skips(&legs, false, &backlogged, &mut n).contains(&"b".to_owned()) {
             sent_b += 1;
         }

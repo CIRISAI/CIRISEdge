@@ -4070,11 +4070,10 @@ fn leg_outcome(leg: LegSend) -> LegOutcome {
         LegSend::Sent => LegOutcome::Delivered,
         LegSend::FilteredByPolicy => LegOutcome::FilteredByPolicy,
         LegSend::Gone => LegOutcome::Gone,
-        LegSend::Failed(AvDispatcherError::Congested) => LegOutcome::Congested,
+        // G8 — Parked: not on the wire now; the leg keeps it for one more try.
+        LegSend::Failed(AvDispatcherError::Congested) | LegSend::Parked => LegOutcome::Congested,
         LegSend::Failed(AvDispatcherError::ChunkTooLarge(_)) => LegOutcome::TooLarge,
         LegSend::Failed(e) => LegOutcome::Failed(e.to_string()),
-        // G8 — not on the wire now; the leg keeps it for one more try.
-        LegSend::Parked => LegOutcome::Congested,
     }
 }
 
@@ -4442,6 +4441,7 @@ enum RedialGate {
 ///   by [`alm::STALL_PROBE_HOLD_MS`]: a listener that lost its leg to a
 ///   shed publisher pushes no setup through that publisher's queue;
 /// - otherwise dial (an unstalled uplink dials all at once, as before).
+#[allow(clippy::fn_params_excessive_bools)]
 fn redial_gate(
     stalled: bool,
     publishing: bool,
@@ -5103,15 +5103,12 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             let to = o.to.clone();
             let start = {
                 let mut pending = Shared::lock(&shared.c3_pending);
-                match pending.get_mut(&to) {
-                    Some(q) => {
-                        q.push_back(o);
-                        false
-                    }
-                    None => {
-                        pending.insert(to.clone(), std::collections::VecDeque::from([o]));
-                        true
-                    }
+                if let Some(q) = pending.get_mut(&to) {
+                    q.push_back(o);
+                    false
+                } else {
+                    pending.insert(to.clone(), std::collections::VecDeque::from([o]));
+                    true
                 }
             };
             if start {
@@ -5185,12 +5182,11 @@ async fn c3_worker(shared: &Arc<Shared>, to: &str) {
     loop {
         let front = {
             let mut pending = Shared::lock(&shared.c3_pending);
-            match pending.get(to).and_then(|q| q.front().cloned()) {
-                Some(o) => o,
-                None => {
-                    pending.remove(to);
-                    return;
-                }
+            if let Some(o) = pending.get(to).and_then(|q| q.front().cloned()) {
+                o
+            } else {
+                pending.remove(to);
+                return;
             }
         };
         resend_c3(shared, front).await;
@@ -5606,7 +5602,7 @@ async fn pump(
         };
         // Peer evidence: a chunk verified as signed by `publisher` proves its
         // node alive now, whichever path carried it.
-        note_publisher_evidence(shared, &publisher.to_string());
+        note_publisher_evidence(shared, publisher.as_ref());
         // C1, receiver side: this path delivered this chunk.
         let base_or_audio = is_base_or_audio(signed.codec_id(), signed.layer());
         shared.note_first_frame();
@@ -5822,17 +5818,17 @@ async fn send_binding_paced(
 /// Re-send this stream's current binding on every leg (a receiver whose
 /// inbound queue dropped a part gets it again).
 async fn reannounce(shared: &Arc<Shared>) {
-    // G8 pacing — never more than one re-announce in flight: a paced one
-    // can outlast BINDING_REANNOUNCE, and the next round then waits.
-    if shared.reannounce_running.swap(true, Ordering::AcqRel) {
-        shared.count(crate::observability::AV_BINDING_REANNOUNCE_HELD);
-        return;
-    }
     struct Running<'a>(&'a AtomicBool);
     impl Drop for Running<'_> {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Release);
         }
+    }
+    // G8 pacing — never more than one re-announce in flight: a paced one
+    // can outlast BINDING_REANNOUNCE, and the next round then waits.
+    if shared.reannounce_running.swap(true, Ordering::AcqRel) {
+        shared.count(crate::observability::AV_BINDING_REANNOUNCE_HELD);
+        return;
     }
     let _running = Running(&shared.reannounce_running);
     let (wire, wire_v2) = {

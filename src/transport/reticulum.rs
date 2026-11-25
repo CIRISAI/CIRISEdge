@@ -7904,11 +7904,21 @@ impl ReticulumTransport {
                         .link_datagram_stats(&l)
                         .map_or(0, |d| d.sent_bytes),
                     interface: attached.get(&l).copied().flatten(),
-                    retransmits: st.as_ref().map_or(0, |s| s.retransmits()),
-                    retransmitted_bytes: st.as_ref().map_or(0, |s| s.retransmitted_bytes()),
-                    outstanding: st.as_ref().map_or(0, |s| s.tx_ring_size()),
-                    busy_rejections: st.as_ref().map_or(0, |s| s.busy_rejections()),
-                    pacing_rejections: st.as_ref().map_or(0, |s| s.pacing_rejections()),
+                    retransmits: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::retransmits),
+                    retransmitted_bytes: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::retransmitted_bytes),
+                    outstanding: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::tx_ring_size),
+                    busy_rejections: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::busy_rejections),
+                    pacing_rejections: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::pacing_rejections),
                 }
             })
             .collect()

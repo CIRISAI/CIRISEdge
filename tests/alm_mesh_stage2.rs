@@ -3558,6 +3558,8 @@ fn count_frames_from(listeners: &mut [Call], publisher: &str) -> FrameCounts {
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// How long each `publish()` call took: `(max, p95, p50)`.
+// p95/p50 are read only through the Debug line in `publish_timed_for`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct PublishLatency {
     max: Duration,
@@ -4674,7 +4676,10 @@ async fn a_capped_publishers_children_move_themselves_and_come_back() {
             break;
         }
     }
-    let back = lifted.iter().find(|l| all_direct(l)).map(|l| l.at - lift);
+    let back = lifted
+        .iter()
+        .find(|l| all_direct(l))
+        .map(|l| l.at.checked_sub(lift).unwrap());
     match back {
         Some(b) if b <= RETURN_BOUND => {}
         other => failed.push(format!(

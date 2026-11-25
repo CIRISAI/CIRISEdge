@@ -2988,7 +2988,7 @@ mod tests {
         // The same watch tick: no egress window has closed yet.
         let mut out = a.tick(&legs);
         // RM4: the kept child is the lowest-ranked; the rest go highest first.
-        let mut by_rank = vec!["b", "c", "d"];
+        let mut by_rank = ["b", "c", "d"];
         by_rank.sort_by_key(|k| spec_rank(s(1), k));
         assert_eq!(
             a.own_children(),
@@ -3014,9 +3014,7 @@ mod tests {
         );
         assert_eq!(a.own_children().len(), 1, "the window keeps one child");
         // The latch ends UPLINK_STALL_LATCH_MS after the last detection.
-        a.t0 =
-            a.t0.checked_sub(Duration::from_millis(1_000))
-                .expect("clock");
+        a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
         a.set_uplink_stall(false);
         assert!(!a.uplink_stalled(), "released after the latch");
     }
@@ -3564,14 +3562,12 @@ mod tests {
         n.note_publisher(s(1), "a");
         n.note_bound_publisher(s(1), "a");
         let mut sent = Vec::new();
-        let mut seq = 0;
-        for step in 0..200u64 {
+        for (seq, step) in (0u64..).zip(0..200u64) {
             n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
             late_chunk(&mut n, s(1), "a", seq, 0);
             if let Some(sb) = n.sels.get(&s(1)).and_then(|x| x.standby().cloned()) {
                 late_chunk(&mut n, s(1), &sb, seq, 0);
             }
-            seq += 1;
             if step % 50 == 0 {
                 offers_to(&mut n, relays);
             }
@@ -3676,7 +3672,7 @@ mod tests {
     /// shed notice queued behind the very backlog that made it late.
     #[test]
     fn a_late_direct_child_moves_to_the_kept_child_make_before_break() {
-        let mut kids = vec!["b", "c", "d"];
+        let mut kids = ["b", "c", "d"];
         kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
         let (kept, mover) = (kids[0], kids[2]);
         let others: Vec<&str> = kids.iter().copied().filter(|k| *k != mover).collect();
@@ -3737,7 +3733,7 @@ mod tests {
     /// media: it is the child `a`'s shed keeps.
     #[test]
     fn the_lowest_ranked_direct_child_is_spared() {
-        let mut kids = vec!["b", "c", "d"];
+        let mut kids = ["b", "c", "d"];
         kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
         let me = kids[0];
         let (mut n, _) = joined_receiver(me, &kids[1..]);
@@ -3769,7 +3765,7 @@ mod tests {
     /// Mutation (45.2.0 before RM6): the slow receiver moved for nothing.
     #[test]
     fn a_receiver_late_from_every_source_does_not_move() {
-        let mut kids = vec!["b", "c", "d"];
+        let mut kids = ["b", "c", "d"];
         kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
         let (kept, mover, other) = (kids[0], kids[2], kids[1]);
         for other_late in [true, false] {

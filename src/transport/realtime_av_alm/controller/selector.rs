@@ -606,6 +606,7 @@ impl<P: PeerRef> ParentSelector<P> {
     }
 
     /// The forwarder `from` answered a subscribe.
+    #[allow(clippy::too_many_lines)]
     pub fn on_decision(
         &mut self,
         now_ms: u64,
@@ -2309,7 +2310,7 @@ mod tests {
         let _ = drive(&mut s, &cfg, 0, 10_000, &[(2, 4, 20.0), (3, 4, 30.0)]);
         let primary = *s.primary().expect("a primary");
         let other = if primary == 2 { 3 } else { 2 };
-        let standby = s.standby.clone();
+        let standby = s.standby;
         if standby == Some(other) {
             s.cands.get_mut(&other).expect("cand").link = Link::None;
             s.standby = None;

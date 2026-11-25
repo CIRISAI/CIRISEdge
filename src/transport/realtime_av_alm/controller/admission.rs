@@ -497,7 +497,7 @@ impl<P: PeerRef> Admission<P> {
     fn widen_allowed(&self, now_ms: u64) -> bool {
         !self.probe_backoff
             || self.probe_event.is_none_or(|(t, _)| {
-                now_ms >= t + (2 * self.cfg.meter_window_ms << self.probe_fails)
+                now_ms >= t + ((2 * self.cfg.meter_window_ms) << self.probe_fails)
             })
     }
 
@@ -1011,6 +1011,7 @@ impl<P: PeerRef> Admission<P> {
     /// Fold one closed egress window. Returns the subscribers shed (most
     /// recent first) when the measured limit fell below commitments.
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[allow(clippy::too_many_lines)]
     pub fn on_egress_window(
         &mut self,
         now_ms: u64,
