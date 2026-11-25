@@ -1139,17 +1139,15 @@ impl<P: PeerRef> ParentSelector<P> {
         // join the ordinary pick and the publisher's offers do the work, and
         // a node that lost a relay re-parents in the relays' tree (asking the
         // publisher for everyone herds onto it).
-        // And only once the ordinary failover has had a request's time
-        // ([`REQUEST_TIMEOUT_MS`]) to find a parent.
-        let parentless_long = self
-            .parentless_since_ms
-            .is_some_and(|t| now_ms.saturating_sub(t) >= REQUEST_TIMEOUT_MS);
+        // At once: no wait for the ordinary failover first. A wait of a
+        // request's time (3 s) held every kill witness's re-parenting back
+        // by that much and failed it once by 0.36 s; the t2 herd it was
+        // added against is kept off by `direct_first` alone.
         // Live calls only (`direct_first`, like R1): the stage-1 sim's
         // capacity-tight worlds (t2) are tuned without it.
         if !self.cfg.direct_first
             || now_ms < self.next_publisher_ask_ms
             || self.last_primary.is_none()
-            || !parentless_long
             || self.publisher_asks_left == 0
         {
             return None;
@@ -2269,10 +2267,14 @@ mod tests {
         s.on_offer(20_000, relay(vec![2, 1]), 20.0, &mut log);
         s.on_link_down(20_100, &2, &mut log);
         let mut asked: Vec<(u32, Role)> = Vec::new();
+        let mut first_ask: Option<u64> = None;
         for k in 0..24u64 {
             let t = 20_250 + k * 250;
             for a in s.tick(t, &mut rng, &mut log) {
                 if let SelectorAction::Subscribe { parent, role } = a {
+                    if parent == 2 && role == Role::Primary {
+                        first_ask.get_or_insert(t);
+                    }
                     asked.push((parent, role));
                 }
             }
@@ -2284,6 +2286,10 @@ mod tests {
         assert!(
             asked.iter().any(|(p, r)| *p == 2 && *r == Role::Primary),
             "the publisher is asked at once, Down or not: {asked:?}"
+        );
+        assert!(
+            first_ask.is_some_and(|t| t <= 20_500),
+            "asked on the tick after the loss (20_100), not after a wait: {first_ask:?}"
         );
     }
 

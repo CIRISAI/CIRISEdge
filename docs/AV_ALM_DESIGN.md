@@ -138,7 +138,7 @@ looped, or shed this node) is held Down for `down_hold_ms` (15 s): an offer
 proves the forwarder is alive, not that it delivers, so liveness alone cannot
 clear a verdict that delivery earned. The one exception is row S3 on the
 child's side: a node whose lost primary was the stream's **publisher**, parentless
-for a request's time with no viable candidate, asks the publisher directly
+with no viable candidate, asks the publisher directly at once
 whatever its health, at most three times per loss, one per 2 s. The publisher
 is the one node that always holds the stream, and when every relay hangs
 under the lost link it is the only route back: waiting out the hold collapsed
