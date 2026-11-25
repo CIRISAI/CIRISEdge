@@ -3749,6 +3749,88 @@ async fn every_pair_keeps_both_legs_uncapped() {
     );
 }
 
+/// **A listener whose pump falls behind still takes in every control
+/// frame** (come-back, 45.2.0): a node's inbound A/V queue per link holds
+/// 256 frames and drops the newest when full, and C3 frames (offers,
+/// admits, refusals) rode the same queue as media, so a listener that fell
+/// behind a media flood lost its answers while the transport had delivered
+/// them (admits sent 67, taken in 42 in one come-back run). Here R's pump is
+/// held 12 s while three members publish: its queues overflow with media
+/// (the precondition, asserted), and every control frame sent to it in that
+/// time must still be taken in once it drains: none is among the frames the
+/// sink drops (`av_inbound_control_dropped`), and at least 90 % of the rate
+/// it took them in before the hold is taken in over the hold and the drain.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_listener_whose_pump_falls_behind_still_takes_every_control_frame() {
+    const HOLD: Duration = Duration::from_secs(12);
+    const DRAIN_S: u64 = 4;
+    let _call = one_call().await;
+    let tag = "alm2-c3flood";
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        None,
+    )
+    .await;
+    let mut calls = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        calls.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    for c in &calls {
+        wait_legs(c, 3).await;
+    }
+    // Settle, then R's rate of control frames taken in, unheld.
+    let mut seq = publish_three(&mut calls, 4, 0).await;
+    let c0 = calls[0].alm_counts().c3_received;
+    seq = publish_three(&mut calls, 4, seq).await;
+    let c1 = calls[0].alm_counts().c3_received;
+    #[allow(clippy::cast_precision_loss)]
+    let rate = (c1 - c0) as f64 / 4.0;
+    let dropped_before = av(&nodes[0].metrics, "av_inbound_dropped_queue_full");
+    calls[0].stall_inbound_for_test(HOLD);
+    seq = publish_three(&mut calls, HOLD.as_secs(), seq).await;
+    let _ = publish_three(&mut calls, DRAIN_S, seq).await;
+    let c2 = calls[0].alm_counts().c3_received;
+    let dropped = av(&nodes[0].metrics, "av_inbound_dropped_queue_full") - dropped_before;
+    let control_dropped = av(&nodes[0].metrics, "av_inbound_control_dropped");
+    #[allow(clippy::cast_precision_loss)]
+    let want = 0.9 * rate * (HOLD.as_secs() + DRAIN_S) as f64;
+    eprintln!(
+        "[C3FLOOD] rate {rate:.1}/s unheld; taken in over hold+drain {}; want >= {want:.0}; media dropped at R's queues {dropped}; control frames among them {control_dropped}",
+        c2 - c1
+    );
+    assert!(
+        dropped > 0,
+        "the precondition: R's queues overflowed ({dropped} dropped)"
+    );
+    assert_eq!(
+        control_dropped, 0,
+        "no control frame is shed with the media: {control_dropped} of the {dropped} dropped were C3"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let got = (c2 - c1) as f64;
+    assert!(
+        got >= want,
+        "every control frame is taken in: {got} taken in over the hold and drain, {want:.0} owed at {rate:.1}/s"
+    );
+    drop(calls);
+}
+
 /// **G8 — a publisher whose uplink is capped below its fan-out** (the
 /// server's av_mesh cell, on loopback, with no tc): `P` publishes
 /// 600 B at 30 Hz to `A`, `B` and `C`, who reach each other directly, every

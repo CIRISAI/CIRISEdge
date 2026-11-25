@@ -917,6 +917,10 @@ pub const AV_LINK_ARRIVED: &str = "av_link_arrived";
 pub const AV_INBOUND_DELIVERED: &str = "av_inbound_delivered";
 /// Dropped: the consumer is a full queue behind (the never-block policy).
 pub const AV_INBOUND_DROPPED_QUEUE_FULL: &str = "av_inbound_dropped_queue_full";
+/// 45.2.0 — of the A/V frames dropped at the sink, the ALM C3 control frames
+/// (an offer, an answer, a subscribe): delivered by the transport and lost
+/// before the call saw them.
+pub const AV_INBOUND_CONTROL_DROPPED: &str = "av_inbound_control_dropped";
 /// Dropped: the link's peer did not pass the #393 attribution gate.
 pub const AV_INBOUND_DROPPED_UNATTRIBUTED: &str = "av_inbound_dropped_unattributed";
 /// Dropped: a peer-opened A/V link arrived and nobody took the arrivals
@@ -2953,6 +2957,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_LINK_ARRIVED,
     AV_INBOUND_DELIVERED,
     AV_INBOUND_DROPPED_QUEUE_FULL,
+    AV_INBOUND_CONTROL_DROPPED,
     AV_INBOUND_DROPPED_UNATTRIBUTED,
     AV_INBOUND_DROPPED_NO_CONSUMER,
     AV_INBOUND_DROPPED_ARRIVALS_FULL,

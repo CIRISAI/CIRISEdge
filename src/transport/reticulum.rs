@@ -17074,6 +17074,9 @@ async fn deliver_av_frame(
     let metrics = ctx.metrics.cloned();
     let outbound_liveness = ctx.link_last_outbound_at;
     let data_len = data.as_ref().map(Vec::len);
+    let control = data
+        .as_deref()
+        .is_some_and(crate::transport::realtime_av_alm::controller::wire::is_control_frame);
     let delivery = ctx.av_sink.deliver(link_id, data, |inbound| {
         crate::transport::av_sink::AvArrival {
             link_id: link_id.into_bytes(),
@@ -17123,6 +17126,9 @@ async fn deliver_av_frame(
                 _ => crate::observability::AV_INBOUND_DROPPED_NO_CONSUMER,
             };
             count(label);
+            if control {
+                count(crate::observability::AV_INBOUND_CONTROL_DROPPED);
+            }
             if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                 av_sink_drop_log().check(&format!("{label}:{link_id:?}"))
             {
