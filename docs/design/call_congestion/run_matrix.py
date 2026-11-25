@@ -422,7 +422,8 @@ def tlc(outdir, name, cfgtext, extra=()):
     cfg = os.path.join(outdir, name + ".cfg")
     open(cfg, "w").write(cfgtext)
     env = dict(os.environ, GRACE_SCHED_OWNER="edge",
-               GRACE_SCHED_KIND="edge: call model TLC", GRACE_SCHED_PEAK_GB="6")
+               GRACE_SCHED_KIND="edge: call model TLC", GRACE_SCHED_PEAK_GB="3",
+               GRACE_SCHED_PRIORITY="low")   # yields to builds; measured peak <= 2.2 GB
     cmd = ["timeout", str(CAP_SECS), "nice", "-n", "19", "ionice", "-c3", GUARD,
            "java", "-Xmx2g", "-Xss64m", "-XX:+UseParallelGC", "-cp", JAR, "tlc2.TLC",
            "-workers", "2", *extra, "-config", cfg,
