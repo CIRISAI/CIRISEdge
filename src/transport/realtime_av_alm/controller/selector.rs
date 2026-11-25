@@ -1719,6 +1719,50 @@ impl<P: PeerRef> ParentSelector<P> {
                     out.push(self.drop_parent(now_ms, &s, rng, log, "standby has no room"));
                     out.push(self.request(now_ms, &n, Role::Standby, "standby with room", log));
                 }
+            } else if calm
+                && self.cfg.direct_first
+                && self.cfg.admission_enabled
+                && self
+                    .last_standby_rotation_ms
+                    .is_none_or(|t| now_ms >= t + self.cfg.min_dwell_ms)
+            {
+                // Row RD — the way back to the publisher. A node that left
+                // its publisher for a relay (a late move, a shed) keeps a
+                // member as its standby, and nothing ever re-picked the
+                // publisher while that relay stayed healthy: the publisher
+                // re-opened room seconds after its cap lifted and its
+                // children stayed relayed until something else moved them
+                // (the come-back witness). So when this node hears the stream
+                // through a relay, its standby is a relay too, and the
+                // stream's publisher offers room for a whole stream, the
+                // standby moves to the publisher (audio only, cheap); the
+                // direct-first switch above then upgrades it.
+                let direct = |c: &Cand<P>| {
+                    c.offer
+                        .as_ref()
+                        .is_some_and(|o| o.depth == 0 && o.ancestry.is_empty())
+                };
+                let relayed = self
+                    .primary
+                    .as_ref()
+                    .is_some_and(|p| !direct(&self.cands[p]));
+                let to = self
+                    .cands
+                    .iter()
+                    .filter(|(_, d)| d.link == Link::None && direct(d))
+                    .filter(|(k, d)| self.viable(k, d, Role::Standby, now_ms))
+                    .find(|(_, d)| {
+                        d.offer
+                            .as_ref()
+                            .is_some_and(|o| o.headroom_bps >= self.cfg.stream_bps)
+                    })
+                    .map(|(k, _)| k.clone());
+                if let (true, false, Some(n)) = (relayed, direct(c), to) {
+                    self.last_standby_rotation_ms = Some(now_ms);
+                    self.standby = None;
+                    out.push(self.drop_parent(now_ms, &s, rng, log, "standby to the publisher"));
+                    out.push(self.request(now_ms, &n, Role::Standby, "publisher has room", log));
+                }
             }
         }
         let pending_standby = self.cands.values().any(|c| {

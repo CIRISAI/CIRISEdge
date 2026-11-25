@@ -236,6 +236,8 @@ pub struct Admission<P: PeerRef> {
     /// last reset: a later widening is not counted as held before twice
     /// that has passed.
     probe_ttf_ms: u64,
+    /// Row NV ([`Self::set_shed_on_verdict_only`]).
+    shed_on_verdict_only: bool,
     /// Row RO — when `demand` was last set; it lapses a dwell later at a
     /// live call's publisher.
     demand_at_ms: u64,
@@ -341,6 +343,7 @@ impl<P: PeerRef> Admission<P> {
             probe_fails: 0,
             probe_event: None,
             probe_ttf_ms: 0,
+            shed_on_verdict_only: false,
             demand_at_ms: 0,
             shed_rank: None,
             shed_at: BTreeMap::new(),
@@ -466,6 +469,20 @@ impl<P: PeerRef> Admission<P> {
     /// for ever (probe, late, leave, repeat).
     pub fn set_probe_backoff(&mut self, on: bool) {
         self.probe_backoff = on;
+    }
+
+    /// Row NV — a live call's forwarder sheds an existing child only on a
+    /// congestion verdict (the meter's, or the stall's), never in a clean
+    /// window. The clean-window shed fired when the ledger got ahead of the
+    /// limit by accounting alone: another stream this node relays admitted
+    /// someone, the limit left for this stream fell below what it had
+    /// already committed, and a child admitted a second earlier was shed
+    /// with the uplink carrying everything (the come-back witness: admit at
+    /// 55.78 s, shed "over-committed" at 56.50 s, no cap; four primary
+    /// changes for one listener). If the uplink really cannot carry what is
+    /// committed, the verdict says so and that window sheds.
+    pub fn set_shed_on_verdict_only(&mut self, on: bool) {
+        self.shed_on_verdict_only = on;
     }
 
     /// RM4 — shed by rank on `stream` instead of LIFO by admission.
@@ -1279,6 +1296,9 @@ impl<P: PeerRef> Admission<P> {
             }
         }
         if !self.cfg.admission_enabled {
+            return Vec::new();
+        }
+        if self.shed_on_verdict_only && !(w.congested && w.capacity_bps.is_some()) {
             return Vec::new();
         }
         let mut shed = Vec::new();

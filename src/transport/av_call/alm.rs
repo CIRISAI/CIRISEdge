@@ -418,6 +418,7 @@ impl AlmState {
         own.set_members(members.iter().cloned());
         own.set_slow_start(true);
         own.set_probe_backoff(true);
+        own.set_shed_on_verdict_only(true);
         own.set_shed_rank(Some(own_stream.0));
         own.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         Self {
@@ -1239,6 +1240,7 @@ impl AlmState {
         a.set_members(self.members.iter().cloned());
         a.set_slow_start(true);
         a.set_probe_backoff(true);
+        a.set_shed_on_verdict_only(true);
         a.set_shed_rank(Some(stream.0));
         a.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         self.shares.insert(stream, (a, Rate::default()));
@@ -1473,6 +1475,7 @@ impl AlmState {
         a.set_role_costs(full, audio);
         a.set_members(self.members.iter().cloned());
         a.set_admit_closed(!self.tier.admits_new_relay_work());
+        a.set_shed_on_verdict_only(true);
         self.relays.insert(s, a);
         self.sync_upstream(s);
     }
