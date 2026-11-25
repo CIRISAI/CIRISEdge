@@ -977,8 +977,16 @@ tempfile       = { version = "3", optional = true }
 # send's sequence and `ReticulumNode::link_seq_stats` (`LinkSeqStats`,
 # `delivered_through`) proves it delivered. Additive: `LinkStats`, the wire
 # and the `send_on_link` error mapping are unchanged.
-leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", rev = "ed29899fbb62d8df325b88780e4f916b0e4ed5ba", version = "0.34", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "ed29899fbb62d8df325b88780e4f916b0e4ed5ba", version = "0.34", optional = true }
+# v0.34.0+ciris.4 (d3565cf1) — the direct-link punch (port prediction, many
+# sockets, a second observer) and nomination with its secret; the Channel
+# reliability series (per-attempt receipts, a learned timeout held to the
+# stale bound, the peer-evidence hold, RACK loss detection, pacing from the
+# path's minimum RTT, a path move judged by the old path's RTT). SOURCE BREAKS
+# edge adopted: `DirectLinkSettings` is non-exhaustive (start from `default()`),
+# `ReticulumNode::note_peer_evidence`, `LinkStats::learned_srtt_ms`.
+# `LinkStats::min_rtt_ms()` may be `None` right after a path move.
+leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.4", version = "0.34", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.4", version = "0.34", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -988,7 +996,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "ed29899f
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", rev = "ed29899fbb62d8df325b88780e4f916b0e4ed5ba", version = "0.34", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.4", version = "0.34", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
