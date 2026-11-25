@@ -82,6 +82,11 @@ CONSTANTS
                         \* capping the probe: widen one child per Dwell under ProbeBackoff
     DrainHold,
     LateAdmitAccept,    \* a parentless listener applies an ADMIT it stopped waiting for
+    AskAfterShed,       \* S3 old: a child P shed asks P back at once (room and backoff ignored)
+    AskAfterLoss,       \* S3 narrowed: only a child whose primary was LOST asks P at once
+    PrimarylessAdmit,   \* P with no primary admits a subscribe whatever its room
+    DemandGuard,        \* a refusal is demand only if no verdict is latched, the asker was
+                        \* not just shed by P, and no undrained congestion-learned ceiling
     NonChildEvery,      \* P offers to members that are not its children this often
     KillAt,             \* P's leg to its first direct child is torn at this tick (0: never)
     UpstreamShed,       \* a relay that loses its parent sheds its children (they fail over)
@@ -211,7 +216,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -219,7 +224,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -250,6 +255,8 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         maxPrimaryGap |-> maxPrimaryGap, bindSkips |-> bindSkips, lastOfferNC |-> lastOfferNC,
         allOkAt |-> allOkAt, lostAt |-> lostAt, drainedSince |-> drainedSince,
         maxParentless |-> maxParentless, admitsIgnored |-> admitsIgnored, maxJoins |-> maxJoins,
+        askNow |-> askNow, lastShedAt |-> lastShedAt, refusedBy |-> refusedBy,
+        repeatDemand |-> repeatDemand,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -327,6 +334,7 @@ ShedTo(S, keep) ==
         kept == {ordered[i] : i \in 1..Min(room1, Len(ordered))}
         victims == kids \ kept
         S1 == [S EXCEPT !.children = kept, !.room = 1,
+                        !.lastShedAt = IF victims /= {} THEN S.now ELSE @,
                         !.standbys = IF StandbyFeed = "full" THEN (@ \cup victims) \ kept
                                      ELSE IF StandbyFeed \in {"fix", "fix2"} THEN {} ELSE @,
                         !.firstShedAt = IF @ < 0 /\ victims /= {} THEN S.now ELSE @,
@@ -368,12 +376,21 @@ MediaTo(S, s, set, t) ==
 
 PAdmit(S, l) ==
     IF l \in S.children THEN SendCtrl(S, <<"P", l>>, Pay("admit"))
-    ELSE IF Cardinality(S.children) < S.room
+    ELSE IF Cardinality(S.children) < S.room \/ (PrimarylessAdmit /\ S.children = {})
     THEN SendCtrl([S EXCEPT !.children = @ \cup {l}, !.standbys = @ \ {l},
                             !.order = Append(SelectSeq(@, LAMBDA x : x /= l), l),
                             !.drainTo[l] = -1, !.shedPend[l] = FALSE],
                   <<"P", l>>, Pay("admit"))
-    ELSE SendCtrl([S EXCEPT !.demand = TRUE], <<"P", l>>, Pay("refuse"))
+    ELSE LET drained == S.drainedSince >= 0 /\ S.now - S.drainedSince >= DrainHold
+             counts == ~DemandGuard
+                       \/ (/\ ~S.stall
+                           /\ ~(S.shedAtL[l] >= 0 /\ S.now - S.shedAtL[l] <= Dwell)
+                           /\ (S.lastCong < 0 \/ drained))
+             \* a repeat ask (refused before, within 4 s) is a member that has
+             \* nowhere else to go: the fast path's trigger
+             repeat == S.refusedBy[l] >= 0 /\ S.now - S.refusedBy[l] <= 40
+         IN SendCtrl([S EXCEPT !.demand = @ \/ counts, !.refusedBy[l] = S.now,
+                               !.repeatDemand = @ \/ (counts /\ repeat)], <<"P", l>>, Pay("refuse"))
 
 RelayAdmit(S, x, l) ==
     IF /\ S.parent[x] /= None
@@ -388,7 +405,7 @@ OnAdmit(S, l, x) ==
     THEN LET S0 == [S EXCEPT !.admitsIgnored = IF S.parent[l] /= x THEN @ + 1 ELSE @]
          IN IF AdmitCleanup /\ S.parent[l] /= x THEN SendCtrl(S0, <<l, x>>, Pay("unsub")) ELSE S0
     ELSE LET old == S.parent[l]
-             S1 == [S EXCEPT !.parent[l] = x, !.pendSub[l] = None,
+             S1 == [S EXCEPT !.parent[l] = x, !.pendSub[l] = None, !.askNow[l] = FALSE,
                              !.reparents[l] = @ + 1, !.lastSwitch[l] = S.now,
                              !.maxParentGap = IF S.shedAtL[l] >= 0 THEN Max(@, S.now - S.shedAtL[l]) ELSE @,
                              !.shedAtL[l] = -1, !.lastFromParent[l] = S.now,
@@ -413,7 +430,9 @@ OnAdmit(S, l, x) ==
 
 OnShed(S, l, x) ==
     IF S.parent[l] = x
-    THEN [S EXCEPT !.parent[l] = None, !.boUntil[l][x] = S.now + 4 * Backoff,
+    THEN [S EXCEPT !.parent[l] = None,
+                   !.boUntil[l][x] = IF AskAfterShed /\ x = "P" THEN S.now ELSE S.now + 4 * Backoff,
+                   !.askNow[l] = AskAfterShed /\ x = "P",
                    !.shedBy[l] = x]
     ELSE [S EXCEPT !.shedBy[l] = IF x = "P" THEN x ELSE @]
 
@@ -426,7 +445,7 @@ Handle(S, pay, s, r) ==
       [] pay.p = "admit" -> OnAdmit(S, r, s)
       [] pay.p = "refuse" ->
             IF S.pendSub[r] = s
-            THEN [S EXCEPT !.pendSub[r] = None, !.boUntil[r][s] = S.now + Backoff]
+            THEN [S EXCEPT !.pendSub[r] = None, !.boUntil[r][s] = S.now + Backoff, !.askNow[r] = FALSE]
             ELSE S
       [] pay.p = "shed" -> OnShed(S, r, s)
       [] pay.p = "unsub_late" \/ (pay.p = "unsub" /\ DepartureHolds /\ r = "P" /\ s \in S.children) ->
@@ -615,7 +634,7 @@ Viable(S, l, x) ==
     /\ S.up[<<l, x>>] /\ S.peerUp[<<x, l>>]
     /\ S.now >= S.boUntil[l][x]
     /\ S.offerAt[l][x] >= 0 /\ S.now - S.offerAt[l][x] <= DownSilence
-    /\ S.offerFwd[l][x] /\ S.offerRoom[l][x]
+    /\ S.offerFwd[l][x] /\ (S.offerRoom[l][x] \/ (x = "P" /\ S.askNow[l]))
     /\ (x = "P" \/ l \notin Chain(S, x))
 Cands(S, l) == SelectSeq(NodeSeq, LAMBDA x : x \in Nodes /\ Viable(S, l, x))
 Pick(c, k) == IF c[1] = "P" THEN "P" ELSE c[Min(k, Len(c))]
@@ -627,6 +646,8 @@ LWatch1(S, l, k) ==
     ELSE LET lost == S.parent[l] /= None /\ (~S.peerUp[<<S.parent[l], l>>] \/ ~S.up[<<l, S.parent[l]>>])
              S0 == IF lost
                    THEN [S EXCEPT !.boUntil[l][S.parent[l]] = S.now + Backoff,
+                                  !.boUntil[l]["P"] = IF AskAfterLoss THEN S.now ELSE @,
+                                  !.askNow[l] = AskAfterLoss,
                                   !.parent[l] = None]
                    ELSE S
              \* UpstreamShed: a relay that lost its parent sheds its children
@@ -712,7 +733,10 @@ Window(S, ch) ==
              \* since the last congestion (a late move is one, ReceiverMoves)
              calm == S.now - Max(S.lastCong, S.lastWiden) >= 2 * WindowTicks * 2^S.probeFails
                      /\ (S.lastCong < 0 \/ S.now - S.lastCong >= StallHold)
-             r1 == IF S.demand /\ S.room < NL /\ (calm \/ ~ProbeBackoff) THEN S.room + 1 ELSE S.room
+             \* DemandGuard's fast path: a publisher that has never learned
+             \* congestion serves a refusal at the next window (nobody relays)
+             r1 == IF S.demand /\ S.room < NL /\ (calm \/ ~ProbeBackoff \/ (DemandGuard /\ S.lastCong < 0 /\ S.repeatDemand))
+                   THEN S.room + 1 ELSE S.room
              \* SlowStart: two clean windows since the last congestion and the
              \* last widening prove the room it has; widen by one stream (the
              \* probe is the widening; a stall takes it back).
@@ -731,6 +755,7 @@ Window(S, ch) ==
              \* backoff down: the probe that worked is the measurement
              held == S.lastWiden > S.lastCong
          IN [S EXCEPT !.room = r3, !.demand = IF r1 /= S.room THEN FALSE ELSE @,
+                      !.repeatDemand = IF r1 /= S.room THEN FALSE ELSE @,
                       !.lastWiden = IF r3 /= S.room THEN S.now ELSE @,
                       !.probeFails = IF r3 /= S.room /\ held THEN Max(0, @ - 1) ELSE @]
 
@@ -868,6 +893,9 @@ StallShedGapS(S) == /\ S.maxParentGap <= GapBound
 OwnSlowStaysS(S) == ~S.slowMoved
 \* Every listener keeps a parent throughout: never parentless past GapBound.
 ParentedThroughoutS(S) == S.maxParentless <= GapBound
+\* After the cap lifts and the backlog has drained (2 windows of margin), P
+\* never sheds again: nothing it grows into can exceed what fits.
+NoShedAfterLiftS(S) == (CapUntil < Horizon /\ S.lastShedAt >= 0) => S.lastShedAt < CapUntil + 2 * WindowTicks
 \* Children join P one at a time (a widening invites one).
 OneJoinAtATimeS(S) == S.maxJoins <= 1
 \* RM4: after a shed P is never left with no direct child (beyond two watch
@@ -921,7 +949,7 @@ Bad(S) ==
     {n \in {"NoSpuriousTeardown", "KeepsOneChild", "NeverTwoParents", "MakeBeforeBreak",
             "NothingWaitsForever", "ReparentBound", "EndParented", "EndHeard",
             "EndFullFanOut", "DeadDetected", "EndQueueDrained",
-            "NoIdleWithOffer", "StallShedGap", "OwnSlowStays", "NeverDrained", "EgressOneCopy", "OnePrimary", "ParentedThroughout", "OneJoinAtATime"} :
+            "NoIdleWithOffer", "StallShedGap", "OwnSlowStays", "NeverDrained", "EgressOneCopy", "OnePrimary", "ParentedThroughout", "OneJoinAtATime", "NoShedAfterLift"} :
         CASE n = "NoSpuriousTeardown" -> ~NoSpuriousTeardownS(S)
           [] n = "KeepsOneChild" -> ~KeepsOneChildS(S)
           [] n = "NeverTwoParents" -> ~NeverTwoParentsS(S)
@@ -940,7 +968,8 @@ Bad(S) ==
           [] n = "EgressOneCopy" -> ~EgressOneCopyS(S)
           [] n = "OnePrimary" -> ~OnePrimaryS(S)
           [] n = "ParentedThroughout" -> ~ParentedThroughoutS(S)
-          [] n = "OneJoinAtATime" -> ~OneJoinAtATimeS(S)}
+          [] n = "OneJoinAtATime" -> ~OneJoinAtATimeS(S)
+          [] n = "NoShedAfterLift" -> ~NoShedAfterLiftS(S)}
 
 -----------------------------------------------------------------------------
 LegName(l) == l[1] \o ">" \o l[2]
@@ -1096,6 +1125,8 @@ Init ==
     /\ standbys = {} /\ maxStallCopies = 0 /\ primaryGapRun = 0 /\ maxPrimaryGap = 0
     /\ bindSkips = [l \in Legs |-> 0] /\ lastOfferNC = -100 /\ allOkAt = -1 /\ lostAt = [c \in L |-> -1]
     /\ drainedSince = -1 /\ maxParentless = 0 /\ admitsIgnored = 0 /\ maxJoins = 0
+    /\ askNow = [c \in L |-> FALSE] /\ lastShedAt = -1
+    /\ refusedBy = [c \in L |-> -1] /\ repeatDemand = FALSE
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
@@ -1138,7 +1169,9 @@ Assign(S) ==
     /\ standbys' = S.standbys /\ maxStallCopies' = S.maxStallCopies
     /\ primaryGapRun' = S.primaryGapRun /\ maxPrimaryGap' = S.maxPrimaryGap /\ bindSkips' = S.bindSkips
     /\ lastOfferNC' = S.lastOfferNC /\ allOkAt' = S.allOkAt /\ lostAt' = S.lostAt /\ drainedSince' = S.drainedSince
-    /\ maxParentless' = S.maxParentless /\ admitsIgnored' = S.admitsIgnored /\ maxJoins' = S.maxJoins /\ dialAt' = S.dialAt
+    /\ maxParentless' = S.maxParentless /\ admitsIgnored' = S.admitsIgnored /\ maxJoins' = S.maxJoins
+    /\ askNow' = S.askNow /\ lastShedAt' = S.lastShedAt /\ refusedBy' = S.refusedBy
+    /\ repeatDemand' = S.repeatDemand /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
@@ -1216,7 +1249,7 @@ Observed ==
      first_verdict |-> firstVerdictAt, first_shed |-> firstShedAt, q_at_shed |-> firstShedQ,
      full_at |-> fullAt, parent_gap |-> maxParentGap, media_gap |-> maxMediaGap,
      drain_clear |-> drainClear, cap_end_q |-> capEndQ, zero_direct |-> maxZeroRun,
-     admits_ignored |-> admitsIgnored, max_parentless |-> maxParentless, probe_fails |-> probeFails,
+     last_shed |-> lastShedAt, admits_ignored |-> admitsIgnored, max_parentless |-> maxParentless, probe_fails |-> probeFails,
      all_ok_after_kill |-> IF allOkAt >= 0 THEN allOkAt - KillAt ELSE IF KillAt > 0 THEN 9999 ELSE -1, stall_copies |-> maxStallCopies, primary_gap |-> maxPrimaryGap, verdict_rises |-> verdicts,
      heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
 \* One line per terminal state: the outcome, the violated set, what is observed.

@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE", ASKSHED="FALSE", ASKLOSS="FALSE", PLADMIT="FALSE", DGUARD="FALSE", RFREE="40",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -207,6 +207,28 @@ def scenarios():
     yield "admit-aside-late-accept", dict(adm, LATEADMIT="TRUE")
     yield "admit-aside-ship", dict(SHIP, M="12", RCAP="16", CAPUNTIL="1000", FEED='"fix2"', SILENT="TRUE",
                                    KEEPFRESH="TRUE")
+    # S3 narrowed vs ask-after-shed, and refusal-as-demand with its guard.
+    # Base: the code's release shape (shipping set + silent listeners + keep-
+    # fresh + admit cleanup + paced re-announce + fix2 + ProbeAfterDrain + a
+    # primary-less P admits); 2.25x; cap lifts at 5 s (post-lift over-growth).
+    s3 = dict(SHIP, M="12", RCAP="16", FEED='"fix2"', SILENT="TRUE", KEEPFRESH="TRUE", CLEANUP="TRUE",
+              BINDEVERY="100", BINDPACE="10", BINDEXP="TRUE", BINDSKIP="TRUE", BINDSKIPMAX="100",
+              PAD="TRUE", DHOLD="10", PLADMIT="TRUE", RFREE="80",
+              RXMOVE="FALSE", HASH="FALSE")   # sheds happen (no ReceiverMoves), so S3 is exercised
+    for tag, sw in [("ask-after-shed", dict(ASKSHED="TRUE")), ("ask-after-loss", dict(ASKLOSS="TRUE"))]:
+        for g in ["FALSE", "TRUE"]:
+            gt = "-guard" if g == "TRUE" else ""
+            yield f"s3-{tag}{gt}", dict(s3, DGUARD=g, **sw)
+            yield f"s3-{tag}{gt}-cap-held", dict(s3, DGUARD=g, CAPUNTIL="1000", **sw)
+            yield f"s3-{tag}{gt}-kill", dict(s3, DGUARD=g, CAPUNTIL="1000", KILLAT="120", **sw)
+    # Nobody relays (RelaySlots 0): the third child must still get in, through
+    # refusals counted as demand; uncapped and capped.
+    nr = dict(s3, ASKLOSS="TRUE", SLOTS="0", RXMOVE="FALSE")
+    for g in ["FALSE", "TRUE"]:
+        gt = "-guard" if g == "TRUE" else ""
+        yield f"norelay{gt}-uncapped", dict(nr, DGUARD=g, CAPAT="1000", CAPUNTIL="1000")
+        yield f"norelay{gt}-capped", dict(nr, DGUARD=g)
+        yield f"norelay{gt}-no-demand-uncapped", dict(nr, DGUARD=g, CAPAT="1000", CAPUNTIL="1000", SS="FALSE")
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)
