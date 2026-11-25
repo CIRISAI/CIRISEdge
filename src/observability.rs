@@ -1155,6 +1155,13 @@ pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
 /// 45.2.0 — a live call ended because this node stopped carrying call media
 /// (it turned shaped-only or anonymous), `EndCause::MediaRefused`.
 pub const AV_CALL_ENDED_MEDIA_REFUSED: &str = "av_call_ended_media_refused";
+/// 45.3 — a call's watch found its room's group behind the store's head
+/// (another handle on the same store applied a commit) and reloaded it, so
+/// the call rolls to the stored epoch.
+pub const AV_CALL_ROOM_FOLLOWED_STORE: &str = "av_call_room_followed_store";
+/// 45.3 — a call's roll to its room's new epoch failed (the group, the owner
+/// bindings, the stream key or the DEK unreadable); retried every watch tick.
+pub const AV_CALL_ROLL_FAILED: &str = "av_call_roll_failed";
 /// ALM — a chunk this node forwarded as an admitted media parent.
 pub const ALM_FORWARDED: &str = "alm_forwarded";
 /// ALM C4 — this node's primary parent for a stream changed.
@@ -3050,6 +3057,8 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_LEG_GONE_ON_SEND,
     SHAPED_ONLY_NO_MEDIA,
     AV_CALL_ENDED_MEDIA_REFUSED,
+    AV_CALL_ROOM_FOLLOWED_STORE,
+    AV_CALL_ROLL_FAILED,
     ALM_FORWARDED,
     ALM_PARENT_CHANGE,
     ALM_RELAY_TIER_ROSTER,

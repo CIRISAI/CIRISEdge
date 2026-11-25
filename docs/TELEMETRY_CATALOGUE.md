@@ -295,6 +295,17 @@ counts handshakes whose link closed in the queue: they cost no crypto.
 7. `Call.alm_log()` in Python returns the hash, the count and the tail while the
    call lives. The tail names peers: it is for the owner's session only.
 
+### Why is this call at another epoch than its room?
+
+1. A call runs at its room group's stored head (45.3). Each watch tick (250 ms)
+   reads the head slot; when another handle on the same store moved it (the
+   host's chat driver holds its own), the call's handle reloads and the call
+   rolls. `av_call_room_followed_store` in `av_plane` counts those reloads.
+2. `av_call_roll_failed` in `av_plane` counts every tick a roll failed. The
+   WARN line "the roll to the room's epoch failed" names the cause once, and
+   again every 30 s while the same cause stands.
+3. A "CALL ROLLED" INFO line follows each roll, with the epochs.
+
 ### What tier is this node in, and who put it there?
 
 1. `load_tier` (0, 1, 2) and `load_host_pressure` (0, 1, 2).

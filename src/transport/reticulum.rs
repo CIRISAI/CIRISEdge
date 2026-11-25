@@ -14095,7 +14095,10 @@ impl DialCtx {
             return Err(TransportError::NoRouteToPeer {
                 key_id: destination_key_id.to_string(),
                 target_dest: hex::encode(dest_hash.into_bytes()),
-                has_path: false,
+                // 45.3 — the path table's own answer, not a constant: a
+                // hard-coded `false` sent a call's epoch split (addresses
+                // nobody registered) looking like a routing fault.
+                has_path: self.node.has_path(&dest_hash),
                 paths: self.path_table_snapshot(),
             });
         }

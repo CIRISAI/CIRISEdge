@@ -4153,6 +4153,20 @@ async fn current_members(shared: &Shared) -> Vec<String> {
 /// members are dialled.
 #[allow(clippy::too_many_lines)] // one roll, every live stream, in one place
 async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
+    // 45.3 — the call runs at the room group's STORED head: another handle
+    // on the same store (the host's chat driver holds its own) may have
+    // applied a commit this handle never saw. One head-slot read a tick; a
+    // reload only when the head moved.
+    match shared.room_group.refresh_from_store().await {
+        Ok(Some(_)) => shared.count(crate::observability::AV_CALL_ROOM_FOLLOWED_STORE),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(CallError::RoomGroupUnavailable {
+                room: shared.room.clone(),
+                detail: format!("the stored head: {e}"),
+            })
+        }
+    }
     let room_epoch = shared.room_group.epoch().await;
     // A replacement waiting out its overlap was minted at the epoch about to
     // end: switch to it first, so the roll rolls the new stream.
@@ -4264,6 +4278,15 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     Shared::lock(&shared.epochs).push(room_epoch);
     close_departed(shared, &left).await;
     readdress(shared, room_epoch, &members).await;
+    // 45.3 — every member's address moved with the epoch: a dial waiting out
+    // a backoff, or still in flight, is aimed at an address of the epoch the
+    // call just left (and at a joiner's, one nobody registered). Dial each
+    // at its new address now; a dial in flight is raced.
+    for m in &members {
+        if *m != shared.own && !joined.contains(m) {
+            dial_now_if_backing_off(shared, m, RACE_ON_ROLL);
+        }
+    }
     shared.emit(CallEvent::EpochRolled {
         from,
         to: room_epoch,
@@ -4369,6 +4392,9 @@ async fn redial_on_direct_path(shared: Arc<Shared>) {
 
 /// [`dial_now_if_backing_off`]'s reason when the member dialled this node.
 const RACE_ON_INBOUND: &str = "the member dialled this node";
+/// [`dial_now_if_backing_off`]'s reason when this node's call rolled (45.3):
+/// a dial in flight was aimed at the previous epoch's address.
+const RACE_ON_ROLL: &str = "the call rolled to a new epoch";
 
 /// `peer` is reachable now (a direct path came up, or it just dialled this
 /// node): if this node has no leg to it and is only waiting out a failed
@@ -4404,7 +4430,8 @@ fn dial_now_if_backing_off(shared: &Arc<Shared>, peer: &str, why: &'static str) 
                 // the dial in flight may sit out the whole no-path establish
                 // timeout from before it did (5 s at every early joiner's
                 // setup). A second dial races it; the loser closes its link.
-                if why == RACE_ON_INBOUND && Shared::lock(&shared.racing_dial).insert(peer.clone())
+                if (why == RACE_ON_INBOUND || why == RACE_ON_ROLL)
+                    && Shared::lock(&shared.racing_dial).insert(peer.clone())
                 {
                     let s = Arc::clone(shared);
                     let m = peer.clone();
@@ -6436,6 +6463,7 @@ async fn watch_loop(shared: Arc<Shared>) {
     let mut n: u64 = 0;
     let mut sent_expired: HashMap<[u8; 16], LegCounters> = HashMap::new();
     let mut unproved: HashMap<[u8; 16], (u16, Instant)> = HashMap::new();
+    let mut roll_failure: Option<(String, Instant)> = None;
     loop {
         tick.tick().await;
         if shared.ended.load(Ordering::Relaxed) {
@@ -6454,14 +6482,42 @@ async fn watch_loop(shared: Arc<Shared>) {
             let s = Arc::clone(&shared);
             tokio::spawn(async move { reannounce(&s).await });
         }
-        if let Err(CallError::CallEnded(_)) = roll_if_moved(&shared).await {
-            return;
+        match roll_if_moved(&shared).await {
+            Ok(()) => roll_failure = None,
+            Err(CallError::CallEnded(_)) => return,
+            Err(e) => roll_failed(&shared, &e, &mut roll_failure),
         }
         reconcile_legs(&shared);
         let _ = apply_pending_replace(&shared, false).await;
         alm_tick(&shared, &mut sent_expired, &mut unproved).await;
         settle_ends(&shared);
         check_lost(&shared);
+    }
+}
+
+/// 45.3 — how often one unchanged roll failure is logged again while it
+/// persists (it is counted every tick it happens).
+const ROLL_FAILURE_RELOG: Duration = Duration::from_secs(30);
+
+/// 45.3 — a roll that failed is never silent: counted every tick it fails
+/// (`av_call_roll_failed`), logged once per cause and again every
+/// [`ROLL_FAILURE_RELOG`] while that cause stands. The call stays where it was
+/// and the next tick retries.
+fn roll_failed(shared: &Shared, e: &CallError, last: &mut Option<(String, Instant)>) {
+    shared.count(crate::observability::AV_CALL_ROLL_FAILED);
+    let cause = e.to_string();
+    let now = Instant::now();
+    let repeat = last
+        .as_ref()
+        .is_some_and(|(c, at)| *c == cause && now.duration_since(*at) < ROLL_FAILURE_RELOG);
+    if !repeat {
+        tracing::warn!(
+            room = %shared.room,
+            error = %cause,
+            "call: the roll to the room's epoch failed; the call stays at its epoch and retries \
+             each watch tick (45.3)"
+        );
+        *last = Some((cause, now));
     }
 }
 
