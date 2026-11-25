@@ -143,7 +143,7 @@ in [`docs/LIGHTNET_DARKNET.md`](docs/LIGHTNET_DARKNET.md).
 
 ## Status
 
-**Current release: v45.2.0, on the long-term support line. Calls are supported
+**Current release: v45.2.1, on the long-term support line. Calls are supported
 for up to four people in this release.** It builds on
 CIRISPersist v61.4.4, CIRISVerify v22.2.4 and Leviculum v0.34.0+ciris.4, needs
 Rust 1.92 or newer, and follows Constitution 1.0-rc17 (message vocabulary

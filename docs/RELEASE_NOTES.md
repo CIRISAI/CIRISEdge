@@ -1,5 +1,22 @@
 # CIRISEdge Release Notes
 
+# v45.2.1 — a call follows its room, and every build lane compiles
+
+**2026-11-25.** **PATCH.** Pins unchanged: persist v61.4.4, CIRISVerify v22.2.4, leviculum
+v0.34.0+ciris.4. No migration, no wire change. Detail in CHANGELOG.md.
+
+- **A call follows its room's group.** A member who joined a call a moment before their app
+  applied a membership change (someone was just added or removed) sat one step behind the others
+  for good: the call's addresses come from the group's epoch, so it dialled addresses nobody
+  listened on, and only restarting the app cleared it. Six nodes joining at once did not form a
+  call in two minutes. A call now reads the stored group every 250 ms and rolls to it (measured
+  under a quarter of a second), then redials every member; a failed roll is counted
+  (`av_call_roll_failed`) and logged, never swallowed.
+- **Every build lane compiles.** v45.2.0's own CI failed four lanes: a feature gate had come off
+  the leviculum link module, so a build without the Reticulum transport did not compile. Builds
+  that enable it (CIRISServer's) were not affected.
+- Calls remain supported for up to four members; six and more are the work of 45.3.
+
 # v45.2.0 — group calls on member relays
 
 **2026-11-25.** **MINOR.** Pins: persist v61.4.4 by tag (`ciris-persist==61.4.4`, commit 5ef264f3),
