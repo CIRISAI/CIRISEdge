@@ -3831,6 +3831,124 @@ async fn a_listener_whose_pump_falls_behind_still_takes_every_control_frame() {
     drop(calls);
 }
 
+/// **A member whose host never reads its frames keeps its place in the
+/// tree** (45.2.0): delivery to the host is lossy, and no pump waits on it.
+/// The other three publish and read; R's host never calls `frames()` (a
+/// backgrounded app, a paused decoder). Once R's queues toward its host
+/// fill, R must still take in control (its C3 count keeps rising every
+/// second), keep a parent for every stream (never without one for more than
+/// 1.5 s), and count what it dropped for its host. Mutation (2ba6adb): the
+/// pumps awaited the full heard queue, R took in no C3 frame from then on,
+/// and its parents and children were left to time out.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_whose_host_never_reads_frames_keeps_its_place() {
+    const RUN_S: u64 = 90;
+    const PARENTLESS_MAX: Duration = Duration::from_millis(1500);
+    let _call = one_call().await;
+    let tag = "alm2-noread";
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        None,
+    )
+    .await;
+    let mut calls = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        calls.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    for c in &calls {
+        wait_legs(c, 3).await;
+    }
+    // The publishers' hosts read; R's (calls[0]) never does.
+    let _read = count_frames_from(&mut calls[1..], &nodes[1].key.key_id);
+    let streams: Vec<_> = (1..=3usize).map(|i| calls[i].stream()).collect();
+    let mut seq = publish_three(&mut calls, 3, 0).await;
+    let mut failed: Vec<String> = Vec::new();
+    let mut parentless_since: Option<(usize, tokio::time::Instant)> = None;
+    let mut last_c3 = calls[0].alm_counts().c3_received;
+    let failover = || {
+        calls[0].alm_log_count(
+            ciris_edge::transport::realtime_av_alm::controller::DecisionKind::Failover,
+        )
+    };
+    let failovers_before = failover();
+    let sink_dropped_before = av(&nodes[0].metrics, "av_inbound_dropped_queue_full");
+    let start = tokio::time::Instant::now();
+    for sec in 0..RUN_S {
+        seq = publish_three(&mut calls, 1, seq).await;
+        let c3 = calls[0].alm_counts().c3_received;
+        if sec >= 2 && c3 == last_c3 {
+            failed.push(format!(
+                "t+{sec}s: R took in no control frame this second ({c3})"
+            ));
+        }
+        last_c3 = c3;
+        let missing = streams
+            .iter()
+            .position(|st| primary_for(&calls[0], *st).is_none());
+        match (missing, parentless_since) {
+            (Some(i), None) => parentless_since = Some((i, tokio::time::Instant::now())),
+            (Some(_), Some((i, t))) if t.elapsed() > PARENTLESS_MAX => {
+                failed.push(format!(
+                    "t+{sec}s: R without a parent for stream {i} for {:?}",
+                    t.elapsed()
+                ));
+                parentless_since = None;
+            }
+            (None, _) => parentless_since = None,
+            _ => {}
+        }
+    }
+    let dropped = av(&nodes[0].metrics, "av_frame_dropped_host_not_reading");
+    // Its parents keep delivering to it: a pump parked on the host stops
+    // metering its parent's chunks, and the parent reads as silent.
+    let failovers = calls[0]
+        .alm_log_count(ciris_edge::transport::realtime_av_alm::controller::DecisionKind::Failover)
+        - failovers_before;
+    // Its pumps keep reading its links: a pump parked on the host leaves
+    // its link's queue to fill, and the transport's sink drops at it.
+    let sink_dropped = av(&nodes[0].metrics, "av_inbound_dropped_queue_full") - sink_dropped_before;
+    if sink_dropped > 0 {
+        failed.push(format!(
+            "R's links' queues overflowed ({sink_dropped} dropped at the sink): its pumps stopped reading"
+        ));
+    }
+    if failovers > 0 {
+        failed.push(format!(
+            "R failed over {failovers} times with nothing wrong upstream"
+        ));
+    }
+    eprintln!(
+        "[NOREAD] {RUN_S} s from {:?}: R dropped {dropped} for its host; C3 taken in {last_c3}; R failovers {failovers}; R sink drops {sink_dropped}; R reorder {:?}; failures {failed:?}",
+        start.elapsed(),
+        calls[0].reorder_counts()
+    );
+    assert!(
+        failed.is_empty(),
+        "R keeps its place while its host reads nothing: {failed:?}"
+    );
+    assert!(
+        dropped > 0,
+        "the precondition: R's queues toward its host filled ({dropped} dropped)"
+    );
+    drop(calls);
+}
+
 /// **G8 — a publisher whose uplink is capped below its fan-out** (the
 /// server's av_mesh cell, on loopback, with no tc): `P` publishes
 /// 600 B at 30 Hz to `A`, `B` and `C`, who reach each other directly, every

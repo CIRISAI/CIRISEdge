@@ -5657,8 +5657,16 @@ async fn pump(
             },
             at,
         };
-        if shared.heard_tx.send(heard).await.is_err() {
-            break;
+        // No pump ever waits on the host: a frame the reorder stage cannot
+        // take now is dropped and counted, never awaited. A host that stops
+        // reading (a backgrounded app) parked every link's pump here, and
+        // with it the node's control plane and its relaying.
+        match shared.heard_tx.try_send(heard) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                shared.count(crate::observability::AV_FRAME_DROPPED_HOST_NOT_READING);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
 }
@@ -6293,9 +6301,16 @@ async fn reorder_loop(
         if rx_pub.take_due(now) {
             legs::publish_rx(&shared, &mut rx, &mut window, &frames_of, now);
         }
+        // Delivery to the host is lossy by design: a host that is not
+        // reading loses the newest whole frames, counted, and this stage
+        // (and every pump behind it) never waits on it.
         for f in whole {
-            if frames.send(f).await.is_err() {
-                return;
+            match frames.try_send(f) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    shared.count(crate::observability::AV_FRAME_DROPPED_HOST_NOT_READING);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
             }
         }
     }
