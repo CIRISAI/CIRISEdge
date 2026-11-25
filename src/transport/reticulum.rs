@@ -152,6 +152,13 @@ const EDGE_APP_ASPECT: &str = "edge";
 /// slow (LoRa, multi-hop), so it gets the full patient window.
 const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How recent verified media from a peer must be for the link stall guard to
+/// keep a link whose Channel sends land nothing (CIRISEdge#926): the peer is
+/// alive and reaching this node, so its acknowledgements are late, not lost.
+/// Above a call's chunk cadence and its receive-side evidence rate limit by a
+/// wide margin, below the guard's own three-send trigger (~3 s).
+const PEER_ALIVE_FOR_STALL: Duration = Duration::from_secs(2);
+
 /// CIRISEdge#336 — the establishment window for a target the node has **no
 /// path** to. This is not a guess: leviculum's `connect` builds a
 /// no-path link request with `hops = 1` and *broadcasts* it, so the only
@@ -7454,6 +7461,7 @@ impl ReticulumTransport {
     /// unknown or closed link. Takes leviculum's core lock: callers rate-limit
     /// and never call it under the call's publisher lock.
     pub fn note_av_peer_evidence(&self, link: &[u8; 16]) -> bool {
+        self.stall_guard.note_peer_alive(*link);
         self.node.note_peer_evidence(&LinkId::new(*link))
     }
 
@@ -10421,6 +10429,42 @@ impl ReticulumTransport {
             .cloned()
             .unwrap_or_else(|| "-".to_owned());
         let link = hex::encode(link_id.as_bytes());
+        // The peer is alive and reaching this node (verified media from it
+        // on one of its links within the last seconds): its acknowledgements
+        // are late behind a queue, not lost. A capped uplink does exactly
+        // this to the one child it still feeds, and retiring that child's
+        // punched path cut the whole call tree for 14 s (server matrix,
+        // N=6 at 300 kbit/s: the kept child's guard fired at 3.2 s). The run's
+        // clock keeps going, so `STALL_BOUND` still ends a link whose peer
+        // truly stopped acknowledging.
+        if peer != "-" && stalled_for < crate::transport::link_stall::STALL_BOUND {
+            let theirs: Vec<[u8; 16]> = self
+                .link_to_peer_key_id
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, p)| **p == peer)
+                .map(|(l, _)| l.into_bytes())
+                .collect();
+            if self
+                .stall_guard
+                .peer_alive_within(&theirs, PEER_ALIVE_FOR_STALL)
+            {
+                self.stall_guard.hold(&link_id.into_bytes());
+                if let Some(m) = self.metrics.get() {
+                    m.inc_link_stall(crate::observability::LINK_STALL_HELD_PEER_ALIVE);
+                }
+                tracing::debug!(
+                    link = %link,
+                    peer = %peer,
+                    zero_sends,
+                    stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
+                    "link Channel landed nothing, but the peer is alive and reaching us: \
+                     its acks are late, the link is kept (CIRISEdge#926)"
+                );
+                return;
+            }
+        }
         if self.node.direct_link_interface(&link_id).is_some()
             && self.node.retire_direct_link(&link_id).await.is_ok()
         {

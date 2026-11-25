@@ -2274,6 +2274,10 @@ pub const LINK_STALL_CLOSED: &str = "link_stall_closed";
 /// A link judged dead on a punched interface was moved back onto its relayed
 /// path (leviculum#83 `retire_direct_link`) instead of closed.
 pub const LINK_STALL_RETIRED_DIRECT: &str = "link_stall_retired_direct";
+/// A stalled link was NOT acted on: its peer is demonstrably alive (verified
+/// media from it within the last seconds), so its acknowledgements are late
+/// behind a queue, not lost.
+pub const LINK_STALL_HELD_PEER_ALIVE: &str = "link_stall_held_peer_alive";
 
 // ─── v43 InvalidProof triage — `EdgeMetrics::peer_binding` labels ──────
 //
@@ -3239,6 +3243,7 @@ pub const LINK_STALL_LABELS: &[&str] = &[
     LINK_STALL_ZERO_LANDED_SEND,
     LINK_STALL_CLOSED,
     LINK_STALL_RETIRED_DIRECT,
+    LINK_STALL_HELD_PEER_ALIVE,
 ];
 /// Every `direct_link_upgrade_guarded` key.
 pub const UPGRADE_GUARDED_LABELS: &[&str] = &[UPGRADE_GUARDED_POOL, UPGRADE_GUARDED_SHIP];
