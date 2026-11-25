@@ -2,6 +2,44 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.2.0 — 2026-11-25
+
+**MINOR. Group calls on member relays.** Pins: persist v61.4.4 by tag, CIRISVerify v22.2.4,
+leviculum **v0.34.0+ciris.4** by tag (was v0.34.0+ciris.3). No migration. The host-facing call and
+relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`.
+
+### Added
+- The call tree controller in every call: member relays, slow start (two direct children, widening
+  as the uplink shows room), stall shedding to one direct child, receiver moves on late media
+  (rows RM1–RM7), the own-downlink guard, and the kept-child recovery (row S3, after a LOST
+  primary only).
+- A publisher re-opens after congestion by probing (rows RO, ProbeAfterDrain, FR): one more direct
+  child per 10 s once its uplink has drained for 2 s; a failed probe doubles the wait, to 32 s.
+- The way back to the publisher (row RD): a relayed member moves its standby to the publisher as
+  soon as it offers a whole stream of room.
+- `av_frame_dropped_host_not_reading`, `av_call_event_dropped_host_not_reading`,
+  `av_inbound_control_dropped`; every ALM decision-log line names its stream.
+- Direct links: `DirectLinkSettings` is non-exhaustive; the peer-evidence hold; the queue gauge
+  reads leviculum's learned round trip.
+- `README.md`: why each piece exists, in plain words; links to the Constitution, CEWP, the kernel
+  and the conformance suite.
+
+### Fixed
+- No receive loop waits on the host: a member whose app stops reading frames kept no control
+  plane and stranded its children.
+- A control frame the transport delivered is never shed with media at the receiver.
+- A forwarder sheds an existing child only on a congestion verdict (row NV), never because another
+  stream it relays admitted someone.
+- A Capacity refusal is demand only when the publisher is not latched, did not just shed the
+  asker, and has drained; demand lapses after a dwell. Re-open steps no longer compound.
+- A child its publisher shed does not ask it straight back.
+
+### Known
+- Call events to a host that is not reading are dropped past 64 (counted, logged once per call);
+  pair-preserving delivery is planned for 45.2.1.
+- Two members that lose the same relay can promote each other for one round; admission refuses
+  the second.
+
 ## 45.1.10 — 2026-11-22
 
 **PATCH. Where the bytes go, who the links are, and Python leaves the release.** Pins: persist

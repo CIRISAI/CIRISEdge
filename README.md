@@ -272,21 +272,23 @@ Status.
 
 ## Status
 
-**Current release: v45.1.10, on the long-term support line.** It builds on
-CIRISPersist v61.4.4, CIRISVerify v22.2.4 and Leviculum v0.34.0+ciris.3, needs
+**Current release: v45.2.0, on the long-term support line.** It builds on
+CIRISPersist v61.4.4, CIRISVerify v22.2.4 and Leviculum v0.34.0+ciris.4, needs
 Rust 1.92 or newer, follows Constitution 1.0-rc17, and speaks message
 vocabulary v1.0.3. Release notes: [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md);
 threat model and its stated limits: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
-**45.2.0, in preparation (not released).** Calls run on member relays: members
-forward for one another, and servers never relay call media, audio included. A
-sender starts with two direct receivers and adds more as its upload allows; a
-stalled upload sheds to one; a receiver with late media moves to a member relay.
-The words an app shows for call paths and relays are fixed for the 45.x line in
+**Calls in 45.2.0.** Calls run on member relays: members forward for one
+another, and servers never relay call media, audio included. A sender starts
+with two direct receivers and adds more as its upload allows; a stalled upload
+sheds to one, and when it recovers the receivers come back to it within about
+half a minute; a receiver with late media moves to a member relay. A member
+whose app stops reading keeps its place and keeps relaying. The words an app
+shows for call paths and relays are fixed for the 45.x line in
 [`docs/calls_relay_tokens.md`](docs/calls_relay_tokens.md). Direct connections
 have been tried by default since v44, with the network's bootstrap server as
 the helper that reports each side's public address; the router type still reads
-`unknown`. This tree pins Leviculum by commit ahead of its release tag.
+`unknown`.
 
 **What has been measured, and how far.** The multi-container acceptance bench
 ([`bench-mesh/`](bench-mesh/README.md); evidence in

@@ -1,5 +1,41 @@
 # CIRISEdge Release Notes
 
+# v45.2.0 — group calls on member relays
+
+**2026-11-25.** **MINOR.** Pins: persist v61.4.4 by tag (`ciris-persist==61.4.4`, commit 5ef264f3),
+CIRISVerify v22.2.4, leviculum **v0.34.0+ciris.4** (was v0.34.0+ciris.3). No migration. Call
+control gains frames and events; nodes on 45.1.x keep working in calls as before. The host-facing
+call and relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`. Detail in CHANGELOG.md.
+
+- **A call's members forward for one another.** Every call runs the tree controller: a publisher
+  starts with two direct children and widens as its uplink shows room, members beyond that hear it
+  through a member relay, and servers never relay call media, audio included. Each host decides
+  whether its member relays (`CallOptions::relay`); a room where nobody relays still hears every
+  publisher directly, with no gap.
+- **A weak uplink sheds, and recovers.** A stalled uplink keeps one direct child and the rest are
+  relayed (heard about 90 % through a 90 s cap). A kept child that is lost mid-cap is replaced in
+  about 5 s. When the cap lifts the publisher re-opens by probing, one child every 10 s once its
+  uplink has drained, and every member is back direct in about 35 s (it was more than 70 s). Under
+  a cap that stays, its probes get rarer (up to 32 s apart).
+- **Receivers move themselves.** A receiver whose media arrives 300 ms late moves to a relay; one
+  whose own downlink is the slow part does not.
+- **Nothing in a call waits on the host.** A member whose app stops reading frames (backgrounded,
+  a busy UI) keeps answering control, keeps its parent and keeps relaying; what its host missed is
+  counted (`av_frame_dropped_host_not_reading`). A control frame the transport delivered is never
+  shed with media.
+- **A publisher sheds a child only on a congestion verdict**, never because another stream it
+  relays admitted someone; and a child it shed does not ask it straight back.
+- **Direct links:** leviculum v0.34.0+ciris.4 brings port prediction, many-socket punches, a
+  second observer and nomination with a shared secret; its Channel keeps a link through a queue
+  (per-attempt receipts, a learned timeout held to the stale bound, RACK loss detection, pacing
+  from the path's minimum round trip, a path move judged by the old path's round trip).
+- **`README.md` says why each piece exists**, in plain words, with the Constitution, CEWP and the
+  kernel linked.
+- **Known, for 45.2.1:** call events to a host that is not reading are dropped past 64 (now
+  counted, `av_call_event_dropped_host_not_reading`, and logged once per call); pair-preserving
+  delivery follows. Two members that lose the same relay can promote each other for one round
+  before admission refuses the second.
+
 # v45.1.10 — where the bytes go, who the links are, and Python leaves the release
 
 **2026-11-22.** **PATCH.** Pins: persist v61.4.4 by tag (`ciris-persist==61.4.4`, commit 5ef264f3),
