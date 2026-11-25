@@ -1126,6 +1126,9 @@ pub const AV_CHUNK_PARKED_REPLACED: &str = "av_chunk_parked_replaced";
 /// G8 C — a call leg waiting out a failed dial's backoff dialled at once
 /// because the member's direct path came up.
 pub const AV_LEG_REDIAL_ON_DIRECT_PATH: &str = "av_leg_redial_on_direct_path";
+/// A verified chunk passed on to leviculum as evidence that its publisher's
+/// node is alive (the peer-evidence hold), on one A/V link to that node.
+pub const AV_PEER_EVIDENCE_NOTED: &str = "av_peer_evidence_noted";
 /// G8 — a periodic stream-key binding re-announce skipped on one leg: the
 /// uplink stall verdict held or the leg was backlogged.
 pub const AV_BINDING_REANNOUNCE_HELD: &str = "av_binding_reannounce_held";
@@ -3023,6 +3026,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_CHUNK_PARKED_SENT,
     AV_CHUNK_PARKED_REPLACED,
     AV_LEG_REDIAL_ON_DIRECT_PATH,
+    AV_PEER_EVIDENCE_NOTED,
     AV_BINDING_REANNOUNCE_HELD,
     AV_LEG_REDIAL_DEFERRED,
     AV_LEG_GONE_ON_SEND,

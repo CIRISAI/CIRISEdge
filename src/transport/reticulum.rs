@@ -7436,6 +7436,7 @@ impl ReticulumTransport {
             bytes_delivered: st.bytes_delivered(),
             srtt_ms: st.srtt_ms(),
             min_rtt_ms: st.min_rtt_ms(),
+            learned_srtt_ms: st.learned_srtt_ms(),
             busy_rejections: st.busy_rejections(),
             pacing_rejections: st.pacing_rejections(),
             window: st.window(),
@@ -7444,6 +7445,16 @@ impl ReticulumTransport {
             last_sent_seq: seq.map(|q| q.last_sent_sequence()),
             oldest_unacked_seq: seq.and_then(|q| q.oldest_unacked_sequence()),
         })
+    }
+
+    /// Peer evidence (leviculum peer-evidence hold): edge has just verified
+    /// cryptographic proof that the party at the far end of A/V link `link`
+    /// is alive now (a chunk signed by that member's node). Leviculum holds
+    /// the link's teardown on it, bounded by the stale time. `false` for an
+    /// unknown or closed link. Takes leviculum's core lock: callers rate-limit
+    /// and never call it under the call's publisher lock.
+    pub fn note_av_peer_evidence(&self, link: &[u8; 16]) -> bool {
+        self.node.note_peer_evidence(&LinkId::new(*link))
     }
 
     /// leviculum#102 — one A/V link's datagram counters (sent, received,
@@ -7830,6 +7841,77 @@ impl ReticulumTransport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    /// G8 diagnostic seam — every A/V link this node dialled: `(peer, link,
+    /// datagram bytes sent, attached interface)`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_dialed_links_for_test(&self) -> Vec<(String, [u8; 16], u64, Option<usize>)> {
+        let attached: HashMap<LinkId, Option<usize>> = self
+            .node
+            .link_list()
+            .into_iter()
+            .map(|l| (l.link_id, l.interface_index))
+            .collect();
+        self.av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(l, p)| {
+                let sent = self.node.link_datagram_stats(l).map_or(0, |d| d.sent_bytes);
+                (
+                    p.clone(),
+                    l.into_bytes(),
+                    sent,
+                    attached.get(l).copied().flatten(),
+                )
+            })
+            .collect()
+    }
+
+    /// G8 diagnostic seam — every A/V link this node holds (dialled, and the
+    /// ones members dialled here), with leviculum's Channel counters.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_links_for_test(&self) -> Vec<AvLinkDiag> {
+        let attached: HashMap<LinkId, Option<usize>> = self
+            .node
+            .link_list()
+            .into_iter()
+            .map(|l| (l.link_id, l.interface_index))
+            .collect();
+        let dialled: HashMap<LinkId, String> = self
+            .av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut ids: Vec<LinkId> = dialled.keys().copied().collect();
+        for l in self.av_sink.link_ids() {
+            if !ids.contains(&l) {
+                ids.push(l);
+            }
+        }
+        ids.into_iter()
+            .map(|l| {
+                let st = self.node.link_stats(&l);
+                AvLinkDiag {
+                    peer: dialled.get(&l).cloned().unwrap_or_else(|| "in".to_owned()),
+                    link: l.into_bytes(),
+                    dialled: dialled.contains_key(&l),
+                    datagram_bytes: self
+                        .node
+                        .link_datagram_stats(&l)
+                        .map_or(0, |d| d.sent_bytes),
+                    interface: attached.get(&l).copied().flatten(),
+                    retransmits: st.as_ref().map_or(0, |s| s.retransmits()),
+                    retransmitted_bytes: st.as_ref().map_or(0, |s| s.retransmitted_bytes()),
+                    outstanding: st.as_ref().map_or(0, |s| s.tx_ring_size()),
+                    busy_rejections: st.as_ref().map_or(0, |s| s.busy_rejections()),
+                    pacing_rejections: st.as_ref().map_or(0, |s| s.pacing_rejections()),
+                }
+            })
+            .collect()
     }
 
     /// Seat-tier test seam — name the serve seats and whether this node is one
@@ -13240,6 +13322,25 @@ fn resource_concluded(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(hash)
         .is_some_and(|at| at.elapsed() < INBOUND_TRANSFER_STALL)
+}
+
+/// G8 diagnostic — one A/V link as [`ReticulumTransport::av_links_for_test`]
+/// reads it.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AvLinkDiag {
+    pub peer: String,
+    pub link: [u8; 16],
+    pub dialled: bool,
+    pub datagram_bytes: u64,
+    pub interface: Option<usize>,
+    pub retransmits: u64,
+    pub retransmitted_bytes: u64,
+    pub outstanding: usize,
+    /// Channel sends refused: the window full (`Busy`) / the pacing gate
+    /// (`PacingDelay`), since the link came up.
+    pub busy_rejections: u64,
+    pub pacing_rejections: u64,
 }
 
 /// G8 C — whether a link attached to `attached` rode the punched interface

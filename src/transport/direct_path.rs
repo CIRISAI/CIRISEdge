@@ -451,17 +451,19 @@ impl DirectLinksConfig {
     /// so the node never runs on a leviculum default edge did not choose.
     #[must_use]
     pub fn leviculum_settings(&self) -> leviculum_std::direct_link::DirectLinkSettings {
-        leviculum_std::direct_link::DirectLinkSettings {
-            policy: match self.accept {
-                // Asked per request, answered by `should_accept_direct`.
-                DirectAccept::RoomPeers => DirectLinkPolicy::AskHost,
-                DirectAccept::Off => DirectLinkPolicy::Reject,
-                DirectAccept::IdentifiedOnly => DirectLinkPolicy::IdentifiedOnly,
-            },
-            facilitator: self.proposes().then(|| self.facilitator.clone()).flatten(),
-            protocol: ProbeProtocol::Rnsp,
-            facilitator_port: self.serve_facilitator,
-        }
+        // g8-lev113 measurement only: `DirectLinkSettings` is
+        // #[non_exhaustive] at leviculum c8699c3d6 (start from Default).
+        let mut settings = leviculum_std::direct_link::DirectLinkSettings::default();
+        settings.policy = match self.accept {
+            // Asked per request, answered by `should_accept_direct`.
+            DirectAccept::RoomPeers => DirectLinkPolicy::AskHost,
+            DirectAccept::Off => DirectLinkPolicy::Reject,
+            DirectAccept::IdentifiedOnly => DirectLinkPolicy::IdentifiedOnly,
+        };
+        settings.facilitator = self.proposes().then(|| self.facilitator.clone()).flatten();
+        settings.protocol = ProbeProtocol::Rnsp;
+        settings.facilitator_port = self.serve_facilitator;
+        settings
     }
 }
 

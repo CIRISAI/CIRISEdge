@@ -1882,6 +1882,8 @@ struct Shared {
     /// G8 C — members whose direct path came up while a leg dial to them was
     /// in flight: if that dial fails, it is retried at once.
     path_up_mid_dial: StdMutex<std::collections::HashSet<String>>,
+    /// Peer evidence: when each A/V link was last passed on as evidence.
+    evidence_at: StdMutex<HashMap<[u8; 16], Instant>>,
     /// Members a second leg dial races an in-flight one to: the member
     /// dialled this node meanwhile, so its call address stands, and the first
     /// dial may be waiting out a no-path establish timeout from before it did.
@@ -2611,6 +2613,7 @@ impl Call {
             queue_age_ms: AtomicU64::new(0),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
+            evidence_at: StdMutex::new(HashMap::new()),
             racing_dial: StdMutex::new(std::collections::HashSet::new()),
             c3_pending: StdMutex::new(HashMap::new()),
             lost_legs: StdMutex::new(std::collections::HashSet::new()),
@@ -5123,6 +5126,59 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
     }
 }
 
+/// How often, per leg, a verified chunk is passed on to leviculum as peer
+/// evidence (leviculum's own floor is the same 100 ms; this keeps the core
+/// lock off the media path between records).
+const PEER_EVIDENCE_EVERY: Duration = Duration::from_millis(100);
+
+/// Peer evidence, the transition: a chunk edge has JUST verified as signed by
+/// publisher X (its stream key, bound by X's hybrid signature) → for every A/V
+/// link between this node and X's node (the leg this node dialled to X, and
+/// the links X dialled here) note evidence that X's node is alive, at most
+/// once per [`PEER_EVIDENCE_EVERY`] per link. Both arrivals count: on X's own
+/// leg it shows X's node alive and reachable there; through a relay it shows
+/// X alive and publishing, which is enough to stop tearing down a leg to X
+/// (leviculum bounds the hold by the stale time either way). Never on an
+/// unverified chunk, never for the relay that carried it (its own packets
+/// are leviculum's automatic evidence), never under the publisher lock.
+fn note_publisher_evidence(shared: &Arc<Shared>, publisher: &str) {
+    let mut links: Vec<[u8; 16]> = Shared::lock(&shared.out_legs)
+        .get(publisher)
+        .map(|l| l.link_id)
+        .into_iter()
+        .collect();
+    links.extend(
+        Shared::lock(&shared.in_links)
+            .iter()
+            .filter(|(_, p)| p.as_str() == publisher)
+            .map(|(l, _)| *l),
+    );
+    if links.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let due: Vec<[u8; 16]> = {
+        let mut at = Shared::lock(&shared.evidence_at);
+        links
+            .into_iter()
+            .filter(|l| {
+                let fresh = at
+                    .get(l)
+                    .is_none_or(|t| now.duration_since(*t) >= PEER_EVIDENCE_EVERY);
+                if fresh {
+                    at.insert(*l, now);
+                }
+                fresh
+            })
+            .collect()
+    };
+    for l in due {
+        if shared.transport.note_av_peer_evidence(&l) {
+            shared.count(crate::observability::AV_PEER_EVIDENCE_NOTED);
+        }
+    }
+}
+
 /// Retry a C3 frame a congested link refused, until [`C3_RESEND_BUDGET`]
 /// or the peer has no link left. An answer that lands after the
 /// subscriber's request timeout is still read: a stale ADMIT is answered
@@ -5548,6 +5604,9 @@ async fn pump(
                 continue;
             }
         };
+        // Peer evidence: a chunk verified as signed by `publisher` proves its
+        // node alive now, whichever path carried it.
+        note_publisher_evidence(shared, &publisher.to_string());
         // C1, receiver side: this path delivered this chunk.
         let base_or_audio = is_base_or_audio(signed.codec_id(), signed.layer());
         shared.note_first_frame();
@@ -6619,6 +6678,11 @@ async fn alm_tick(
         }
     }
     unproved.retain(|l, _| legs.iter().any(|(_, x)| x == l));
+    {
+        let ins: Vec<[u8; 16]> = Shared::lock(&shared.in_links).keys().copied().collect();
+        Shared::lock(&shared.evidence_at)
+            .retain(|l, _| legs.iter().any(|(_, x)| x == l) || ins.contains(l));
+    }
     let early = backlogged.len() >= alm::UPLINK_STALL_LEGS && backlogged.len() == measurable;
     let detected = early || stalled_legs >= alm::UPLINK_STALL_LEGS;
     let rose = {
