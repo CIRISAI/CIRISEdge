@@ -232,8 +232,27 @@ pub struct Admission<P: PeerRef> {
     probe_fails: u32,
     /// N4 — the last congestion or widening, and whether it was a widening.
     probe_event: Option<(u64, bool)>,
+    /// Row FR — the longest a widening took to meet congestion since the
+    /// last reset: a later widening is not counted as held before twice
+    /// that has passed.
+    probe_ttf_ms: u64,
+    /// Row RO — when `demand` was last set; it lapses a dwell later at a
+    /// live call's publisher.
+    demand_at_ms: u64,
     /// RM4 — the stream id a shed ranks by ([`Self::set_shed_rank`]).
     shed_rank: Option<[u8; 32]>,
+    /// Row RO — when this forwarder last shed each member: that member's
+    /// refusal within a dwell is not demand (it asks back what was just
+    /// taken from it).
+    shed_at: BTreeMap<P, u64>,
+    /// Row ProbeAfterDrain — since when the uplink has measured drained
+    /// ([`Self::set_uplink_drained`]), `None` while it is not.
+    drained_since_ms: Option<u64>,
+    /// Row ProbeAfterDrain — the last step it took.
+    last_drain_step_ms: Option<u64>,
+    /// Row ProbeAfterDrain — re-open steps taken (demand or drained), for
+    /// the witnesses.
+    reopen_steps: u64,
 }
 
 /// RM4 — a member's rank on a stream: the first eight bytes (big-endian) of
@@ -257,7 +276,7 @@ pub fn hash_rank<P: PeerRef>(stream: &[u8; 32], member: &P) -> u64 {
 
 /// N4 — the most failed probes the backoff counts (the wait tops out at
 /// 2 windows × 2^2).
-pub const PROBE_FAILS_MAX: u32 = 2;
+pub const PROBE_FAILS_MAX: u32 = 4;
 
 impl<P: PeerRef> Admission<P> {
     /// The room roster (membership gate). Fail-closed: until set, and for
@@ -321,7 +340,13 @@ impl<P: PeerRef> Admission<P> {
             probe_backoff: false,
             probe_fails: 0,
             probe_event: None,
+            probe_ttf_ms: 0,
+            demand_at_ms: 0,
             shed_rank: None,
+            shed_at: BTreeMap::new(),
+            drained_since_ms: None,
+            last_drain_step_ms: None,
+            reopen_steps: 0,
         }
     }
 
@@ -487,36 +512,112 @@ impl<P: PeerRef> Admission<P> {
         );
     }
 
+    /// Row ProbeAfterDrain — re-open steps taken so far.
+    #[must_use]
+    pub fn reopen_steps(&self) -> u64 {
+        self.reopen_steps
+    }
+
     /// N4 — failed probes counted now.
     #[must_use]
     pub fn probe_fails(&self) -> u32 {
         self.probe_fails
     }
 
+    /// Row ProbeAfterDrain — the uplink measures drained now (every out
+    /// leg's queue gauge known and under `congestion_queue_ms`, nothing
+    /// outstanding), or not. The caller reports it each window.
+    pub fn set_uplink_drained(&mut self, now_ms: u64, drained: bool) {
+        if drained {
+            self.drained_since_ms.get_or_insert(now_ms);
+        } else {
+            self.drained_since_ms = None;
+        }
+    }
+
+    /// Row ProbeAfterDrain — drained for the hold: two clean meter windows
+    /// (`probe_clean_windows × meter_window_ms`, 2 s), the same settling a
+    /// slow-start doubling waits for.
+    fn drained_for_hold(&self, now_ms: u64) -> bool {
+        let hold = u64::from(self.cfg.probe_clean_windows) * self.cfg.meter_window_ms;
+        self.drained_since_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) >= hold)
+    }
+
+    /// Row RO — whether a Capacity refusal of `who` is demand that widens
+    /// the room: not while a stall verdict is latched, not from a member
+    /// this forwarder shed within the dwell (it asks back what was just
+    /// taken), and, after congestion taught a ceiling, only once the uplink
+    /// has drained for the hold. A refusal under the cap, or to a node just
+    /// shed, was spent as a step long after (the mesh4 n4 witness: a step 33
+    /// s later, after the lift, and a shed-refuse-step cycle with no cap).
+    /// A never-congested publisher is unchanged: every refusal is demand.
+    fn refusal_is_demand(&self, now_ms: u64, who: &P) -> bool {
+        let latched = self.probe_held(now_ms);
+        let just_shed = self
+            .shed_at
+            .get(who)
+            .is_some_and(|t| now_ms.saturating_sub(*t) < self.cfg.min_dwell_ms);
+        let reopened = self.ceiling_bps.is_none() || self.drained_for_hold(now_ms);
+        !latched && !just_shed && reopened
+    }
+
     /// N4 — whether the backoff lets the room widen at `now_ms`.
     fn widen_allowed(&self, now_ms: u64) -> bool {
         !self.probe_backoff
-            || self.probe_event.is_none_or(|(t, _)| {
-                now_ms >= t + ((2 * self.cfg.meter_window_ms) << self.probe_fails)
-            })
+            || self
+                .probe_event
+                .is_none_or(|(t, _)| now_ms >= t + self.backoff_wait_ms())
     }
 
-    /// N4 — the room widened at `now_ms`.
+    /// N4 — the wait the backoff imposes at the current fail count.
+    fn backoff_wait_ms(&self) -> u64 {
+        (2 * self.cfg.meter_window_ms) << self.probe_fails
+    }
+
+    /// N4, row FR — the room widened at `now_ms`. The previous widening
+    /// counts as held, and the fails forgotten, only if it has stood with no
+    /// congestion for its own backoff wait AND twice the longest any widening
+    /// took to fail since the last reset. "Until the next widening" forgave a
+    /// step that fails slowly (half a stream over a cap builds its queue over
+    /// tens of seconds) a dwell after it was taken, so a held cap was probed
+    /// at the dwell's rhythm for the life of the call.
     fn note_widen(&mut self, now_ms: u64) {
-        if self.probe_event.is_some_and(|(_, widen)| widen) {
-            // The previous widening held: nothing congested since.
-            self.probe_fails = self.probe_fails.saturating_sub(1);
+        if let Some((t, true)) = self.probe_event {
+            let need = self.backoff_wait_ms().max(2 * self.probe_ttf_ms);
+            if now_ms.saturating_sub(t) >= need {
+                // A widening that stood that long shows the uplink carries
+                // it: what the probe learned below it is forgotten, and the
+                // room re-opens at the dwell's pace.
+                self.reset_probe_memory();
+            }
         }
         self.probe_event = Some((now_ms, true));
     }
 
-    /// N4 — congestion at `now_ms`; `failed`: count it as a failed probe
-    /// whatever came before (a departure, RM5).
+    /// N4, row FR — congestion at `now_ms`; `failed`: count it as a failed
+    /// probe whatever came before (a departure, RM5). A widening that meets
+    /// congestion failed however long it took, and how long it took is kept.
     fn note_congestion(&mut self, now_ms: u64, failed: bool) {
-        if failed || self.probe_event.is_some_and(|(_, widen)| widen) {
+        let widened = match self.probe_event {
+            Some((t, true)) => Some(t),
+            _ => None,
+        };
+        if let Some(t) = widened {
+            self.probe_ttf_ms = self.probe_ttf_ms.max(now_ms.saturating_sub(t));
+        }
+        if failed || widened.is_some() {
             self.probe_fails = (self.probe_fails + 1).min(PROBE_FAILS_MAX);
         }
         self.probe_event = Some((now_ms, false));
+    }
+
+    /// Row FR — evidence that the uplink's capacity changed (a widening that
+    /// stood, or the ceiling going stale): what the probe learned under the
+    /// old capacity is forgotten.
+    fn reset_probe_memory(&mut self) {
+        self.probe_fails = 0;
+        self.probe_ttf_ms = 0;
     }
 
     /// Whether an upward probe is held now ([`Self::hold_probe`]).
@@ -570,6 +671,7 @@ impl<P: PeerRef> Admission<P> {
         let mut shed = Vec::with_capacity(order.len());
         for (p, c) in order {
             self.ledger.remove(&p);
+            self.shed_at.insert(p.clone(), now_ms);
             self.draining.insert(
                 p.clone(),
                 Drain {
@@ -957,6 +1059,7 @@ impl<P: PeerRef> Admission<P> {
             if (committed - freed + need) as f64 <= limit + 1.0 {
                 for (v, _) in victims.into_iter().take(take) {
                     self.ledger.remove(&v);
+                    self.shed_at.insert(v.clone(), now_ms);
                     log.record(
                         now_ms,
                         &self.me,
@@ -971,7 +1074,10 @@ impl<P: PeerRef> Admission<P> {
                 return AdmitDecision::Admit { role: req.role };
             }
         }
-        self.demand = true;
+        if self.refusal_is_demand(now_ms, &req.subscriber) {
+            self.demand = true;
+            self.demand_at_ms = now_ms;
+        }
         self.refuse(now_ms, req, RefuseReason::Capacity, rng, log)
     }
 
@@ -1063,7 +1169,15 @@ impl<P: PeerRef> Admission<P> {
                 // never the raw rate.
                 let carried = w.sent_bps * MEASURED_MARGIN;
                 if carried > c {
-                    self.ceiling_bps = Some(carried);
+                    // A live call's publisher raises a congestion-taught
+                    // ceiling one stream per dwell (below), never to what one
+                    // window carried: a drain burst is not a sustained rate,
+                    // one jump re-opens the whole room in one tick, and under
+                    // a held cap a step's first windows carry it cleanly for
+                    // seconds before its queue shows.
+                    if !(self.is_root && self.probe_backoff) {
+                        self.ceiling_bps = Some(carried);
+                    }
                 }
                 // Additive increase (Eric, 2026-11-10): a clean window in
                 // which someone is waiting (a capacity refusal since the
@@ -1072,7 +1186,52 @@ impl<P: PeerRef> Admission<P> {
                 // if the uplink really is full, takes it back. Without it a
                 // shed member waited out the staleness (60-120 s) with the
                 // uplink clean the whole time (avmesh4, after the cap lifted).
-                if self.demand && !self.over_claim_flagged && !held && !backoff {
+                // Row ProbeAfterDrain + RO: a live call's publisher (root, N4
+                // on) re-opens a congestion-taught ceiling one stream at a
+                // time, for a waiting member (demand, RO-guarded at the
+                // refusal) or because its uplink has drained for the hold,
+                // at most once per dwell and under the N4 backoff, and only
+                // while the room is short of one more stream. Each step is
+                // one stream above what is committed now (not above the
+                // last step's unused room), so steps never compound past
+                // what the uplink was shown to carry. Its offers then show
+                // room in seconds after a cap lifts, not after the 60 s
+                // staleness, and its children move back one per dwell.
+                let reopening = self.is_root && self.probe_backoff;
+                // Row RO: demand nobody has waited on for a dwell lapses.
+                if reopening
+                    && self.demand
+                    && now_ms.saturating_sub(self.demand_at_ms) >= self.cfg.min_dwell_ms
+                {
+                    self.demand = false;
+                }
+                let dwell_ok = self
+                    .last_drain_step_ms
+                    .is_none_or(|t| now_ms.saturating_sub(t) >= self.cfg.min_dwell_ms);
+                let short =
+                    self.committed_bps() + self.cfg.stream_bps > self.hard_limit_bps() as u64;
+                if reopening {
+                    if (self.demand || self.drained_for_hold(now_ms))
+                        && !self.over_claim_flagged
+                        && !held
+                        && !backoff
+                        && dwell_ok
+                        && short
+                    {
+                        let why = if self.demand { "demand" } else { "drained" };
+                        self.demand = false;
+                        self.last_drain_step_ms = Some(now_ms);
+                        self.reopen_steps += 1;
+                        self.note_widen(now_ms);
+                        let per = self.class.fraction.unwrap_or(1.0);
+                        let used = self.committed_bps() as f64
+                            + self.cfg.reserve_bps as f64
+                            + self.external_committed as f64;
+                        let c = (used + self.cfg.stream_bps as f64) / per;
+                        self.ceiling_bps = Some(c);
+                        log.record(now_ms, &self.me, DecisionKind::Ceiling, None, c as i64, why);
+                    }
+                } else if self.demand && !self.over_claim_flagged && !held && !backoff {
                     self.demand = false;
                     self.note_widen(now_ms);
                     // From what the hard limit reads now (a publisher's
@@ -1096,6 +1255,7 @@ impl<P: PeerRef> Admission<P> {
                     && now_ms.saturating_sub(self.last_congested_ms) >= self.ceiling_stale_ms
                 {
                     self.ceiling_bps = None;
+                    self.reset_probe_memory();
                     self.ceiling_stale_ms = (self.ceiling_stale_ms * 2).min(CEILING_STALE_MAX_MS);
                     log.record(now_ms, &self.me, DecisionKind::Ceiling, None, 0, "stale");
                 }
@@ -1161,6 +1321,7 @@ impl<P: PeerRef> Admission<P> {
                 break;
             };
             self.ledger.remove(&victim);
+            self.shed_at.insert(victim.clone(), now_ms);
             log.record(
                 now_ms,
                 &self.me,
@@ -1170,6 +1331,15 @@ impl<P: PeerRef> Admission<P> {
                 "over-committed",
             );
             shed.push(victim);
+        }
+        // N4: a shed is the room not holding, like a congested verdict: if
+        // the last event was a re-open step, that probe failed and the next
+        // waits twice as long. Without it a held cap was probed on a fixed
+        // dwell rhythm for the life of the call (the over-commit sheds that
+        // followed each step were not congestion), each probe moving
+        // listeners twice.
+        if !shed.is_empty() && self.is_root && self.probe_backoff {
+            self.note_congestion(now_ms, false);
         }
         shed
     }
@@ -1347,6 +1517,143 @@ mod tests {
             congested,
             capacity_bps: congested.then_some(sent_bps),
         }
+    }
+
+    /// Row ProbeAfterDrain — a congestion-taught ceiling re-opens by probing
+    /// once the uplink has drained for the hold, long before
+    /// `CEILING_STALE_MS`, and not while a queue remains; a step that meets
+    /// congestion is a failed probe and the next waits longer (N4).
+    /// Mutation (2ba6adb): the ceiling capped the publisher until it went
+    /// stale 60 s after its last congested sample, so every recovery after
+    /// a lifted cap cost a minute (the come-back witness).
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_drained_uplink_reopens_a_congested_ceiling_by_probing() {
+        let (mut a, mut log, cfg) = publisher_of_two();
+        a.set_probe_backoff(true);
+        let bps = cfg.stream_bps as f64;
+        // A verdict at one stream: the second child goes.
+        assert_eq!(
+            a.on_egress_window(1_000, &window(bps, true), &mut log),
+            vec![2]
+        );
+        let c0 = a.ceiling_bps().expect("a ceiling");
+        // Not while a queue remains: clean windows, uplink not drained.
+        let mut t = 2_000;
+        while t <= 12_000 {
+            a.set_uplink_drained(t, false);
+            let _ = a.on_egress_window(t, &window(bps, false), &mut log);
+            t += 1_000;
+        }
+        assert_eq!(
+            a.ceiling_bps(),
+            Some(c0),
+            "no probe while the uplink still queues"
+        );
+        // Drained for the hold: one more stream, long before staleness.
+        let mut stepped_at = None;
+        while t <= 20_000 {
+            a.set_uplink_drained(t, true);
+            let _ = a.on_egress_window(t, &window(bps, false), &mut log);
+            if a.ceiling_bps().is_some_and(|c| c > c0) {
+                stepped_at = Some(t);
+                break;
+            }
+            t += 1_000;
+        }
+        let at = stepped_at.expect("the drained uplink probes up");
+        assert!(at < 1_000 + CEILING_STALE_MS, "re-opened at {at}");
+        assert!(
+            at >= 12_000 + u64::from(cfg.probe_clean_windows) * cfg.meter_window_ms,
+            "only after the hold ({at})"
+        );
+        // The step meets congestion: a failed probe, so the next step waits
+        // at least twice the base backoff past the dwell.
+        let fails = a.probe_fails();
+        let _ = a.on_egress_window(at + 1_000, &window(bps, true), &mut log);
+        assert!(
+            a.probe_fails() > fails,
+            "a probe that met congestion failed"
+        );
+        let c1 = a.ceiling_bps().expect("re-measured");
+        let mut next = None;
+        let mut u = at + 2_000;
+        while u <= at + 200_000 {
+            a.set_uplink_drained(u, true);
+            let _ = a.on_egress_window(u, &window(bps, false), &mut log);
+            if a.ceiling_bps().is_some_and(|c| c > c1) {
+                next = Some(u);
+                break;
+            }
+            u += 1_000;
+        }
+        let next = next.expect("it probes again");
+        // No sooner than a dwell after the last step, nor than the doubled
+        // backoff after the congestion that failed it.
+        let base = 2 * cfg.meter_window_ms;
+        let backoff_end = at + 1_000 + (base << a.probe_fails());
+        let dwell_end = at + cfg.min_dwell_ms;
+        assert!(
+            next >= backoff_end.max(dwell_end),
+            "probed again at {next}: the backoff ends {backoff_end}, the dwell {dwell_end}"
+        );
+    }
+
+    /// Row RO — a refusal of a member this publisher just shed, or one made
+    /// under a latched verdict, is not demand: it is not spent later as a
+    /// step. A member never shed, once the uplink has drained, is. Mutation
+    /// (2ba6adb): every Capacity refusal set `demand`; one refused under the
+    /// cap was spent 33 s later, after the lift (mesh4 n4).
+    #[test]
+    fn a_refusal_of_a_just_shed_member_is_not_demand() {
+        let cfg = ControllerConfig::interactive();
+        let bps = f64::from(u32::try_from(cfg.stream_bps).unwrap_or(u32::MAX));
+        // A member this publisher just shed: its refusal is no demand.
+        let (mut a, mut log, _) = publisher_of_two();
+        let mut rng = SplitMix64(3);
+        assert_eq!(
+            a.on_egress_window(1_000, &window(bps, true), &mut log),
+            vec![2]
+        );
+        a.set_uplink_drained(1_000, true);
+        assert!(matches!(
+            a.request(1_500, &req(2, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Refuse { .. }
+        ));
+        let _ = a.on_egress_window(3_000, &window(bps, false), &mut log);
+        assert!(
+            !log.tail().contains("(demand)"),
+            "a just-shed member's refusal took no demand step: {}",
+            log.tail()
+        );
+        // Under a latched verdict: no refusal is demand; past it, with the
+        // uplink drained for the hold, a member never shed is.
+        let (mut a, mut log, _) = publisher_of_two();
+        assert_eq!(
+            a.on_egress_window(1_000, &window(bps, true), &mut log),
+            vec![2]
+        );
+        a.hold_probe(20_000);
+        a.set_uplink_drained(1_000, true);
+        assert!(matches!(
+            a.request(4_000, &req(4, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Refuse { .. }
+        ));
+        let _ = a.on_egress_window(5_000, &window(bps, false), &mut log);
+        assert!(
+            !log.tail().contains("(demand)"),
+            "none under a latched verdict"
+        );
+        assert!(matches!(
+            a.request(21_000, &req(4, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Refuse { .. }
+        ));
+        let _ = a.on_egress_window(22_000, &window(bps, false), &mut log);
+        assert!(
+            log.tail().contains("(demand)"),
+            "a member never shed asked: {}",
+            log.tail()
+        );
     }
 
     /// A publisher whose two children were admitted on the probe.
@@ -1633,9 +1940,13 @@ mod tests {
             a.on_egress_window(1_000, &window(bps, true), &mut log),
             vec![2]
         );
+        // Row RO: a congestion-taught ceiling re-opens only on a drained
+        // uplink, and the member it shed is not the one whose ask counts:
+        // a member that was never shed (4) waits here, the uplink drained.
+        a.set_uplink_drained(1_000, true);
         assert!(
             matches!(
-                a.request(1_500, &req(2, Role::Primary), &mut rng, &mut log),
+                a.request(3_000, &req(4, Role::Primary), &mut rng, &mut log),
                 AdmitDecision::Refuse {
                     reason: RefuseReason::Capacity,
                     ..
@@ -1643,29 +1954,29 @@ mod tests {
             ),
             "the premise: no room under the verdict"
         );
-        let _ = a.on_egress_window(2_000, &window(bps, false), &mut log);
+        let _ = a.on_egress_window(4_000, &window(bps, false), &mut log);
         assert!(
             matches!(
-                a.request(2_500, &req(2, Role::Primary), &mut rng, &mut log),
+                a.request(4_100, &req(4, Role::Primary), &mut rng, &mut log),
                 AdmitDecision::Admit { .. }
             ),
             "one clean window with a member waiting is one more stream"
         );
         assert!(
             matches!(
-                a.request(2_600, &req(3, Role::Primary), &mut rng, &mut log),
+                a.request(4_200, &req(3, Role::Primary), &mut rng, &mut log),
                 AdmitDecision::Refuse { .. }
             ),
             "one, not more: the next waits for the next clean window"
         );
-        let _ = a.on_egress_window(3_000, &window(2.0 * bps, false), &mut log);
+        let _ = a.on_egress_window(5_000, &window(2.0 * bps, false), &mut log);
         assert!(matches!(
-            a.request(3_500, &req(3, Role::Primary), &mut rng, &mut log),
+            a.request(5_500, &req(3, Role::Primary), &mut rng, &mut log),
             AdmitDecision::Admit { .. }
         ));
         // Nobody waiting: a clean window adds nothing.
         let c = a.ceiling_bps();
-        let _ = a.on_egress_window(4_000, &window(bps, false), &mut log);
+        let _ = a.on_egress_window(6_000, &window(bps, false), &mut log);
         assert_eq!(a.ceiling_bps(), c);
     }
 

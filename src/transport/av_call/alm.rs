@@ -246,6 +246,10 @@ pub(super) struct AlmState {
     me: String,
     cfg: ControllerConfig,
     t0: Instant,
+    /// Tests only: the clock a simulated world sets, so a sim's time is the
+    /// world's steps and never the host's compute time.
+    #[cfg(test)]
+    sim_now_ms: Option<u64>,
     rng: SplitMix64,
     log: DecisionLog,
     own_stream: StreamId,
@@ -277,6 +281,10 @@ pub(super) struct AlmState {
     last_primary: BTreeMap<StreamId, Option<String>>,
     egress: EgressMeter,
     leg_queue_ms: BTreeMap<String, f64>,
+    /// Row ProbeAfterDrain — out legs that cannot read as drained now: their
+    /// queue gauge is unmeasured (no `min_rtt` yet, or right after a path
+    /// move) or a Channel message is still outstanding on them.
+    leg_busy: BTreeSet<String>,
     members: Vec<String>,
     tier: ServiceTier,
     own_rate: Rate,
@@ -417,6 +425,8 @@ impl AlmState {
             egress: EgressMeter::new(cfg.meter_window_ms, cfg.congestion_queue_ms),
             cfg,
             t0: Instant::now(),
+            #[cfg(test)]
+            sim_now_ms: None,
             rng: SplitMix64(seed),
             log: DecisionLog::new(64),
             own_stream,
@@ -435,6 +445,7 @@ impl AlmState {
             draining_parent: BTreeMap::new(),
             last_primary: BTreeMap::new(),
             leg_queue_ms: BTreeMap::new(),
+            leg_busy: BTreeSet::new(),
             members: members.to_vec(),
             tier: ServiceTier::FullOps,
             own_rate: Rate::default(),
@@ -710,6 +721,10 @@ impl AlmState {
 
     /// The call's monotonic clock (ms).
     pub(super) fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(t) = self.sim_now_ms {
+            return t;
+        }
         u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
@@ -905,6 +920,9 @@ impl AlmState {
     /// so `peer` holds no commitment here.
     pub(super) fn on_child_link_down(&mut self, peer: &str) {
         self.layer_caps.retain(|(_, c), _| c != peer);
+        // Its leg is gone: it no longer counts toward the uplink's drain.
+        self.leg_queue_ms.remove(peer);
+        self.leg_busy.remove(peer);
         let p = peer.to_owned();
         self.own.release(&p);
         for (a, _) in self.shares.values_mut() {
@@ -1063,6 +1081,28 @@ impl AlmState {
     /// leg's link stats (refreshed each watch tick).
     pub(super) fn set_leg_queue_ms(&mut self, peer: &str, ms: f64) {
         self.leg_queue_ms.insert(peer.to_owned(), ms);
+    }
+
+    /// Row ProbeAfterDrain — whether `peer`'s out leg cannot read as drained
+    /// now (its queue gauge unmeasured, or a message outstanding on it).
+    pub(super) fn set_leg_busy(&mut self, peer: &str, busy: bool) {
+        if busy {
+            self.leg_busy.insert(peer.to_owned());
+        } else {
+            self.leg_busy.remove(peer);
+        }
+    }
+
+    /// Row ProbeAfterDrain — the uplink measures drained: no stall verdict,
+    /// at least one out leg, and every one with a known queue gauge under
+    /// `congestion_queue_ms` and nothing outstanding.
+    fn uplink_drained(&self) -> bool {
+        #[allow(clippy::cast_precision_loss)]
+        let limit = self.cfg.congestion_queue_ms as f64;
+        !self.uplink_stall
+            && !self.leg_queue_ms.is_empty()
+            && self.leg_busy.is_empty()
+            && self.leg_queue_ms.values().all(|q| *q < limit)
     }
 
     /// C1, sender side: `bytes` left on `peer`'s leg.
@@ -1869,6 +1909,8 @@ impl AlmState {
         }
         let ext = self.external_except(self.own_stream);
         self.own.set_external_committed(ext);
+        let drained = self.uplink_drained();
+        self.own.set_uplink_drained(now, drained);
         let mut own_w = w;
         if self.uplink_stall {
             own_w.capacity_bps = Some(one + self.cfg.reserve_bps as f64 + ext as f64);
@@ -3053,6 +3095,9 @@ mod tests {
                 a.on_own_published(600, true);
                 a.on_sent("b", 700);
             }
+            // Row ProbeAfterDrain: the leg's gauge reads drained (the hold
+            // is what keeps the room shut here, not a queue).
+            a.set_leg_queue_ms("b", 0.0);
             a.t0 = a.t0.checked_sub(Duration::from_millis(ms)).expect("clock");
         };
         a.set_uplink_stall(true);
@@ -3537,6 +3582,9 @@ mod tests {
                 a.on_own_published(600, true);
                 a.on_sent("c", 700);
             }
+            // Row ProbeAfterDrain: c's leg reads drained, so the room may
+            // re-open once the backoff allows.
+            a.set_leg_queue_ms("c", 0.0);
             a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
             let _ = a.tick(&[]);
             let now = a.now_ms();
@@ -4766,6 +4814,11 @@ mod tests {
         const STEP_MS: u64 = 33;
         /// One stream, as a rate: 30 chunks/s of `CHUNK` bytes.
         const STREAM_BYTES_PER_S: u64 = 30 * CHUNK;
+        /// Re-open probes a held cap may see over 120 s: one per dwell (10 s)
+        /// at most, and every probe that fails doubles the wait from the 2 s
+        /// base (2 windows x 2^fails): gaps of 10, 10, 16, 32, 64 s fit five
+        /// in 120 s. Without the doubling past the dwell: one per ~10 s.
+        const HELD_CAP_PROBES_MAX: u64 = 5;
 
         /// A delivery held back by a stalled receiver: released at `at`.
         struct Held {
@@ -4805,6 +4858,7 @@ mod tests {
                     .map(|i| AlmState::new(NAMES[i], streams[i], &roster, true, i as u64 + 1))
                     .collect();
                 for (i, n) in nodes.iter_mut().enumerate() {
+                    n.sim_now_ms = Some(0);
                     for (j, peer) in NAMES.iter().enumerate() {
                         if i != j {
                             n.on_caps(peer, CAPS_THIS_BUILD | CAP_RELAY);
@@ -4953,10 +5007,11 @@ mod tests {
             fn step(&mut self) {
                 self.now += STEP_MS;
                 self.steps += 1;
+                // The world's clock, not the host's: `t0.elapsed()` added
+                // each step's compute time to every node's clock, so a run's
+                // outcome moved with the box's load.
                 for n in &mut self.nodes {
-                    n.t0 =
-                        n.t0.checked_sub(Duration::from_millis(STEP_MS))
-                            .expect("the clock is past the shift");
+                    n.sim_now_ms = Some(self.now);
                 }
                 if self.now >= self.window_start + 1_000 {
                     self.window_start = self.now;
@@ -5017,6 +5072,21 @@ mod tests {
                 self.nodes[i].counts.shed
             }
 
+            /// The publisher of `stream`'s re-open steps so far.
+            pub(super) fn reopen_steps(&self, stream: usize) -> u64 {
+                self.nodes[stream].own.reopen_steps()
+            }
+
+            /// Every listener's primary changes on `stream`'s publisher's
+            /// stream so far.
+            pub(super) fn moves(&self, stream: usize) -> u64 {
+                (0..N)
+                    .filter(|rx| *rx != stream)
+                    .filter_map(|rx| self.nodes[rx].sels.get(&self.streams[stream]))
+                    .map(ParentSelector::parent_changes)
+                    .sum()
+            }
+
             pub(super) fn tail(&self) -> String {
                 self.nodes
                     .iter()
@@ -5047,6 +5117,32 @@ mod tests {
                 let h = w.worst_heard(st, 10_000, 58_000);
                 assert!(h >= 0.99, "stream {st} heard {h}\n{}", w.tail());
             }
+        }
+
+        /// Row ProbeAfterDrain under a cap that never lifts: the publisher's
+        /// re-probes get rarer (N4, PROBE_FAILS_MAX above the dwell), so its
+        /// listeners are not moved on a fixed ~10 s rhythm for the life of
+        /// the call. Moves over 120 s of a held cap, after it settles.
+        #[test]
+        fn n4_a_held_cap_reprobes_ever_more_rarely() {
+            let mut w = World::new();
+            w.run_until(20_000);
+            w.cap[0] = Some(STREAM_BYTES_PER_S * 5 / 2);
+            w.run_until(50_000);
+            let (m0, p0) = (w.moves(0), w.reopen_steps(0));
+            w.run_until(170_000);
+            let (m1, p1) = (w.moves(0), w.reopen_steps(0));
+            eprintln!(
+                "[N4HELD] over 120 s of a held cap: {} re-open probes, {} listener moves",
+                p1 - p0,
+                m1 - m0
+            );
+            assert!(
+                p1 - p0 <= HELD_CAP_PROBES_MAX,
+                "{} probes over 120 s of a held cap\n{}",
+                p1 - p0,
+                w.tail()
+            );
         }
 
         /// A real cap sheds, and recovers once lifted: `a`'s uplink carries

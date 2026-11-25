@@ -6723,6 +6723,11 @@ async fn alm_tick(
         let mut a = Shared::lock(&shared.alm);
         if let Some(st) = stats {
             a.set_leg_queue_ms(peer, st.queue_delay_ms());
+            // Unmeasured is not drained: `min_rtt` is `None` until the link
+            // has a valid sample, and again right after a path move.
+            a.set_leg_busy(peer, st.min_rtt_ms.is_none() || st.tx_ring > 0);
+        } else {
+            a.set_leg_busy(peer, true);
         }
         // §5.1: what the link proved delivered is the uplink meter's rate.
         // A datagram leg proves nothing; its sends count as they leave

@@ -8,7 +8,7 @@ Every token in this file is **frozen for 45.x**. Later releases only add tokens;
 
 ## Host defaults (the host decides, edge does not)
 
-- A publisher starts with TWO direct children and widens as its uplink shows room (slow start). The cost: in a room of four or more, members beyond the second hear the publisher through a member relay first, and move to it directly only once it has room (a voluntary switch, seconds later). After an uplink stall it widens nothing for 10 s.
+- A publisher starts with TWO direct children and widens as its uplink shows room (slow start). The cost: in a room of four or more, members beyond the second hear the publisher through a member relay first, and move to it directly only once it has room (a voluntary switch, seconds later). After an uplink stall it widens nothing for 10 s. After congestion it re-opens by probing: once its uplink has drained for 2 s it offers room for one more direct child every 10 s, so members move back to it in seconds after a cap lifts; a probe that meets congestion doubles the wait before the next (up to 32 s), so a publisher whose uplink stays capped disturbs its listeners less and less often.
 - `CallOptions::relay: bool` is unchanged. The server passes `true` for member nodes and `false` for canonicals and for a client on a metered or mobile network.
 - Edge adds one rule of its own: **a serve seat never relays call media, audio included**, whatever `relay` says. The rule is applied on every transport the Edge was built with, whichever builder method registered it. A call on a transport that was given no seat set logs an ERROR. The lever is `av_call::CANONICAL_AV_FALLBACK = false` on 45.x.
 
