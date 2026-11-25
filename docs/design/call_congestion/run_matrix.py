@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE", ASKSHED="FALSE", ASKLOSS="FALSE", PLADMIT="FALSE", DGUARD="FALSE", RFREE="40",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE", PAD="FALSE", DHOLD="10", LATEADMIT="FALSE", ASKSHED="FALSE", ASKLOSS="FALSE", PLADMIT="FALSE", DGUARD="FALSE", RFREE="40", PROMOTE="FALSE", SU="FALSE", BRIDGE="0", PRESET="FALSE", STARVEAT="0", SUNSUB="FALSE",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -229,6 +229,29 @@ def scenarios():
         yield f"norelay{gt}-uncapped", dict(nr, DGUARD=g, CAPAT="1000", CAPUNTIL="1000")
         yield f"norelay{gt}-capped", dict(nr, DGUARD=g)
         yield f"norelay{gt}-no-demand-uncapped", dict(nr, DGUARD=g, CAPAT="1000", CAPUNTIL="1000", SS="FALSE")
+    # SU (shared upstream): A and B both on C (P's one direct child; relays take
+    # two), each the other's warm standby; P's leg to C is killed mid-cap, C
+    # goes silent, A and B lose C by silence at the same watch tick.
+    su = dict(s3, ASKLOSS="TRUE", SLOTS="2", PROMOTE="TRUE", REPAIR="TRUE", CAPUNTIL="1000", KILLAT="120",
+              HASH="TRUE", INIT="1")
+    # From the tree itself (C on P, A and B on C, standbys crossed), cap from
+    # the start, P's leg to C killed at 5 s; offer phases are what vary.
+    sut = dict(su, PRESET="TRUE", CAPAT="0", KILLAT="0", STARVEAT="50", SS="FALSE", INIT="3")
+    yield "su-tree-off", sut
+    yield "su-tree-on", dict(sut, SU="TRUE")
+    yield "su-tree-on-bridge", dict(sut, SU="TRUE", BRIDGE="20")
+    yield "su-tree-on-no-askloss", dict(sut, SU="TRUE", ASKLOSS="FALSE")
+    yield "su-tree-off-unsub", dict(sut, SUNSUB="TRUE")
+    yield "su-tree-on-unsub", dict(sut, SU="TRUE", SUNSUB="TRUE")
+    yield "su-tree-on-unsub-bridge", dict(sut, SU="TRUE", SUNSUB="TRUE", BRIDGE="20")
+    yield "su-off", su
+    yield "su-on", dict(su, SU="TRUE")
+    yield "su-on-bridge", dict(su, SU="TRUE", BRIDGE="20")
+    yield "su-off-nokill", dict(su, KILLAT="0")
+    yield "su-on-nokill", dict(su, SU="TRUE", KILLAT="0")
+    # RO (i) with the 2 s bridge renewal (nobody relays).
+    yield "norelay-guard-bridge-uncapped", dict(nr, DGUARD="TRUE", BRIDGE="20", CAPAT="1000", CAPUNTIL="1000")
+    yield "s3-ask-after-loss-guard-bridge", dict(s3, ASKLOSS="TRUE", DGUARD="TRUE", BRIDGE="20")
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)

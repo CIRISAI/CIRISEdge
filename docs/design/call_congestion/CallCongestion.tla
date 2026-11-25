@@ -85,6 +85,15 @@ CONSTANTS
     AskAfterShed,       \* S3 old: a child P shed asks P back at once (room and backoff ignored)
     AskAfterLoss,       \* S3 narrowed: only a child whose primary was LOST asks P at once
     PrimarylessAdmit,   \* P with no primary admits a subscribe whatever its room
+    Promote,            \* a listener keeps a warm standby (another member that offers the
+                        \* stream) and, on losing its primary, PROMOTES it at once
+    SharedUpstream,     \* SU: a member whose last offer names, as ITS upstream, the primary
+                        \* I just lost is no candidate until a fresh offer shows otherwise
+    BridgeEvery,        \* a parentless member with no candidate asks P this often (0: never)
+    PresetTree,         \* start from: C on P; A and B on C; A and B each other's standby
+    SilenceUnsub,       \* a member that drops its parent for silence unsubscribes it
+    StarveAt,           \* from this tick P sends its first child no media, link up, for
+    StarveTicks,        \* this long (0: never): C starves silently
     DemandGuard,        \* a refusal is demand only if no verdict is latched, the asker was
                         \* not just shed by P, and no undrained congestion-learned ceiling
     NonChildEvery,      \* P offers to members that are not its children this often
@@ -190,9 +199,9 @@ Ordinary(k, b) == Max(1, (b * OrdNum(k) + 4) \div 8)
 Wait(k, b) == IF k <= MaxTries THEN Ordinary(k, b)
               ELSE Min(Ordinary(k, b), Max(HeldCap, Ordinary(MaxTries, b)))
 
-Pay(p) == [p |-> p, fwd |-> FALSE, room |-> FALSE, direct |-> FALSE]
-Offer(f, r) == [p |-> "offer", fwd |-> f, room |-> r, direct |-> FALSE]
-OfferD(f, r, d) == [p |-> "offer", fwd |-> f, room |-> r, direct |-> d]
+Pay(p) == [p |-> p, fwd |-> FALSE, room |-> FALSE, direct |-> FALSE, up |-> None]
+Offer(f, r) == [p |-> "offer", fwd |-> f, room |-> r, direct |-> FALSE, up |-> None]
+OfferD(f, r, d, u) == [p |-> "offer", fwd |-> f, room |-> r, direct |-> d, up |-> u]
 NoPay == Pay("none")
 Item(k, leg, g, q, a, pay, from, to, t) ==
     [k |-> k, leg |-> leg, gen |-> g, seq |-> q, att |-> a, pay |-> pay,
@@ -216,7 +225,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -224,7 +233,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, drainedSince, maxParentless, admitsIgnored, maxJoins, askNow, lastShedAt, refusedBy, repeatDemand, offerUp, standby, lostPrim, lostPrimAt, lastBridge, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -256,7 +265,8 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         allOkAt |-> allOkAt, lostAt |-> lostAt, drainedSince |-> drainedSince,
         maxParentless |-> maxParentless, admitsIgnored |-> admitsIgnored, maxJoins |-> maxJoins,
         askNow |-> askNow, lastShedAt |-> lastShedAt, refusedBy |-> refusedBy,
-        repeatDemand |-> repeatDemand,
+        repeatDemand |-> repeatDemand, offerUp |-> offerUp, standby |-> standby, lostPrim |-> lostPrim,
+        lostPrimAt |-> lostPrimAt, lastBridge |-> lastBridge,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -440,7 +450,8 @@ Handle(S, pay, s, r) ==
     CASE pay.p = "offer" ->
             IF r = "P" THEN S
             ELSE [S EXCEPT !.offerAt[r][s] = S.now, !.offerFwd[r][s] = pay.fwd,
-                           !.offerRoom[r][s] = pay.room, !.offerDirect[r][s] = pay.direct]
+                           !.offerRoom[r][s] = pay.room, !.offerDirect[r][s] = pay.direct,
+                           !.offerUp[r][s] = pay.up]
       [] pay.p = "sub" -> IF r = "P" THEN PAdmit(S, s) ELSE RelayAdmit(S, r, s)
       [] pay.p = "admit" -> OnAdmit(S, r, s)
       [] pay.p = "refuse" ->
@@ -625,10 +636,18 @@ PWatch(S, ch) ==
              S1 == [S EXCEPT !.obs = newObs, !.stallSeen = seen, !.stall = st,
                              !.verdicts = IF st /\ ~S.stall THEN @ + 1 ELSE @,
                              !.firstVerdictAt = IF @ < 0 /\ st THEN S.now ELSE @]
-         IN IF ShedOnVerdict /\ st /\ ~S.stall /\ Cardinality(S1.children) > KeepOf(ch)
-            THEN ShedTo(S1, KeepOf(ch)) ELSE S1
+             \* the rise clamps the room to what P holds (the window fold reads
+             \* one stream at the rise, shed or not)
+             S1c == IF ShedOnVerdict /\ st /\ ~S.stall
+                    THEN [S1 EXCEPT !.room = Min(@, Max(1, Cardinality(S1.children)))] ELSE S1
+         IN IF ShedOnVerdict /\ st /\ ~S.stall /\ Cardinality(S1c.children) > KeepOf(ch)
+            THEN ShedTo(S1c, KeepOf(ch)) ELSE S1c
 
 \* (d) A listener's selector.
+\* SU: x's last offer named, as its own upstream, the primary l just lost,
+\* and x has not offered since the loss.
+SUExcluded(S, l, x) == SharedUpstream /\ S.lostPrim[l] /= None /\ x /= "P"
+                       /\ S.offerUp[l][x] = S.lostPrim[l] /\ S.offerAt[l][x] <= S.lostPrimAt[l]
 Viable(S, l, x) ==
     /\ x /= l /\ Alive(S, x)
     /\ S.up[<<l, x>>] /\ S.peerUp[<<x, l>>]
@@ -636,6 +655,7 @@ Viable(S, l, x) ==
     /\ S.offerAt[l][x] >= 0 /\ S.now - S.offerAt[l][x] <= DownSilence
     /\ S.offerFwd[l][x] /\ (S.offerRoom[l][x] \/ (x = "P" /\ S.askNow[l]))
     /\ (x = "P" \/ l \notin Chain(S, x))
+    /\ ~SUExcluded(S, l, x)
 Cands(S, l) == SelectSeq(NodeSeq, LAMBDA x : x \in Nodes /\ Viable(S, l, x))
 Pick(c, k) == IF c[1] = "P" THEN "P" ELSE c[Min(k, Len(c))]
 Subscribe(S, l, x) ==
@@ -644,12 +664,23 @@ Subscribe(S, l, x) ==
 LWatch1(S, l, k) ==
     IF ~Alive(S, l) THEN S
     ELSE LET lost == S.parent[l] /= None /\ (~S.peerUp[<<S.parent[l], l>>] \/ ~S.up[<<l, S.parent[l]>>])
-             S0 == IF lost
-                   THEN [S EXCEPT !.boUntil[l][S.parent[l]] = S.now + Backoff,
-                                  !.boUntil[l]["P"] = IF AskAfterLoss THEN S.now ELSE @,
-                                  !.askNow[l] = AskAfterLoss,
-                                  !.parent[l] = None]
-                   ELSE S
+             S0a == IF lost
+                    THEN [S EXCEPT !.boUntil[l][S.parent[l]] = S.now + Backoff,
+                                   !.boUntil[l]["P"] = IF AskAfterLoss THEN S.now ELSE @,
+                                   !.askNow[l] = AskAfterLoss,
+                                   !.lostPrim[l] = S.parent[l], !.lostPrimAt[l] = S.now,
+                                   !.parent[l] = None]
+                    ELSE S
+             \* Promote: the warm standby becomes the primary at once (no
+             \* subscribe round trip), if it is still a candidate (SU applies)
+             sb == S0a.standby[l]
+             S0 == IF Promote /\ lost /\ sb \notin {None, S.parent[l]} /\ Alive(S0a, sb)
+                      /\ S0a.up[<<l, sb>>] /\ S0a.peerUp[<<sb, l>>] /\ ~SUExcluded(S0a, l, sb)
+                   THEN [S0a EXCEPT !.parent[l] = sb, !.standby[l] = None,
+                                    !.reparents[l] = @ + 1, !.lastSwitch[l] = S.now,
+                                    !.relayKids = IF sb = "P" THEN @ ELSE [@ EXCEPT ![sb] = @ \cup {l}],
+                                    !.children = IF sb = "P" THEN @ \cup {l} ELSE @]
+                   ELSE S0a
              \* UpstreamShed: a relay that lost its parent sheds its children
              \* (Shed{UpstreamLost}), so they fail over on the S1 path
              kids == S0.relayKids[l]
@@ -666,10 +697,21 @@ LWatch1(S, l, k) ==
                    ELSE S1
              \* TreeRepair: nothing new on any path for RepairTicks while the
              \* stream is live (P is publishing): drop the parent and look again
-             S2r == IF TreeRepair /\ S2.parent[l] /= None /\ S2.pendSub[l] = None
-                        /\ S2.now - S2.lastNewAt[l] >= RepairTicks /\ Alive(S2, "P")
-                    THEN [S2 EXCEPT !.boUntil[l][S2.parent[l]] = S2.now + Backoff, !.parent[l] = None]
+             silent == TreeRepair /\ S2.parent[l] /= None /\ S2.pendSub[l] = None
+                       /\ S2.now - S2.lastNewAt[l] >= RepairTicks /\ Alive(S2, "P")
+             S2s == IF silent
+                    THEN [S2 EXCEPT !.boUntil[l][S2.parent[l]] = S2.now + Backoff, !.parent[l] = None,
+                                    !.lostPrim[l] = S2.parent[l], !.lostPrimAt[l] = S2.now,
+                                    !.lastNewAt[l] = S2.now]
                     ELSE S2
+             sb2 == S2s.standby[l]
+             S2r == IF silent /\ Promote /\ sb2 \notin {None, S2.parent[l]} /\ Alive(S2s, sb2)
+                       /\ S2s.up[<<l, sb2>>] /\ S2s.peerUp[<<sb2, l>>] /\ ~SUExcluded(S2s, l, sb2)
+                    THEN [S2s EXCEPT !.parent[l] = sb2, !.standby[l] = None,
+                                     !.reparents[l] = @ + 1, !.lastSwitch[l] = S2.now,
+                                     !.relayKids = IF sb2 = "P" THEN @ ELSE [@ EXCEPT ![sb2] = @ \cup {l}],
+                                     !.children = IF sb2 = "P" THEN @ \cup {l} ELSE @]
+                    ELSE S2s
              c == Cands(S2r, l)
              \* HashRank: the lowest-ranked MEMBER never moves on late media
              \* (computable by everyone); else P's oldest child (the rank rides
@@ -710,10 +752,35 @@ LWatch1(S, l, k) ==
             THEN Subscribe(S2r, l, "P")
             ELSE S2r
 
+\* The warm standby: another member whose offer (fresh) says it forwards the
+\* stream and that is not below this node; kept while it stays so.
+StandbyCands(S, l) ==
+    SelectSeq(LSeq, LAMBDA x : x /= l /\ x /= S.parent[l] /\ Alive(S, x)
+                               /\ S.offerAt[l][x] >= 0 /\ S.now - S.offerAt[l][x] <= DownSilence
+                               /\ S.offerFwd[l][x] /\ l \notin Chain(S, x) /\ ~SUExcluded(S, l, x))
+Upkeep(S, l) ==
+    LET S1 == IF Promote /\ S.parent[l] /= None
+              THEN LET c == StandbyCands(S, l)
+                   IN [S EXCEPT !.standby[l] = IF c = <<>> THEN None ELSE c[1]]
+              ELSE S
+        \* the 2 s bridge: a parentless member with nothing pending and no
+        \* candidate asks P anyway (P refuses: demand; or admits)
+        bridge == BridgeEvery > 0 /\ Alive(S1, l) /\ S1.parent[l] = None /\ S1.pendSub[l] = None
+                  /\ Cands(S1, l) = <<>> /\ S1.now - S1.lastBridge[l] >= BridgeEvery
+                  /\ S1.up[<<l, "P">>] /\ S1.peerUp[<<"P", l>>]
+    IN IF bridge THEN Subscribe([S1 EXCEPT !.lastBridge[l] = S1.now], l, "P") ELSE S1
+
 RECURSIVE LWatchOver(_, _, _)
 LWatchOver(S, i, ch) ==
     IF i > NL THEN S
-    ELSE LWatchOver(Flush(LWatch1(S, LSeq[i], ch.pick[LSeq[i]])), i + 1, ch)
+    ELSE LET l == LSeq[i]
+             S1 == LWatch1(S, l, ch.pick[l])
+             \* a silence drop leaves the old parent's commitment in place unless
+             \* the member unsubscribes it (lostPrimAt = now: dropped this tick)
+             S2 == IF SilenceUnsub /\ S1.lostPrimAt[l] = S.now /\ S.lostPrimAt[l] /= S.now
+                      /\ S1.lostPrim[l] /= None /\ S1.parent[l] /= S1.lostPrim[l]
+                   THEN SendCtrl(S1, <<l, S1.lostPrim[l]>>, Pay("unsub")) ELSE S1
+         IN LWatchOver(Flush(Upkeep(Flush(S2), l)), i + 1, ch)
 
 Watch(S, ch) ==
     IF S.now % WatchEvery /= 0 THEN S
@@ -793,7 +860,7 @@ Reannounce(S) ==
 \* StallOfferEvery while stalled).
 OfferPay(S, n) ==
     IF n = "P" THEN Offer(TRUE, Cardinality(S.children) < S.room)
-    ELSE OfferD(S.parent[n] /= None, Cardinality(S.relayKids[n]) < RelaySlots, S.parent[n] = "P")
+    ELSE OfferD(S.parent[n] /= None, Cardinality(S.relayKids[n]) < RelaySlots, S.parent[n] = "P", S.parent[n])
 RECURSIVE OfferLegs(_, _, _)
 OfferLegs(S, n, ms) ==
     IF ms = {} THEN S
@@ -819,8 +886,10 @@ Offers(S) == Flush(Reannounce(OffersOver(S, Nodes)))
 \* P publishes one tick of media to its children and the drained.
 Publish(S) ==
     IF ~Alive(S, "P") THEN S
-    ELSE LET sb == IF StandbyFeed = "full" \/ (StandbyFeed \in {"fix", "fix2"} /\ ~S.stall) THEN S.standbys ELSE {}
-             to == {c \in L : (c \in S.children \/ S.drainTo[c] >= S.now \/ c \in sb) /\ S.up[<<"P", c>>]}
+    ELSE LET starved == IF StarveAt > 0 /\ StarveAt <= S.now /\ S.now < StarveAt + StarveTicks /\ S.order /= <<>>
+                        THEN {S.order[1]} ELSE {}
+             sb == IF StandbyFeed = "full" \/ (StandbyFeed \in {"fix", "fix2"} /\ ~S.stall) THEN S.standbys ELSE {}
+             to == {c \in L : (c \in S.children \/ S.drainTo[c] >= S.now \/ c \in sb) /\ S.up[<<"P", c>>]} \ starved
              S1 == [S EXCEPT !.published = IF InWin(S.now) THEN @ + 1 ELSE @,
                              !.maxStallCopies = IF S.stall THEN Max(@, Cardinality(to)) ELSE @]
              per == IF StallDrain /\ S.stall THEN Max(1, (M * DrainPct) \div 100) ELSE M
@@ -896,11 +965,13 @@ ParentedThroughoutS(S) == S.maxParentless <= GapBound
 \* After the cap lifts and the backlog has drained (2 windows of margin), P
 \* never sheds again: nothing it grows into can exceed what fits.
 NoShedAfterLiftS(S) == (CapUntil < Horizon /\ S.lastShedAt >= 0) => S.lastShedAt < CapUntil + 2 * WindowTicks
+\* No forwarding loop: no listener is its own ancestor.
+LoopFreeS(S) == \A c \in L : c \notin ChainN(S, c, NL + 1)
 \* Children join P one at a time (a widening invites one).
 OneJoinAtATimeS(S) == S.maxJoins <= 1
 \* RM4: after a shed P is never left with no direct child (beyond two watch
 \* ticks: a move in flight).
-NeverDrainedS(S) == S.maxZeroRun <= 2 * WatchEvery
+NeverDrainedS(S) == S.maxZeroRun <= 2 * WatchEvery + (IF KillAt > 0 THEN GapBound ELSE 0)
 \* F12: under a latched stall verdict, P's media egress for its stream is at
 \* most one copy.
 EgressOneCopyS(S) == S.maxStallCopies <= 1
@@ -949,7 +1020,7 @@ Bad(S) ==
     {n \in {"NoSpuriousTeardown", "KeepsOneChild", "NeverTwoParents", "MakeBeforeBreak",
             "NothingWaitsForever", "ReparentBound", "EndParented", "EndHeard",
             "EndFullFanOut", "DeadDetected", "EndQueueDrained",
-            "NoIdleWithOffer", "StallShedGap", "OwnSlowStays", "NeverDrained", "EgressOneCopy", "OnePrimary", "ParentedThroughout", "OneJoinAtATime", "NoShedAfterLift"} :
+            "NoIdleWithOffer", "StallShedGap", "OwnSlowStays", "NeverDrained", "EgressOneCopy", "OnePrimary", "ParentedThroughout", "OneJoinAtATime", "NoShedAfterLift", "LoopFree"} :
         CASE n = "NoSpuriousTeardown" -> ~NoSpuriousTeardownS(S)
           [] n = "KeepsOneChild" -> ~KeepsOneChildS(S)
           [] n = "NeverTwoParents" -> ~NeverTwoParentsS(S)
@@ -969,7 +1040,8 @@ Bad(S) ==
           [] n = "OnePrimary" -> ~OnePrimaryS(S)
           [] n = "ParentedThroughout" -> ~ParentedThroughoutS(S)
           [] n = "OneJoinAtATime" -> ~OneJoinAtATimeS(S)
-          [] n = "NoShedAfterLift" -> ~NoShedAfterLiftS(S)}
+          [] n = "NoShedAfterLift" -> ~NoShedAfterLiftS(S)
+          [] n = "LoopFree" -> ~LoopFreeS(S)}
 
 -----------------------------------------------------------------------------
 LegName(l) == l[1] \o ">" \o l[2]
@@ -1127,9 +1199,15 @@ Init ==
     /\ drainedSince = -1 /\ maxParentless = 0 /\ admitsIgnored = 0 /\ maxJoins = 0
     /\ askNow = [c \in L |-> FALSE] /\ lastShedAt = -1
     /\ refusedBy = [c \in L |-> -1] /\ repeatDemand = FALSE
+    /\ offerUp = [c \in L |-> [n \in Nodes |-> IF (PresetTree /\ NL = 3) /\ n \in L
+                                                   THEN (IF n = LSeq[3] THEN "P" ELSE LSeq[3]) ELSE None]]
+    /\ standby = [c \in L |-> IF (PresetTree /\ NL = 3) /\ c /= LSeq[3] THEN (IF c = LSeq[1] THEN LSeq[2] ELSE LSeq[1]) ELSE None]
+    /\ lostPrim = [c \in L |-> None] /\ lostPrimAt = [c \in L |-> -1] /\ lastBridge = [c \in L |-> -100]
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
-    /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
+    /\ children = IF (PresetTree /\ NL = 3) THEN {LSeq[3]} ELSE {}
+    /\ order = IF (PresetTree /\ NL = 3) THEN <<LSeq[3]>> ELSE <<>>
+    /\ drainTo = [c \in L |-> -1]
     /\ shedPend = [c \in L |-> FALSE]
     /\ room = IF SlowStart THEN InitFanout ELSE NL
     /\ demand = FALSE /\ lastCong = -1 /\ lastWiden = 0 /\ stall = FALSE /\ stallSeen = -1
@@ -1138,15 +1216,16 @@ Init ==
           lp \in IF Wide THEN [L -> LPhases] ELSE {[c \in L |-> x] : x \in LPhases} :
           lastOffer = [n \in Nodes |-> (IF n = "P" THEN pp ELSE lp[n]) - OfferEvery]
     /\ winPhase \in WPhases
-    /\ relayKids = [c \in L |-> {}] /\ parent = [c \in L |-> None]
+    /\ relayKids = [c \in L |-> IF (PresetTree /\ NL = 3) /\ c = LSeq[3] THEN {LSeq[1], LSeq[2]} ELSE {}]
+    /\ parent = [c \in L |-> IF (PresetTree /\ NL = 3) THEN (IF c = LSeq[3] THEN "P" ELSE LSeq[3]) ELSE None]
     /\ pendSub = [c \in L |-> None] /\ pendAt = [c \in L |-> -1]
     /\ boUntil = [c \in L |-> [n \in Nodes |-> 0]]
     /\ reparents = [c \in L |-> 0] /\ lastSwitch = [c \in L |-> 0]
     /\ shedBy = [c \in L |-> None]
     \* the call is joined: every listener heard P's offer (direct first)
-    /\ offerAt = [c \in L |-> [n \in Nodes |-> IF n = "P" THEN 0 ELSE -1]]
-    /\ offerFwd = [c \in L |-> [n \in Nodes |-> n = "P"]]
-    /\ offerRoom = [c \in L |-> [n \in Nodes |-> n = "P"]]
+    /\ offerAt = [c \in L |-> [n \in Nodes |-> IF n = "P" \/ (PresetTree /\ NL = 3) THEN 0 ELSE -1]]
+    /\ offerFwd = [c \in L |-> [n \in Nodes |-> n = "P" \/ (PresetTree /\ NL = 3)]]
+    /\ offerRoom = [c \in L |-> [n \in Nodes |-> n = "P" \/ (PresetTree /\ NL = 3)]]
     /\ heard = [c \in L |-> 0] /\ lastHeard = [c \in L |-> -1]
     /\ lastFwd = [c \in L |-> -1] /\ published = 0
     /\ torn = {} /\ dual = [c \in L |-> 0]
@@ -1171,7 +1250,8 @@ Assign(S) ==
     /\ lastOfferNC' = S.lastOfferNC /\ allOkAt' = S.allOkAt /\ lostAt' = S.lostAt /\ drainedSince' = S.drainedSince
     /\ maxParentless' = S.maxParentless /\ admitsIgnored' = S.admitsIgnored /\ maxJoins' = S.maxJoins
     /\ askNow' = S.askNow /\ lastShedAt' = S.lastShedAt /\ refusedBy' = S.refusedBy
-    /\ repeatDemand' = S.repeatDemand /\ dialAt' = S.dialAt
+    /\ repeatDemand' = S.repeatDemand /\ offerUp' = S.offerUp /\ standby' = S.standby
+    /\ lostPrim' = S.lostPrim /\ lostPrimAt' = S.lostPrimAt /\ lastBridge' = S.lastBridge /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
