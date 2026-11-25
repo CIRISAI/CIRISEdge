@@ -3637,13 +3637,13 @@ fn torn_down(m: &EdgeMetrics) -> u64 {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn every_pair_keeps_both_legs_uncapped() {
-    /// One dial (its link, the responder's KEX, then the hello and bindings
-    /// paced at that link's establishment RTT over the initial window: up to
-    /// 0.82 s measured on a debug build, 0.1 s typical) plus one dial
-    /// backoff floor (`DIAL_BACKOFF_MIN`, 1 s) and change: well short of the
-    /// 5 s no-path establish timeout a dial begun before the member's
-    /// address stood sat out (6.4 s without the fix).
-    const SETUP_BOUND: Duration = Duration::from_secs(2);
+    /// One dial backoff floor (`DIAL_BACKOFF_MIN`, 1 s): once the last
+    /// member has joined, every member it reaches dials back at once, with
+    /// no backoff and no 5 s no-path establish timeout waited out (6.4 s
+    /// without the fix). A setup over 1 s is a bug to find, not a bound to
+    /// move (the lead's ruling, 2026-11-25: the 2 s this carried was set
+    /// after seeing results up to 0.82 s).
+    const SETUP_BOUND: Duration = Duration::from_secs(1);
     let _call = one_call().await;
     let tag = "alm2-legs";
     let (nodes, groups, _tmp) = topo_capped(
