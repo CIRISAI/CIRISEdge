@@ -1226,7 +1226,7 @@ impl<P: PeerRef> Admission<P> {
                     .last_drain_step_ms
                     .is_none_or(|t| now_ms.saturating_sub(t) >= self.cfg.min_dwell_ms);
                 let short =
-                    self.committed_bps() + self.cfg.stream_bps > self.hard_limit_bps() as u64;
+                    (self.committed_bps() + self.cfg.stream_bps) as f64 > self.hard_limit_bps();
                 if reopening {
                     if (self.demand || self.drained_for_hold(now_ms))
                         && !self.over_claim_flagged
