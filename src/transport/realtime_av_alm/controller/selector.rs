@@ -222,6 +222,10 @@ pub struct ParentSelector<P: PeerRef> {
     /// Row S3 — publisher asks left for this loss ([`PUBLISHER_ASKS`]); a
     /// primary resets it.
     publisher_asks_left: u32,
+    /// Row S3 — when the last primary SHED this node (a decision its
+    /// forwarder made, under its own load), rather than being lost: no ask
+    /// back. Cleared by the next primary.
+    primary_shed_at: Option<u64>,
     /// Since when this node has had no primary (member-tier R3).
     parentless_since_ms: Option<u64>,
     last_activity_ms: Option<u64>,
@@ -264,6 +268,7 @@ impl<P: PeerRef> ParentSelector<P> {
             next_r3_probe_ms: 0,
             next_publisher_ask_ms: 0,
             publisher_asks_left: PUBLISHER_ASKS,
+            primary_shed_at: None,
             parentless_since_ms: None,
             last_activity_ms: None,
             activity_since_ms: 0,
@@ -599,6 +604,7 @@ impl<P: PeerRef> ParentSelector<P> {
         );
         if self.primary.as_ref() == Some(from) {
             self.primary = None;
+            self.primary_shed_at = Some(now_ms);
         }
         if self.standby.as_ref() == Some(from) {
             self.standby = None;
@@ -849,6 +855,7 @@ impl<P: PeerRef> ParentSelector<P> {
         self.last_primary = Some(p.clone());
         self.primary = Some(p);
         self.publisher_asks_left = PUBLISHER_ASKS;
+        self.primary_shed_at = None;
         self.last_switch_ms = now_ms;
     }
 
@@ -1129,7 +1136,12 @@ impl<P: PeerRef> ParentSelector<P> {
         }
     }
 
-    /// Row S3, the child's side — the stream's publisher, known from any
+    /// Row S3, the child's side — only for a primary LOST (its link closed,
+    /// or it fell silent), never for one that SHED this node: the publisher
+    /// shed it under its own load, and asking back at once contradicted
+    /// that, its refusal feeding the publisher's demand (the mesh4 n4
+    /// witness: a re-overcommitted publisher shed its children again after
+    /// the cap had lifted). The stream's publisher, known from any
     /// depth-0 offer it ever made, as a primary candidate whatever its health
     /// (a link down left it Down), its offer's age or a backoff (a refusal
     /// under a stall verdict is retried after the verdict's latch, not a
@@ -1149,6 +1161,7 @@ impl<P: PeerRef> ParentSelector<P> {
             || now_ms < self.next_publisher_ask_ms
             || self.last_primary.is_none()
             || self.publisher_asks_left == 0
+            || self.primary_shed_at.is_some()
         {
             return None;
         }
@@ -2429,6 +2442,31 @@ mod tests {
         assert!(
             admitted_at.is_some(),
             "the publisher was asked and admitted"
+        );
+    }
+
+    /// Row S3 is for a LOST primary only: a node its publisher SHED does
+    /// not ask it back (the publisher decided, under its own load). Mutation
+    /// (5f8aa9b): it asked on the next tick, the refusal fed the publisher's
+    /// demand, and mesh4's n4 re-overcommitted after the lift.
+    #[test]
+    fn a_node_its_publisher_shed_does_not_ask_it_back() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.direct_first = true;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2]);
+        let mut rng = SplitMix64(4);
+        let mut log = DecisionLog::default();
+        let _ = drive(&mut s, &cfg, 0, 10_000, &[(2, 4, 20.0)]);
+        assert_eq!(s.primary(), Some(&2));
+        s.on_shed(10_100, &2, &mut rng, &mut log);
+        for k in 0..24u64 {
+            let _ = s.tick(10_250 + k * 250, &mut rng, &mut log);
+        }
+        assert!(
+            !log.tail().contains("ask publisher"),
+            "no ask back after a shed: {}",
+            log.tail()
         );
     }
 
