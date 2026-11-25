@@ -40,6 +40,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -4909,4 +4910,569 @@ async fn a_receiver_whose_own_downlink_is_slow_does_not_move() {
         "the guard never ran (R was not late?): {context}"
     );
     drop(calls);
+}
+
+// ── Calls cut — a room where nobody relays (phones on metered data) ──────
+
+/// The longest a (listener, publisher) pair may go between consecutive
+/// chunks in an uncapped room where nobody relays. The design's intent is no
+/// gap beyond the cadence (the slow-start bridge exists so a refused member's
+/// move costs it nothing); the uncapped witness
+/// [`every_pair_keeps_both_legs_uncapped`] states no per-pair gap tolerance,
+/// so this is the 1 s the calls cut asks for.
+const NO_RELAY_GAP_BOUND: Duration = Duration::from_secs(1);
+
+/// The uncapped room of [`every_pair_keeps_both_legs_uncapped`]: four members
+/// reaching each other directly, node 4 the canonical shape.
+const NO_RELAY_DIALS: [(usize, usize); 10] = [
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (1, 2),
+    (1, 3),
+    (2, 3),
+    (0, 4),
+    (1, 4),
+    (2, 4),
+    (3, 4),
+];
+
+/// What one listener heard, per stream, as it arrived.
+type Arrivals = Arc<
+    std::sync::Mutex<
+        Vec<(
+            ciris_edge::transport::realtime_av::StreamId,
+            tokio::time::Instant,
+        )>,
+    >,
+>;
+
+/// One look at the room: each listener's primary for each publisher's
+/// stream (a role label), and each publisher's own-stream children
+/// (primaries, all).
+#[derive(Debug, Clone, PartialEq)]
+struct NoRelayLook {
+    parents: Vec<Vec<Option<String>>>,
+    kids: Vec<(usize, usize)>,
+}
+
+/// A four-member room in which every member joins with relay OFF and
+/// publishes 30 Hz from its own start (`t0`), each listener's arrivals
+/// recorded per stream as they come.
+struct NoRelayRoom {
+    tag: &'static str,
+    nodes: Arc<Vec<Node>>,
+    groups: Arc<Vec<CohortGroup>>,
+    /// `N0`..`N3` for the members, `T` for the canonical, by key id.
+    names: Vec<(String, String)>,
+    origin: tokio::time::Instant,
+    calls: Vec<Option<Call>>,
+    joining: Vec<Option<tokio::task::JoinHandle<Call>>>,
+    join_started: Vec<Option<tokio::time::Instant>>,
+    joined: Vec<Option<tokio::time::Instant>>,
+    /// Where a member's pair clocks start (and from when it publishes).
+    t0: Vec<Option<tokio::time::Instant>>,
+    /// Publish on install (a late joiner talks from its join).
+    publish_on_join: bool,
+    sends: Vec<Vec<tokio::time::Instant>>,
+    seq: u64,
+    arrivals: Vec<Arrivals>,
+    events: Vec<Option<mpsc::Receiver<CallEvent>>>,
+    /// (ms since origin, on node, event).
+    path_events: Vec<(u128, usize, String)>,
+    /// (ms since origin, look), only when it changed.
+    looks: Vec<(u128, NoRelayLook)>,
+    /// [listener][publisher]: first time the listener's primary was the
+    /// publisher itself.
+    first_direct: Vec<Vec<Option<tokio::time::Instant>>>,
+    /// [publisher][child]: first time the child held a PRIMARY on the
+    /// publisher's own stream.
+    first_child: Vec<Vec<Option<tokio::time::Instant>>>,
+    /// Every (ms, listener, publisher, parent) where a listener's primary
+    /// for a publisher's stream was another member.
+    member_parents: Vec<(u128, usize, usize, String)>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for NoRelayRoom {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+        for j in self.joining.iter().flatten() {
+            j.abort();
+        }
+    }
+}
+
+impl NoRelayRoom {
+    fn new(
+        tag: &'static str,
+        nodes: Vec<Node>,
+        groups: Vec<CohortGroup>,
+        publish_on_join: bool,
+    ) -> Self {
+        let names = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    n.key.key_id.clone(),
+                    if i < 4 {
+                        format!("N{i}")
+                    } else {
+                        "T".to_owned()
+                    },
+                )
+            })
+            .collect();
+        Self {
+            tag,
+            nodes: Arc::new(nodes),
+            groups: Arc::new(groups),
+            names,
+            origin: tokio::time::Instant::now(),
+            calls: (0..4).map(|_| None).collect(),
+            joining: (0..4).map(|_| None).collect(),
+            join_started: vec![None; 4],
+            joined: vec![None; 4],
+            t0: vec![None; 4],
+            publish_on_join,
+            sends: vec![Vec::new(); 4],
+            seq: 0,
+            arrivals: (0..4)
+                .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
+                .collect(),
+            events: (0..4).map(|_| None).collect(),
+            path_events: Vec::new(),
+            looks: Vec::new(),
+            first_direct: vec![vec![None; 4]; 4],
+            first_child: vec![vec![None; 4]; 4],
+            member_parents: Vec::new(),
+            tasks: Vec::new(),
+        }
+    }
+
+    fn ms(&self, t: tokio::time::Instant) -> u128 {
+        t.saturating_duration_since(self.origin).as_millis()
+    }
+
+    fn name(&self, key_id: &str) -> String {
+        self.names.iter().find(|(k, _)| k == key_id).map_or_else(
+            || key_id[..8.min(key_id.len())].to_owned(),
+            |(_, n)| n.clone(),
+        )
+    }
+
+    /// Join member `i` with relay OFF, in the background.
+    fn start_join(&mut self, i: usize) {
+        self.join_started[i] = Some(tokio::time::Instant::now());
+        let (nodes, groups, tag) = (Arc::clone(&self.nodes), Arc::clone(&self.groups), self.tag);
+        self.joining[i] = Some(tokio::spawn(async move {
+            join_loaded(
+                &nodes[i],
+                &groups[i],
+                tag,
+                CallOptions {
+                    relay: false,
+                    ..CallOptions::default()
+                },
+                None,
+            )
+            .await
+        }));
+    }
+
+    async fn poll_joins(&mut self) {
+        for i in 0..4 {
+            if self.joining[i]
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                let mut call = self.joining[i]
+                    .take()
+                    .expect("finished")
+                    .await
+                    .expect("join task");
+                let mut rx = call.frames().expect("frames");
+                let arr = Arc::clone(&self.arrivals[i]);
+                self.tasks.push(tokio::spawn(async move {
+                    while let Some(f) = rx.recv().await {
+                        arr.lock()
+                            .expect("arrivals")
+                            .push((f.stream, tokio::time::Instant::now()));
+                    }
+                }));
+                self.events[i] = call.events();
+                self.calls[i] = Some(call);
+                self.joined[i] = Some(tokio::time::Instant::now());
+                if self.publish_on_join {
+                    self.t0[i] = self.join_started[i];
+                }
+            }
+        }
+    }
+
+    fn all_joined(&self) -> bool {
+        self.calls.iter().all(Option::is_some)
+    }
+
+    // l and p index several per-member tables at once.
+    #[allow(clippy::needless_range_loop)]
+    fn look(&mut self) {
+        let now = tokio::time::Instant::now();
+        let streams: Vec<Option<ciris_edge::transport::realtime_av::StreamId>> = self
+            .calls
+            .iter()
+            .map(|c| c.as_ref().map(Call::stream))
+            .collect();
+        let mut parents = vec![vec![None; 4]; 4];
+        for l in 0..4 {
+            let Some(cl) = &self.calls[l] else { continue };
+            for p in (0..4).filter(|p| *p != l) {
+                let Some(s) = streams[p] else { continue };
+                let Some(x) = primary_for(cl, s) else {
+                    continue;
+                };
+                if x == self.names[p].0 {
+                    self.first_direct[l][p].get_or_insert(now);
+                } else {
+                    self.member_parents
+                        .push((self.ms(now), l, p, self.name(&x)));
+                }
+                parents[l][p] = Some(self.name(&x));
+            }
+        }
+        let mut kids = vec![(0, 0); 4];
+        for p in 0..4 {
+            let Some(cp) = &self.calls[p] else { continue };
+            let own = cp.alm_own_children();
+            kids[p] = (
+                own.iter().filter(|(_, r)| *r == Role::Primary).count(),
+                own.len(),
+            );
+            for (c, r) in &own {
+                if *r == Role::Primary {
+                    if let Some(ci) = self.names[..4].iter().position(|(k, _)| k == c) {
+                        self.first_child[p][ci].get_or_insert(now);
+                    }
+                }
+            }
+        }
+        let look = NoRelayLook { parents, kids };
+        if self.looks.last().is_none_or(|(_, l)| *l != look) {
+            self.looks.push((self.ms(now), look));
+        }
+        let at = self.ms(now);
+        for i in 0..4 {
+            let Some(rx) = self.events[i].as_mut() else {
+                continue;
+            };
+            while let Ok(e) = rx.try_recv() {
+                let line = match &e {
+                    CallEvent::MediaPathFailed {
+                        member,
+                        cause,
+                        detail,
+                        ..
+                    } => Some(format!("MediaPathFailed {member} {cause:?} {detail:?}")),
+                    CallEvent::MediaPathRestored { member, via, .. } => {
+                        Some(format!("MediaPathRestored {member} {via:?}"))
+                    }
+                    _ => None,
+                };
+                if let Some(line) = line {
+                    let named = self
+                        .names
+                        .iter()
+                        .fold(line, |s, (k, n)| s.replace(k.as_str(), n));
+                    self.path_events.push((at, i, named));
+                }
+            }
+        }
+    }
+
+    /// Without publishing: look and take joins until `done` or `budget`.
+    async fn settle(&mut self, budget: Duration, done: impl Fn(&Self) -> bool) -> bool {
+        let end = tokio::time::Instant::now() + budget;
+        loop {
+            self.poll_joins().await;
+            self.look();
+            if done(self) {
+                return true;
+            }
+            if tokio::time::Instant::now() > end {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Every publishing member sends one frame; a look every third.
+    async fn tick(&mut self) {
+        for i in 0..4 {
+            if self.t0[i].is_none() {
+                continue;
+            }
+            let Some(c) = self.calls[i].as_mut() else {
+                continue;
+            };
+            let size = c.chunk_plaintext_budget().unwrap_or(240).min(600);
+            let mut b = body(["a", "b", "c", "d"][i], self.seq);
+            b.resize(size, b'.');
+            let _ = c.publish(Frame::opaque(b)).await;
+            self.sends[i].push(tokio::time::Instant::now());
+        }
+        if self.seq.is_multiple_of(3) {
+            self.look();
+        }
+        self.seq += 1;
+        tokio::time::sleep(FRAME_INTERVAL).await;
+    }
+
+    async fn run_for(&mut self, d: Duration) {
+        let end = tokio::time::Instant::now() + d;
+        while tokio::time::Instant::now() < end {
+            self.poll_joins().await;
+            self.tick().await;
+        }
+    }
+
+    /// Run until member `i` has joined, then `d` more.
+    async fn run_past_join(&mut self, i: usize, d: Duration) {
+        let budget = tokio::time::Instant::now() + Duration::from_mins(1);
+        while self.calls[i].is_none() {
+            assert!(
+                tokio::time::Instant::now() < budget,
+                "member {i} joins within 60 s"
+            );
+            self.poll_joins().await;
+            self.tick().await;
+        }
+        self.run_for(d).await;
+    }
+
+    /// The per-pair table and every failure, the publishing having ended at
+    /// `end`.
+    #[allow(clippy::too_many_lines)]
+    fn judge(&self, end: tokio::time::Instant) -> (String, Vec<String>) {
+        let mut out = String::new();
+        let mut failed = Vec::new();
+        let ms = |t: Option<tokio::time::Instant>| t.map(|t| self.ms(t));
+        let _ = writeln!(
+            out,
+            "joins (ms since origin) started {:?} done {:?}; pair clocks t0 {:?}; publishing ended {}",
+            self.join_started.iter().map(|t| ms(*t)).collect::<Vec<_>>(),
+            self.joined.iter().map(|t| ms(*t)).collect::<Vec<_>>(),
+            self.t0.iter().map(|t| ms(*t)).collect::<Vec<_>>(),
+            self.ms(end),
+        );
+        out.push_str(
+            "pair L<-P: first chunk (ms from max(t0 L, t0 P)) | longest gap ms (at ms) | tail ms | heard/sent | first direct (ms from ref) | parents seen\n",
+        );
+        for l in 0..4 {
+            let arr = self.arrivals[l].lock().expect("arrivals").clone();
+            for p in (0..4).filter(|p| *p != l) {
+                let (Some(tl), Some(tp)) = (self.t0[l], self.t0[p]) else {
+                    failed.push(format!("N{l}<-N{p}: a member never started"));
+                    continue;
+                };
+                let r = tl.max(tp);
+                let Some(stream) = self.calls[p].as_ref().map(Call::stream) else {
+                    continue;
+                };
+                let heard: Vec<tokio::time::Instant> = arr
+                    .iter()
+                    .filter(|(s, t)| *s == stream && *t >= r)
+                    .map(|(_, t)| *t)
+                    .collect();
+                let sent = self.sends[p].iter().filter(|t| **t >= r).count();
+                let first = heard.first().map(|t| t.duration_since(r));
+                let (gap, gap_at) = heard
+                    .windows(2)
+                    .map(|w| (w[1].duration_since(w[0]), w[1]))
+                    .max_by_key(|(g, _)| *g)
+                    .map_or((Duration::ZERO, None), |(g, at)| (g, Some(at)));
+                let tail = heard
+                    .last()
+                    .map_or(Duration::ZERO, |t| end.saturating_duration_since(*t));
+                let direct = self.first_direct[l][p].map(|t| {
+                    if t >= r {
+                        t.duration_since(r).as_millis().to_string()
+                    } else {
+                        format!("-{}", r.duration_since(t).as_millis())
+                    }
+                });
+                let mut seen: Vec<Option<String>> = Vec::new();
+                for (_, lk) in &self.looks {
+                    if seen.last() != Some(&lk.parents[l][p]) {
+                        seen.push(lk.parents[l][p].clone());
+                    }
+                }
+                let _ = writeln!(
+            out,
+                    "  N{l}<-N{p}: first {:?} | gap {} (at {:?}) | tail {} | {}/{} | direct {:?} | {:?}",
+                    first.map(|d| d.as_millis()),
+                    gap.as_millis(),
+                    gap_at.map(|t| self.ms(t)),
+                    tail.as_millis(),
+                    heard.len(),
+                    sent,
+                    direct,
+                    seen,
+                );
+                if heard.is_empty() {
+                    failed.push(format!("N{l} never heard N{p}"));
+                }
+                if gap > NO_RELAY_GAP_BOUND {
+                    failed.push(format!(
+                        "N{l}<-N{p}: gap {} ms at {:?} ms, bound {} ms",
+                        gap.as_millis(),
+                        gap_at.map(|t| self.ms(t)),
+                        NO_RELAY_GAP_BOUND.as_millis()
+                    ));
+                }
+                if tail > NO_RELAY_GAP_BOUND {
+                    failed.push(format!(
+                        "N{l}<-N{p}: nothing for the last {} ms",
+                        tail.as_millis()
+                    ));
+                }
+            }
+        }
+        out.push_str("children admitted as PRIMARY on each publisher's own stream (ms since origin, in admission order; the 3rd is the one slow start refused):\n");
+        for p in 0..4 {
+            let mut kids: Vec<(u128, usize)> = (0..4)
+                .filter_map(|c| self.first_child[p][c].map(|t| (self.ms(t), c)))
+                .collect();
+            kids.sort_unstable();
+            let rel: Vec<String> = kids
+                .iter()
+                .map(|(t, c)| {
+                    // From the later of the pair's two starts (the pair's
+                    // own clock): the time it took to become direct.
+                    let since = self.t0[*c].zip(self.t0[p]).map(|(a, b)| {
+                        i128::try_from(*t).unwrap() - i128::try_from(self.ms(a.max(b))).unwrap()
+                    });
+                    format!("N{c}@{t} (+{since:?} from the pair's start)")
+                })
+                .collect();
+            let _ = writeln!(out, "  N{p}: {rel:?}");
+        }
+        out.push_str("looks (ms since origin; parents[listener][publisher]; own (primaries, all) per publisher), on change:\n");
+        for (t, lk) in &self.looks {
+            let _ = writeln!(out, "  {t}: kids {:?} parents {:?}", lk.kids, lk.parents);
+        }
+        let _ = writeln!(out, "path events: {:?}", self.path_events);
+        for (t, i, e) in &self.path_events {
+            if e.starts_with("MediaPathFailed") {
+                failed.push(format!("N{i} at {t} ms: {e}"));
+            }
+        }
+        if let Some(first) = self.member_parents.first() {
+            failed.push(format!(
+                "a listener's parent was a member (nobody relays): first {first:?}, {} looks",
+                self.member_parents.len()
+            ));
+        }
+        (out, failed)
+    }
+
+    fn logs(&self) -> String {
+        let mut s = String::new();
+        for (i, c) in self.calls.iter().enumerate() {
+            if let Some(c) = c {
+                let tail = self
+                    .names
+                    .iter()
+                    .fold(c.alm_log().2, |s, (k, n)| s.replace(k.as_str(), n));
+                let _ = writeln!(s, "[NR] N{i} log:\n{tail}");
+            }
+        }
+        s
+    }
+}
+
+/// **Calls cut — a room where nobody relays hears every publisher
+/// directly** (the server's metered-phone case: every member passes
+/// `relay: false`). Four members, uncapped, all publishing 30 Hz for 25 s.
+/// Slow start gives each publisher two direct children into its unmeasured
+/// uplink and refuses the third for capacity; with no relay anywhere, that
+/// member hears the publisher only through the slow-start bridge until the
+/// probe widens and admits it. Judged per (listener, publisher) pair: heard,
+/// no gap past [`NO_RELAY_GAP_BOUND`], no `MediaPathFailed` anywhere, and no
+/// member ever a parent.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_room_where_nobody_relays_hears_every_publisher_directly() {
+    let _call = one_call().await;
+    let tag = "alm2-norelay";
+    let (nodes, groups, _tmp) = topo(tag, 5, 4, &NO_RELAY_DIALS, Some(4)).await;
+    let mut room = NoRelayRoom::new(tag, nodes, groups, false);
+    for i in 0..4 {
+        room.start_join(i);
+    }
+    let up = room
+        .settle(Duration::from_mins(1), |r| {
+            r.all_joined() && r.calls.iter().flatten().all(|c| c.legs().len() >= 3)
+        })
+        .await;
+    assert!(up, "every member joins and holds 3 legs: {}", room.logs());
+    let start = tokio::time::Instant::now();
+    for i in 0..4 {
+        room.t0[i] = Some(start);
+    }
+    room.run_for(Duration::from_secs(25)).await;
+    let end = tokio::time::Instant::now();
+    // Late arrivals of what was sent before `end`.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (table, failed) = room.judge(end);
+    eprintln!("[NR] nobody relays, all at once:\n{table}failed {failed:?}");
+    if !failed.is_empty() {
+        eprintln!("{}", room.logs());
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+/// **Calls cut — late joiners in a room where nobody relays hear everyone**:
+/// two members streaming for 6 s; the third joins, the fourth 6 s later,
+/// every member with relay OFF, each publishing from its join. The fourth
+/// is each first publisher's third child, the one slow start refuses into
+/// an unmeasured uplink. Per pair, counted from the later of the two
+/// members' starts: heard, no gap past [`NO_RELAY_GAP_BOUND`], no
+/// `MediaPathFailed`.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn late_joiners_in_a_room_where_nobody_relays_hear_everyone() {
+    let _call = one_call().await;
+    let tag = "alm2-norelay-late";
+    let (nodes, groups, _tmp) = topo(tag, 5, 4, &NO_RELAY_DIALS, Some(4)).await;
+    let mut room = NoRelayRoom::new(tag, nodes, groups, true);
+    room.start_join(0);
+    room.start_join(1);
+    let up = room
+        .settle(Duration::from_mins(1), |r| {
+            r.calls[..2]
+                .iter()
+                .all(|c| c.as_ref().is_some_and(|c| !c.legs().is_empty()))
+        })
+        .await;
+    assert!(up, "the first two join and hold a leg: {}", room.logs());
+    // The first two start streaming together, once they hold their leg.
+    let start = tokio::time::Instant::now();
+    room.t0[0] = Some(start);
+    room.t0[1] = Some(start);
+    room.run_for(Duration::from_secs(6)).await;
+    room.start_join(2);
+    room.run_for(Duration::from_secs(6)).await;
+    room.start_join(3);
+    room.run_past_join(3, Duration::from_secs(20)).await;
+    let end = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (table, failed) = room.judge(end);
+    eprintln!("[NR] nobody relays, late joiners:\n{table}failed {failed:?}");
+    if !failed.is_empty() {
+        eprintln!("{}", room.logs());
+    }
+    assert!(failed.is_empty(), "{failed:?}");
 }
