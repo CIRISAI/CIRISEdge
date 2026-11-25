@@ -925,6 +925,9 @@ pub const AV_INBOUND_CONTROL_DROPPED: &str = "av_inbound_control_dropped";
 /// call's frames (its queue toward the host is full): delivery to the host
 /// is lossy, the pumps behind it never wait.
 pub const AV_FRAME_DROPPED_HOST_NOT_READING: &str = "av_frame_dropped_host_not_reading";
+/// 45.2.0 — a call event dropped because the host is not reading the call's
+/// events (its queue toward the host is full); nothing waits on it.
+pub const AV_CALL_EVENT_DROPPED_HOST_NOT_READING: &str = "av_call_event_dropped_host_not_reading";
 /// Dropped: the link's peer did not pass the #393 attribution gate.
 pub const AV_INBOUND_DROPPED_UNATTRIBUTED: &str = "av_inbound_dropped_unattributed";
 /// Dropped: a peer-opened A/V link arrived and nobody took the arrivals
@@ -2963,6 +2966,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_INBOUND_DROPPED_QUEUE_FULL,
     AV_INBOUND_CONTROL_DROPPED,
     AV_FRAME_DROPPED_HOST_NOT_READING,
+    AV_CALL_EVENT_DROPPED_HOST_NOT_READING,
     AV_INBOUND_DROPPED_UNATTRIBUTED,
     AV_INBOUND_DROPPED_NO_CONSUMER,
     AV_INBOUND_DROPPED_ARRIVALS_FULL,

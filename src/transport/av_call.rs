@@ -1748,6 +1748,8 @@ struct Shared {
     owners: Arc<dyn CallOwners>,
     heard_tx: mpsc::Sender<Heard>,
     events_tx: mpsc::Sender<CallEvent>,
+    /// The first event the host could not take was logged at WARN.
+    event_drop_warned: AtomicBool,
     state: StdMutex<CallState>,
     epochs: StdMutex<Vec<u64>>,
     ended: AtomicBool,
@@ -2115,8 +2117,23 @@ impl Shared {
     }
 
     fn emit(&self, event: CallEvent) {
-        if self.events_tx.try_send(event).is_err() {
-            tracing::debug!("call event dropped: the events receiver is full or gone");
+        match self.events_tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Never waits on the host, and never quiet: counted, and
+                // the first one of the call is logged at WARN.
+                self.count(crate::observability::AV_CALL_EVENT_DROPPED_HOST_NOT_READING);
+                if !self.event_drop_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        room = %self.room,
+                        "call event dropped: the host is not reading the call's events \
+                         (av_call_event_dropped_host_not_reading); later drops are counted"
+                    );
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("call event dropped: the events receiver is gone");
+            }
         }
     }
 
@@ -2562,6 +2579,7 @@ impl Call {
             owners,
             heard_tx,
             events_tx,
+            event_drop_warned: AtomicBool::new(false),
             state: StdMutex::new(CallState::Live),
             epochs: StdMutex::new(vec![epoch.0]),
             ended: AtomicBool::new(false),

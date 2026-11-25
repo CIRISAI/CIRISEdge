@@ -16951,6 +16951,22 @@ static AV_SINK_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 /// CIRISEdge#805 — the per-link throttle for routine A/V sink drops (overflow,
 /// no consumer): DEBUG, a few per minute per link, never per frame
 /// (CIRISEdge#460). The exact count is the `av_plane` counter, never throttled.
+/// 45.2.0 — whether this is the first control-frame drop seen on `link`
+/// (the warn-once set; bounded, cleared when it would outgrow leviculum's
+/// own link cap).
+fn av_control_drop_first(link: LinkId) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<LinkId>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.len() >= crate::transport::av_sink::AV_PENDING_ARRIVAL_LINKS_MAX {
+        seen.clear();
+    }
+    seen.insert(link)
+}
+
 fn av_sink_drop_log() -> &'static crate::log_throttle::LogThrottle {
     AV_SINK_DROP_LOG
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
@@ -17128,6 +17144,17 @@ async fn deliver_av_frame(
             count(label);
             if control {
                 count(crate::observability::AV_INBOUND_CONTROL_DROPPED);
+                // Never quiet: once per link, at WARN (a control frame the
+                // transport delivered and the call will never see).
+                if av_control_drop_first(link_id) {
+                    tracing::warn!(
+                        link = ?link_id,
+                        reason = label,
+                        "ALM control frame dropped at the A/V sink: its per-link control \
+                         queue was full (av_inbound_control_dropped); later drops on this \
+                         link are counted, not logged"
+                    );
+                }
             }
             if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                 av_sink_drop_log().check(&format!("{label}:{link_id:?}"))

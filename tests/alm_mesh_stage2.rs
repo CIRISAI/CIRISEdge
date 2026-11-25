@@ -3949,6 +3949,84 @@ async fn a_member_whose_host_never_reads_frames_keeps_its_place() {
     drop(calls);
 }
 
+/// **A member whose host reads nothing still relays to its child**
+/// (45.2.0): R's host never takes the call's frames NOR its events from the
+/// moment it joins; P and C cannot reach each other, so C hears P only
+/// through R (the roster-relay shape). C's hearing of P must be what a
+/// reading relay gives: every second carries P's frames to C and C hears
+/// at least 90 % of what P publishes. Mutation (2ba6adb): R's pumps parked
+/// on its unread queues and C heard nothing from P from then on.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_whose_host_reads_nothing_still_relays_to_its_child() {
+    // Past R's host-bound queues (256 frames + 1024 heard) at ~30 frames/s.
+    const RUN_S: u64 = 90;
+    let _call = one_call().await;
+    let tag = "alm2-noreadrelay";
+    // 0 = R (relays, its host reads nothing), 1 = P, 2 = C; 3 = T. P and C
+    // dial R; T dials everyone. P and C share nothing.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        3,
+        &[(0, 1), (0, 2), (0, 3), (1, 3), (2, 3)],
+        Some(3),
+    )
+    .await;
+    let (r, p) = (&nodes[0], &nodes[1]);
+    // R: frames() and events() never taken.
+    let cr = join_loaded(r, &groups[0], tag, relay_opts(), None).await;
+    let mut cp = join_loaded(p, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = vec![join_loaded(&nodes[2], &groups[2], tag, CallOptions::default(), None).await];
+    wait_legs(&cr, 2).await;
+    wait_legs(&cp, 1).await;
+    wait_legs(&cc[0], 1).await;
+    let heard = count_frames_from(&mut cc, &p.key.key_id);
+    let converged = wait_until(Duration::from_secs(90), || async {
+        primary_for(&cc[0], cp.stream()).as_deref() == Some(r.key.key_id.as_str())
+    })
+    .await;
+    assert!(converged, "the premise: C hears P through R");
+    let mut seq = 0;
+    let mut published = 0u64;
+    let mut empty_seconds: Vec<u64> = Vec::new();
+    let start_heard = heard.read()[0];
+    let mut last = start_heard;
+    for sec in 0..RUN_S {
+        let (s2, _) = publish_timed_for(&mut cp, 1, seq).await;
+        published += s2 - seq;
+        seq = s2;
+        let now = heard.read()[0];
+        if sec >= 2 && now == last {
+            empty_seconds.push(sec);
+        }
+        last = now;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let got = heard.read()[0] - start_heard;
+    let r_host_frames = av(&r.metrics, "av_frame_dropped_host_not_reading");
+    let r_host_events = av(&r.metrics, "av_call_event_dropped_host_not_reading");
+    let r_sink = av(&r.metrics, "av_inbound_dropped_queue_full");
+    eprintln!(
+        "[NOREADRELAY] C heard {got} of {published} of P through R; seconds with nothing {empty_seconds:?}; \
+         R dropped for its host {r_host_frames} frames, {r_host_events} events; R sink drops {r_sink}"
+    );
+    assert!(
+        r_host_frames > 0,
+        "the precondition: R's host queues filled"
+    );
+    assert!(
+        empty_seconds.is_empty(),
+        "C heard P every second: {empty_seconds:?}"
+    );
+    assert!(
+        got * 10 >= published * 9,
+        "C hears P through R: {got} of {published}"
+    );
+    drop(cc);
+    drop(cr);
+}
+
 /// **G8 — a publisher whose uplink is capped below its fan-out** (the
 /// server's av_mesh cell, on loopback, with no tc): `P` publishes
 /// 600 B at 30 Hz to `A`, `B` and `C`, who reach each other directly, every
