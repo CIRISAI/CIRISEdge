@@ -60,6 +60,11 @@ pub struct DecisionLog {
     tail_cap: usize,
     counters: BTreeMap<DecisionKind, u64>,
     buf: Vec<u8>,
+    /// The stream the records that follow concern (its id's first bytes,
+    /// hex), set by the caller that owns one selector or admission per
+    /// stream; shown on every tail line and debug record, never hashed (a
+    /// single-stream simulation's hash is unchanged).
+    stream: Option<String>,
 }
 
 impl Default for DecisionLog {
@@ -79,6 +84,7 @@ impl DecisionLog {
             tail_cap,
             counters: BTreeMap::new(),
             buf: Vec::with_capacity(128),
+            stream: None,
         }
     }
 
@@ -113,8 +119,10 @@ impl DecisionLog {
         *self.counters.entry(kind).or_insert(0) += 1;
         // The one place every decision passes. Peers only at DEBUG: an INFO
         // line says what happened and never to whom.
+        let stream = self.stream.as_deref().unwrap_or("-");
         tracing::debug!(
             target: "edge.alm.decision",
+            stream,
             ?kind,
             subject = ?subject,
             value,
@@ -129,9 +137,15 @@ impl DecisionLog {
                 self.tail.pop_front();
             }
             self.tail.push_back(format!(
-                "t={at_ms} node={node:?} {kind:?} subj={subject:?} v={value} ({reason})"
+                "t={at_ms} node={node:?} stream={stream} {kind:?} subj={subject:?} v={value} ({reason})"
             ));
         }
+    }
+
+    /// Name the stream the records that follow concern (see the `stream`
+    /// field); `None` for records that concern no one stream.
+    pub fn set_stream(&mut self, stream: Option<String>) {
+        self.stream = stream;
     }
 
     /// The running hash over every record so far.

@@ -619,6 +619,7 @@ impl AlmState {
             let mut shed = Vec::new();
             for (stream, a) in &mut self.relays {
                 a.set_admit_closed(true);
+                self.log.set_stream(Some(stream_label(*stream)));
                 for p in a.shed_all_draining(now, RELAY_OFF_WIRE_REASON, &mut self.log) {
                     shed.push((*stream, p));
                 }
@@ -866,6 +867,7 @@ impl AlmState {
         for (stream, a) in &mut self.relays {
             a.set_admit_closed(!tier.admits_new_relay_work());
             if tier.sheds_relayed_audio() {
+                self.log.set_stream(Some(stream_label(*stream)));
                 for p in a.shed_all_draining(now, ShedReason::LoadShed, &mut self.log) {
                     shed_frames.push((*stream, p));
                 }
@@ -893,7 +895,8 @@ impl AlmState {
     pub(super) fn on_parent_link_down(&mut self, peer: &str) {
         let now = self.now_ms();
         let p = peer.to_owned();
-        for s in self.sels.values_mut() {
+        for (st, s) in &mut self.sels {
+            self.log.set_stream(Some(stream_label(*st)));
             s.on_link_down(now, &p, &mut self.log);
         }
     }
@@ -1457,6 +1460,7 @@ impl AlmState {
     ) -> Vec<Outgoing> {
         let now = self.now_ms();
         let stream = f.stream;
+        self.log.set_stream(Some(stream_label(stream)));
         self.counts.c3_received += 1;
         self.label(crate::observability::ALM_C3_RECEIVED);
         let mut out = Vec::new();
@@ -1858,6 +1862,7 @@ impl AlmState {
             let ext = self.external_except(s);
             let a = self.relays.get_mut(&s).expect("present");
             a.set_external_committed(ext);
+            self.log.set_stream(Some(stream_label(s)));
             for p in a.on_egress_window(now, &w, &mut self.log) {
                 shed.push((s, p));
             }
@@ -1868,6 +1873,7 @@ impl AlmState {
         if self.uplink_stall {
             own_w.capacity_bps = Some(one + self.cfg.reserve_bps as f64 + ext as f64);
         }
+        self.log.set_stream(Some(stream_label(self.own_stream)));
         for p in self.own.on_egress_window(now, &own_w, &mut self.log) {
             shed.push((self.own_stream, p));
         }
@@ -1877,6 +1883,7 @@ impl AlmState {
             let ext = self.external_except(s);
             let (a, _) = self.shares.get_mut(&s).expect("present");
             a.set_external_committed(ext);
+            self.log.set_stream(Some(stream_label(s)));
             for p in a.on_egress_window(now, &w, &mut self.log) {
                 shed.push((s, p));
             }
@@ -1939,6 +1946,7 @@ impl AlmState {
         // every decision (the simultaneous-failover loop).
         let streams: Vec<StreamId> = self.sels.keys().copied().collect();
         for s in streams {
+            self.log.set_stream(Some(stream_label(s)));
             let has_children = self
                 .relays
                 .get(&s)
@@ -2250,6 +2258,7 @@ impl AlmState {
         // a target (two movers onto each other would loop).
         let keep = rxmove::lowest(s, &directs).cloned();
         let allowed = |c: &String| !directs.contains(c) || Some(c) == keep.as_ref();
+        self.log.set_stream(Some(stream_label(s)));
         let mut log = std::mem::take(&mut self.log);
         let act = self
             .sels
@@ -2392,6 +2401,11 @@ impl AlmState {
         self.label(crate::observability::ALM_C3_MALFORMED);
         self.label(e.token());
     }
+}
+
+/// The decision log's name for a stream: its id's first two bytes, hex.
+fn stream_label(s: StreamId) -> String {
+    format!("{:02x}{:02x}", s.0[0], s.0[1])
 }
 
 #[cfg(test)]
