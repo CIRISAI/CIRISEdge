@@ -460,7 +460,14 @@ impl DirectLinksConfig {
             DirectAccept::Off => DirectLinkPolicy::Reject,
             DirectAccept::IdentifiedOnly => DirectLinkPolicy::IdentifiedOnly,
         };
-        settings.facilitator = self.proposes().then(|| self.facilitator.clone()).flatten();
+        // Named, whether or not this node proposes: since leviculum
+        // v0.34.0+ciris.4 a node ANSWERS a proposal only by probing a
+        // facilitator of its own (it no longer probes one a peer names), so
+        // holding it back from a node that does not propose made that node
+        // refuse every proposal as unsupported. Proposing is edge's to start
+        // (`proposes`), and leviculum's own background retry is off for a
+        // node that does not propose.
+        settings.facilitator.clone_from(&self.facilitator);
         settings.protocol = ProbeProtocol::Rnsp;
         settings.facilitator_port = self.serve_facilitator;
         settings

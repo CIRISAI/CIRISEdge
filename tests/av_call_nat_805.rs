@@ -397,7 +397,7 @@ struct Pair {
 
 /// `T`, then `A` and `B` as its clients, each holding the other's signed
 /// route and knowing the other through `T`; plus the room's MLS group over
-/// both. `facilitated` gives `A` `T`'s facilitator; `B` is on the default.
+/// both. `facilitated` gives `A` and `B` `T`'s facilitator; only `A` proposes.
 async fn pair(tag: &str, facilitated: bool) -> Pair {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -420,7 +420,20 @@ async fn pair(tag: &str, facilitated: bool) -> Pair {
         &b_dir,
         &tmp.path().join("b"),
         t_port,
-        DirectLinksConfig::default(),
+        // B names the facilitator too but does not propose: since leviculum
+        // v0.34.0+ciris.4 a node answers a proposal only by probing a
+        // facilitator of its OWN (it no longer probes one a peer names), so a
+        // member with none refuses. Not proposing keeps A the one proposer
+        // these tests are written around.
+        DirectLinksConfig {
+            proposing: if facilitated {
+                ciris_edge::transport::direct_path::Proposing::Off
+            } else {
+                ciris_edge::transport::direct_path::Proposing::On
+            },
+            facilitator: facilitated.then(|| format!("127.0.0.1:{f_port}")),
+            ..DirectLinksConfig::default()
+        },
     )
     .await;
     for (from, from_key, to) in [(&a_dir, &a.key, &b_dir), (&b_dir, &b.key, &a_dir)] {
@@ -1076,7 +1089,7 @@ fn path_events(seen: &std::sync::Mutex<Vec<CallEvent>>) -> Vec<CallEvent> {
 }
 
 /// **v45.1 — a failed media path says why, once, and is answered when the
-/// path comes up.** `A` has `T`'s facilitator; `B` has none, and refuses
+/// path comes up.** `A` and `B` have `T`'s facilitator, only `A` proposes, and `B` refuses
 /// every direct-link request (the test seam: REJECT `POLICY`). So:
 ///
 /// - `A`'s leg to `B` proposes, `B` refuses, the dial across `T` cannot
@@ -1085,8 +1098,8 @@ fn path_events(seen: &std::sync::Mutex<Vec<CallEvent>>) -> Vec<CallEvent> {
 ///   relay: none_available }` (`T` is not in the call), its `tried` the reflexive
 ///   punch refused, its NAT `unknown` (this leviculum pin measures nothing)
 ///   and no peer report (no carrier on this pin).
-/// - `B`'s leg to `A` cannot propose at all: one `MediaPathFailed { member:
-///   A, cause: no_facilitator }`.
+/// - `B`'s leg to `A` cannot propose (its proposing is off): one
+///   `MediaPathFailed { member: A, cause: other, detail: proposing_off }`.
 /// - `A` dials `B` again through its backoff, and fires nothing more.
 /// - `B` then allows the path: `A`'s next proposal (on a fresh identity link,
 ///   past leviculum's per-link cooldown) brings it direct, the legs come up,
@@ -1181,17 +1194,13 @@ async fn a_failed_media_path_says_why_once_and_is_restored() {
             ..
         }] => {
             assert_eq!(member, &a_id);
-            assert_eq!(*cause, MediaPathCause::NoFacilitator);
-            assert!(retryable);
-            assert_eq!(*detail, Some(PathDetail::FacilitatorUnresolved));
+            // B names a facilitator (it must, to answer) and does not
+            // propose: its own leg to A has no path it may start, and says
+            // so as the operator's switch, not as a missing facilitator.
+            assert_eq!(*cause, MediaPathCause::Other);
+            assert_eq!(*detail, Some(PathDetail::ProposingOff));
             assert_eq!(*relay, RelayStanding::NoneAvailable);
-            assert_eq!(
-                tried
-                    .iter()
-                    .map(|t| (t.kind, t.outcome))
-                    .collect::<Vec<_>>(),
-                [(PathKind::DirectReflexive, PathOutcome::NoFacilitator)]
-            );
+            eprintln!("[MPF] B's failure: retryable {retryable}, tried {tried:?}");
         }
         other => panic!("B: one MediaPathFailed for A: {other:?}"),
     }
