@@ -4642,6 +4642,11 @@ async fn a_capped_publishers_children_move_themselves_and_come_back() {
     for l in &listeners {
         wait_legs(l, 3).await;
     }
+    // Every listener's frames are read as they arrive, as a host does: a
+    // call whose frames nobody reads fills its queues (256, then 1024 heard)
+    // and its links' pumps wait on them, C3 included, so the witness judged
+    // a harness that had stopped listening.
+    let _drained = count_frames_from(&mut listeners, &pid);
     let stream = cp.stream();
     let names: Vec<String> = nodes[1..4].iter().map(|n| n.key.key_id.clone()).collect();
     let kept = (0..3)
