@@ -40,6 +40,13 @@ call and relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`. Detai
   probing a helper server (facilitator) of its own, never one the other side names. A device with
   none named, or with proposing switched off by its operator (which resolves none), no longer
   accepts direct connections.
+- **Supported size: calls of up to four members.** Measured on the server's capped-uplink matrix
+  (one member's whole uplink capped for 90 s, one run per cell): at four members every bar passes
+  at 250 and 300 kbit/s (no link torn down, no gap, 85 % and 96 % heard through the cap, everyone
+  back direct within about 30 s of the lift). At six members a capped uplink still tears links
+  down and about 81 % is heard at 300 kbit/s, and one six-member call did not form when everyone
+  joined in the same instant. Hosts should limit a call to four members on 45.2.0; six and more
+  are the work of 45.2.1.
 - **Known, for 45.2.1:** call events to a host that is not reading are dropped past 64 (now
   counted, `av_call_event_dropped_host_not_reading`, and logged once per call); pair-preserving
   delivery follows. Two members that lose the same relay can promote each other for one round

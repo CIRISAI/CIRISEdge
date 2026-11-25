@@ -44,6 +44,10 @@ relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`.
   resolves none), no longer accepts direct links.
 
 ### Known
+- **Calls are supported up to four members in 45.2.0.** At six, a capped uplink still tears links
+  down (about 81 % heard at 300 kbit/s; the first ten seconds 12-14 %), and a six-member call
+  whose members all joined in the same instant did not form in one run. Hosts should limit a call
+  to four members.
 - When an uplink is capped, the first ten seconds lose about half of that publisher's media while
   the shed and the relays settle.
 - Call events to a host that is not reading are dropped past 64 (counted, logged once per call);
