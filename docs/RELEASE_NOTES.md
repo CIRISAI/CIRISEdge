@@ -28,6 +28,14 @@ v0.34.0+ciris.4. No migration, no wire change. Detail in CHANGELOG.md.
   the leviculum link module, so a build without the Reticulum transport did not compile. Builds
   that enable it (CIRISServer's) were not affected.
 - Calls remain supported for up to four members; six and more are the work of 45.3.
+- **Known, and measured on this release: through a capped uplink, media arrives late.** With one
+  member's whole uplink capped at 250 kbit/s in a four-member call, every link stays up and about
+  84 % of that member's frames are delivered, but half of them more than 6 s after they were sent
+  and one in twenty more than 11 s after (the server's matrix on 9a810d2; the kernel queued about
+  11 s and dropped nothing). Edge queues media it cannot send where it should drop what is already
+  stale, and a receiver judges a frame's age from when it arrived, not from when it was sent.
+  Uncapped calls are unaffected (1 to 2 ms). Pacing with control first, and age judged end to
+  end, are the first work of 45.3.
 
 # v45.2.0 — group calls on member relays
 

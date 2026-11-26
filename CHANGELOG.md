@@ -25,6 +25,12 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   `transport-http` alone, with `transport-packet-radio` alone, or for the uniffi bindgen build).
 - `NoRouteToPeer` from a derived-address dial reports the path table's own `has_path`.
 
+### Known
+- Through a capped uplink media is delivered late, not dropped: at four members and 250 kbit/s,
+  p50 6.0 s and p95 11.1 s (server matrix, 9a810d2). `MEDIA_STALE_BUDGET` (800 ms) measures a
+  frame's wait in the receiver's own queue only; nothing drops on the signed source timestamp, and
+  a datagram leg has no expiry. 45.3.
+
 ## 45.2.0 — 2026-11-25
 
 **MINOR. Group calls on member relays.** Pins: persist v61.4.4 by tag, CIRISVerify v22.2.4,
