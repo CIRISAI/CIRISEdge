@@ -2101,7 +2101,13 @@ async fn a_keyframe_reaches_a_loaded_receiver_whole() {
     let mut cb = join_loaded(b, &groups[1], tag, phone, None).await;
     wait_legs(&ca, 1).await;
     wait_legs(&cb, 1).await;
-    wait_bound(&ca, 1).await;
+    // Both of B's bindings, v1 AND v2: the v2 carries the framing and goes
+    // only after the CAPS exchange, later than v1. Publishing on v1 alone
+    // raced it: the keyframe's chunks waited FRAMING_HOLD for a framing the
+    // loaded receiver had not verified yet and were dropped as unknown under
+    // a busy host (45.3; failed on v45.2.0 too). This witness is about the
+    // data plane holding the burst, not about binding timing.
+    wait_bound(&ca, 2).await;
     let mut frames = ca.frames().expect("A's frames");
     a.transport.refresh_metrics();
     let shed_before = av(&a.metrics, "av_datagram_shed_sink");
