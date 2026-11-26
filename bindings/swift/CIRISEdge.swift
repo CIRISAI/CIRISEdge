@@ -451,6 +451,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
     typealias FfiType = Double
     typealias SwiftType = Double
@@ -1011,6 +1027,88 @@ public func FfiConverterTypeEdgeMetricsSnapshot_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeEdgeMetricsSnapshot_lower(_ value: EdgeMetricsSnapshot) -> RustBuffer {
     return FfiConverterTypeEdgeMetricsSnapshot.lower(value)
+}
+
+
+public struct EdgeNatReport: Equatable, Hashable {
+    public var mapping: String
+    public var allocation: String
+    public var filtering: String
+    public var portPreserving: Bool?
+    public var routerMapping: String
+    public var family: String
+    public var evidence: String
+    public var legacyClass: String
+    public var measuredAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(mapping: String, allocation: String, filtering: String, portPreserving: Bool?, routerMapping: String, family: String, evidence: String, legacyClass: String, measuredAt: Int64) {
+        self.mapping = mapping
+        self.allocation = allocation
+        self.filtering = filtering
+        self.portPreserving = portPreserving
+        self.routerMapping = routerMapping
+        self.family = family
+        self.evidence = evidence
+        self.legacyClass = legacyClass
+        self.measuredAt = measuredAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeNatReport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeNatReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeNatReport {
+        return
+            try EdgeNatReport(
+                mapping: FfiConverterString.read(from: &buf), 
+                allocation: FfiConverterString.read(from: &buf), 
+                filtering: FfiConverterString.read(from: &buf), 
+                portPreserving: FfiConverterOptionBool.read(from: &buf), 
+                routerMapping: FfiConverterString.read(from: &buf), 
+                family: FfiConverterString.read(from: &buf), 
+                evidence: FfiConverterString.read(from: &buf), 
+                legacyClass: FfiConverterString.read(from: &buf), 
+                measuredAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeNatReport, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.mapping, into: &buf)
+        FfiConverterString.write(value.allocation, into: &buf)
+        FfiConverterString.write(value.filtering, into: &buf)
+        FfiConverterOptionBool.write(value.portPreserving, into: &buf)
+        FfiConverterString.write(value.routerMapping, into: &buf)
+        FfiConverterString.write(value.family, into: &buf)
+        FfiConverterString.write(value.evidence, into: &buf)
+        FfiConverterString.write(value.legacyClass, into: &buf)
+        FfiConverterInt64.write(value.measuredAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeNatReport_lift(_ buf: RustBuffer) throws -> EdgeNatReport {
+    return try FfiConverterTypeEdgeNatReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeNatReport_lower(_ value: EdgeNatReport) -> RustBuffer {
+    return FfiConverterTypeEdgeNatReport.lower(value)
 }
 
 
@@ -2881,6 +2979,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeEdgeNatReport: FfiConverterRustBuffer {
+    typealias SwiftType = EdgeNatReport?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeEdgeNatReport.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeEdgeNatReport.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeEdgePeerFilter: FfiConverterRustBuffer {
     typealias SwiftType = EdgePeerFilter?
 
@@ -3547,6 +3669,12 @@ public func linkTeardown(linkId: Data)throws   {try rustCallWithError(FfiConvert
     )
 }
 }
+public func localNatReport()throws  -> EdgeNatReport?  {
+    return try  FfiConverterOptionTypeEdgeNatReport.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_local_nat_report($0
+    )
+})
+}
 public func metricsSnapshot()throws  -> EdgeMetricsSnapshot  {
     return try  FfiConverterTypeEdgeMetricsSnapshot_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_metrics_snapshot($0
@@ -3886,6 +4014,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_link_teardown() != 2573) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_local_nat_report() != 54275) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_metrics_snapshot() != 47202) {

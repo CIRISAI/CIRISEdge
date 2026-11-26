@@ -500,6 +500,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_link_teardown() != 2573:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_local_nat_report() != 54275:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_metrics_snapshot() != 47202:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_onion_set_enabled() != 16650:
@@ -903,6 +905,10 @@ _UniffiLib.uniffi_ciris_edge_fn_func_link_teardown.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_ciris_edge_fn_func_link_teardown.restype = None
+_UniffiLib.uniffi_ciris_edge_fn_func_local_nat_report.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_local_nat_report.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_ciris_edge_fn_func_metrics_snapshot.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1158,6 +1164,9 @@ _UniffiLib.uniffi_ciris_edge_checksum_func_link_request.restype = ctypes.c_uint1
 _UniffiLib.uniffi_ciris_edge_checksum_func_link_teardown.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_link_teardown.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_local_nat_report.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_local_nat_report.restype = ctypes.c_uint16
 _UniffiLib.uniffi_ciris_edge_checksum_func_metrics_snapshot.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_metrics_snapshot.restype = ctypes.c_uint16
@@ -2039,6 +2048,97 @@ class _UniffiFfiConverterTypeEdgeMetricsSnapshot(_UniffiConverterRustBuffer):
         _UniffiFfiConverterMapStringFloat64.write(value.gauges, buf)
         _UniffiFfiConverterString.write(value.snapshot_at, buf)
         _UniffiFfiConverterUInt64.write(value.window_seconds, buf)
+
+class _UniffiFfiConverterInt64(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "i64"
+    VALUE_MIN = -2**63
+    VALUE_MAX = 2**63
+
+    @staticmethod
+    def read(buf):
+        return buf.read_i64()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_i64(value)
+
+@dataclass
+class EdgeNatReport:
+    def __init__(self, *, mapping:str, allocation:str, filtering:str, port_preserving:typing.Optional[bool], router_mapping:str, family:str, evidence:str, legacy_class:str, measured_at:int):
+        self.mapping = mapping
+        self.allocation = allocation
+        self.filtering = filtering
+        self.port_preserving = port_preserving
+        self.router_mapping = router_mapping
+        self.family = family
+        self.evidence = evidence
+        self.legacy_class = legacy_class
+        self.measured_at = measured_at
+        
+        
+
+    
+    def __str__(self):
+        return "EdgeNatReport(mapping={}, allocation={}, filtering={}, port_preserving={}, router_mapping={}, family={}, evidence={}, legacy_class={}, measured_at={})".format(self.mapping, self.allocation, self.filtering, self.port_preserving, self.router_mapping, self.family, self.evidence, self.legacy_class, self.measured_at)
+    def __eq__(self, other):
+        if self.mapping != other.mapping:
+            return False
+        if self.allocation != other.allocation:
+            return False
+        if self.filtering != other.filtering:
+            return False
+        if self.port_preserving != other.port_preserving:
+            return False
+        if self.router_mapping != other.router_mapping:
+            return False
+        if self.family != other.family:
+            return False
+        if self.evidence != other.evidence:
+            return False
+        if self.legacy_class != other.legacy_class:
+            return False
+        if self.measured_at != other.measured_at:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeEdgeNatReport(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return EdgeNatReport(
+            mapping=_UniffiFfiConverterString.read(buf),
+            allocation=_UniffiFfiConverterString.read(buf),
+            filtering=_UniffiFfiConverterString.read(buf),
+            port_preserving=_UniffiFfiConverterOptionalBoolean.read(buf),
+            router_mapping=_UniffiFfiConverterString.read(buf),
+            family=_UniffiFfiConverterString.read(buf),
+            evidence=_UniffiFfiConverterString.read(buf),
+            legacy_class=_UniffiFfiConverterString.read(buf),
+            measured_at=_UniffiFfiConverterInt64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.mapping)
+        _UniffiFfiConverterString.check_lower(value.allocation)
+        _UniffiFfiConverterString.check_lower(value.filtering)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.port_preserving)
+        _UniffiFfiConverterString.check_lower(value.router_mapping)
+        _UniffiFfiConverterString.check_lower(value.family)
+        _UniffiFfiConverterString.check_lower(value.evidence)
+        _UniffiFfiConverterString.check_lower(value.legacy_class)
+        _UniffiFfiConverterInt64.check_lower(value.measured_at)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.mapping, buf)
+        _UniffiFfiConverterString.write(value.allocation, buf)
+        _UniffiFfiConverterString.write(value.filtering, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.port_preserving, buf)
+        _UniffiFfiConverterString.write(value.router_mapping, buf)
+        _UniffiFfiConverterString.write(value.family, buf)
+        _UniffiFfiConverterString.write(value.evidence, buf)
+        _UniffiFfiConverterString.write(value.legacy_class, buf)
+        _UniffiFfiConverterInt64.write(value.measured_at, buf)
 
 @dataclass
 class EdgeNetworkEvent:
@@ -3557,6 +3657,31 @@ class _UniffiFfiConverterSequenceTypeEdgeLinkInfo(_UniffiConverterRustBuffer):
             _UniffiFfiConverterTypeEdgeLinkInfo.read(buf) for i in range(count)
         ]
 
+class _UniffiFfiConverterOptionalTypeEdgeNatReport(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeEdgeNatReport.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeEdgeNatReport.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeEdgeNatReport.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterSequenceTypeEdgePathEntry(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -4110,6 +4235,17 @@ def link_teardown(link_id: bytes) -> None:
     _uniffi_ffi_result = _uniffi_rust_call_with_error(
         _uniffi_error_converter,
         _UniffiLib.uniffi_ciris_edge_fn_func_link_teardown,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def local_nat_report() -> typing.Optional[EdgeNatReport]:
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterOptionalTypeEdgeNatReport.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_local_nat_report,
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
@@ -4740,6 +4876,7 @@ __all__ = [
     "EdgeLinkHandle",
     "EdgeLinkInfo",
     "EdgeMetricsSnapshot",
+    "EdgeNatReport",
     "EdgeNetworkEvent",
     "EdgeOnionStatus",
     "EdgePathEntry",
@@ -4771,6 +4908,7 @@ __all__ = [
     "link_open",
     "link_request",
     "link_teardown",
+    "local_nat_report",
     "metrics_snapshot",
     "onion_set_enabled",
     "onion_status",
