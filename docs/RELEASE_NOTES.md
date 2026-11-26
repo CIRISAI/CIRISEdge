@@ -17,6 +17,11 @@ v0.34.0+ciris.4. No migration, no wire change. Detail in CHANGELOG.md.
   uplink, a relayed standby for another member included, so about one time in four the member
   that should have been taken back was refused for some 30 s. Relay work no longer blocks it;
   the publisher's own other streams still keep their room.
+- **A member who drops out is read as lost.** An app that dropped a call without leaving kept
+  answering on the call's address, and since 45.2.0 its peers redialled it and held that link for
+  good, so it was never reported lost. A dropped call now leaves its addresses and closes its
+  links, and a link that arrives for a call a node is not in is closed, not left open. To be read
+  as having LEFT, an app still calls `leave_with`.
 - **A room that cannot be refreshed still opens** from the handle already held (counted and
   logged), where it would have refused every open.
 - **Every build lane compiles.** v45.2.0's own CI failed four lanes: a feature gate had come off
