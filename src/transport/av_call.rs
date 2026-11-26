@@ -2441,6 +2441,31 @@ impl Drop for Call {
         for t in &self.tasks {
             t.abort();
         }
+        // 45.3 — a dropped call is gone from the wire too: its addresses are
+        // left and its links closed, as a media-refused end does. Before, the
+        // node kept answering on the call's addresses and kept every link
+        // open with nothing behind it: a member that redialled it (a leg a
+        // send finds gone is redialled, 73a3133) got a "leg" to a call that
+        // no longer existed, so it never read that attendee Lost.
+        let _ = self
+            .shared
+            .lifecycle
+            .leave(&self.shared.scope, &self.shared.group_id);
+        let links: Vec<[u8; 16]> = Shared::lock(&self.shared.out_legs)
+            .drain()
+            .map(|(_, l)| l.link_id)
+            .chain(Shared::lock(&self.shared.in_links).drain().map(|(l, _)| l))
+            .collect();
+        if !links.is_empty() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let transport = Arc::clone(&self.shared.transport);
+                rt.spawn(async move {
+                    for l in links {
+                        let _ = transport.link_teardown(&l).await;
+                    }
+                });
+            }
+        }
     }
 }
 
