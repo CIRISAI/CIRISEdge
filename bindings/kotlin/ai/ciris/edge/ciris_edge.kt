@@ -657,6 +657,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_ciris_edge_checksum_func_link_teardown(
     ): Short
+    external fun uniffi_ciris_edge_checksum_func_local_nat_report(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_metrics_snapshot(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_onion_set_enabled(
@@ -780,6 +782,8 @@ external fun uniffi_ciris_edge_fn_func_link_request(`linkHandle`: RustBuffer.ByV
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_link_teardown(`linkId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_ciris_edge_fn_func_local_nat_report(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_metrics_snapshot(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_onion_set_enabled(`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -1018,6 +1022,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_link_teardown() != 2573.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_local_nat_report() != 54275.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_metrics_snapshot() != 47202.toShort()) {
@@ -1288,6 +1295,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 
     override fun write(value: ULong, buf: ByteBuffer) {
         buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterLong: FfiConverter<Long, Long> {
+    override fun lift(value: Long): Long {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Long {
+        return buf.getLong()
+    }
+
+    override fun lower(value: Long): Long {
+        return value
+    }
+
+    override fun allocationSize(value: Long) = 8UL
+
+    override fun write(value: Long, buf: ByteBuffer) {
+        buf.putLong(value)
     }
 }
 
@@ -1786,6 +1816,79 @@ public object FfiConverterTypeEdgeMetricsSnapshot: FfiConverterRustBuffer<EdgeMe
             FfiConverterMapStringDouble.write(value.`gauges`, buf)
             FfiConverterString.write(value.`snapshotAt`, buf)
             FfiConverterULong.write(value.`windowSeconds`, buf)
+    }
+}
+
+
+
+data class EdgeNatReport (
+    var `mapping`: kotlin.String
+    , 
+    var `allocation`: kotlin.String
+    , 
+    var `filtering`: kotlin.String
+    , 
+    var `portPreserving`: kotlin.Boolean?
+    , 
+    var `routerMapping`: kotlin.String
+    , 
+    var `family`: kotlin.String
+    , 
+    var `evidence`: kotlin.String
+    , 
+    var `legacyClass`: kotlin.String
+    , 
+    var `measuredAt`: kotlin.Long
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeNatReport: FfiConverterRustBuffer<EdgeNatReport> {
+    override fun read(buf: ByteBuffer): EdgeNatReport {
+        return EdgeNatReport(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalBoolean.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterLong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeNatReport) = (
+            FfiConverterString.allocationSize(value.`mapping`) +
+            FfiConverterString.allocationSize(value.`allocation`) +
+            FfiConverterString.allocationSize(value.`filtering`) +
+            FfiConverterOptionalBoolean.allocationSize(value.`portPreserving`) +
+            FfiConverterString.allocationSize(value.`routerMapping`) +
+            FfiConverterString.allocationSize(value.`family`) +
+            FfiConverterString.allocationSize(value.`evidence`) +
+            FfiConverterString.allocationSize(value.`legacyClass`) +
+            FfiConverterLong.allocationSize(value.`measuredAt`)
+    )
+
+    override fun write(value: EdgeNatReport, buf: ByteBuffer) {
+            FfiConverterString.write(value.`mapping`, buf)
+            FfiConverterString.write(value.`allocation`, buf)
+            FfiConverterString.write(value.`filtering`, buf)
+            FfiConverterOptionalBoolean.write(value.`portPreserving`, buf)
+            FfiConverterString.write(value.`routerMapping`, buf)
+            FfiConverterString.write(value.`family`, buf)
+            FfiConverterString.write(value.`evidence`, buf)
+            FfiConverterString.write(value.`legacyClass`, buf)
+            FfiConverterLong.write(value.`measuredAt`, buf)
     }
 }
 
@@ -3276,6 +3379,38 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeEdgeNatReport: FfiConverterRustBuffer<EdgeNatReport?> {
+    override fun read(buf: ByteBuffer): EdgeNatReport? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeEdgeNatReport.read(buf)
+    }
+
+    override fun allocationSize(value: EdgeNatReport?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeEdgeNatReport.allocationSize(value)
+        }
+    }
+
+    override fun write(value: EdgeNatReport?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeEdgeNatReport.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeEdgePeerFilter: FfiConverterRustBuffer<EdgePeerFilter?> {
     override fun read(buf: ByteBuffer): EdgePeerFilter? {
         if (buf.get().toInt() == 0) {
@@ -4111,6 +4246,17 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
         FfiConverterByteArray.lower(`linkId`),_status)
 }
     
+    
+
+    @Throws(EdgeBindingsException::class) fun `localNatReport`(): EdgeNatReport? {
+            return FfiConverterOptionalTypeEdgeNatReport.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_local_nat_report(
+    
+        _status)
+}
+    )
+    }
     
 
     @Throws(EdgeBindingsException::class) fun `metricsSnapshot`(): EdgeMetricsSnapshot {

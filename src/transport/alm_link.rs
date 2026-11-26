@@ -19,6 +19,9 @@ pub struct AvLinkStats {
     pub srtt_ms: Option<f64>,
     /// Minimum RTT (ms), the propagation floor.
     pub min_rtt_ms: Option<u64>,
+    /// The queue-aware smoothed RTT (ms): leviculum's learned estimate,
+    /// which follows queue delay (`srtt_ms` is first tries only, Karn).
+    pub learned_srtt_ms: Option<f64>,
     /// Cumulative sends refused because the Channel window was full.
     pub busy_rejections: u64,
     /// Cumulative sends refused by the link pacer.
@@ -39,11 +42,13 @@ pub struct AvLinkStats {
 }
 
 impl AvLinkStats {
-    /// Queueing delay above the propagation floor (ms): `srtt − min_rtt`.
+    /// Queueing delay above the propagation floor (ms): `learned_srtt −
+    /// min_rtt` (the first-try `srtt` stays at the floor while a queue
+    /// builds), `srtt − min_rtt` where no learned figure is held.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn queue_delay_ms(&self) -> f64 {
-        match (self.srtt_ms, self.min_rtt_ms) {
+        match (self.learned_srtt_ms.or(self.srtt_ms), self.min_rtt_ms) {
             (Some(s), Some(m)) => (s - m as f64).max(0.0),
             _ => 0.0,
         }

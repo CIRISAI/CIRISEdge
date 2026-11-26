@@ -262,6 +262,9 @@ async fn transport_node_on_free_ports() -> (ReticulumNode, u16, u16) {
 
 async fn try_transport_node(tcp_port: u16, facilitator_port: u16) -> Result<ReticulumNode, String> {
     let storage = tempfile::tempdir().expect("tempdir");
+    // `DirectLinkSettings` is #[non_exhaustive]: from its default.
+    let mut facilitator = leviculum_std::direct_link::DirectLinkSettings::default();
+    facilitator.facilitator_port = Some(facilitator_port);
     let mut node = ReticulumNodeBuilder::new()
         .enable_transport(true)
         .add_interface_config(leviculum_std::config::InterfaceConfig {
@@ -272,10 +275,7 @@ async fn try_transport_node(tcp_port: u16, facilitator_port: u16) -> Result<Reti
             ingress_control: Some(false),
             ..Default::default()
         })
-        .direct_link(leviculum_std::direct_link::DirectLinkSettings {
-            facilitator_port: Some(facilitator_port),
-            ..Default::default()
-        })
+        .direct_link(facilitator)
         .storage_path(storage.path().to_path_buf())
         .build()
         .await
@@ -702,6 +702,19 @@ async fn next_event(
     }
 }
 
+/// A node that answers a direct-link proposal and never proposes. Since
+/// leviculum v0.34.0+ciris.4 a node answers only by probing a facilitator of
+/// its OWN (it no longer probes one a peer names), so the answering side
+/// names one too; a node with none refuses the proposal as unsupported.
+fn answerer() -> DirectLinksConfig {
+    DirectLinksConfig {
+        proposing: ciris_edge::transport::direct_path::Proposing::Off,
+        // Replaced by T's facilitator in `trio`.
+        facilitator: Some(String::new()),
+        ..DirectLinksConfig::default()
+    }
+}
+
 fn proposer() -> DirectLinksConfig {
     DirectLinksConfig {
         // Replaced by T's facilitator in `trio`.
@@ -845,7 +858,7 @@ async fn a_link_that_goes_direct_shapes_at_the_mdu_and_closes_when_it_falls_back
     let mut p = trio_shaped(
         "up",
         proposer(),
-        DirectLinksConfig::default(),
+        answerer(),
         None,
         None,
         Some((policy.clone(), policy)),
@@ -919,7 +932,7 @@ async fn an_off_node_gives_a_shaped_only_peer_a_shaped_link_on_a_direct_path() {
     let mut p = trio_shaped(
         "asked",
         proposer(),
-        DirectLinksConfig::default(),
+        answerer(),
         None,
         None,
         Some((shaping_all(true), ShapingPolicy::default())),
@@ -976,7 +989,7 @@ async fn off_with_off_stays_unshaped_on_a_direct_path() {
     let mut p = trio_shaped(
         "offoff",
         proposer(),
-        DirectLinksConfig::default(),
+        answerer(),
         None,
         None,
         Some((ShapingPolicy::default(), ShapingPolicy::default())),
@@ -1011,7 +1024,7 @@ async fn a_required_shaped_link_proposes_before_it_refuses_and_the_rung_opens() 
     let mut p = trio_shaped(
         "rung",
         proposer(),
-        DirectLinksConfig::default(),
+        answerer(),
         None,
         None,
         Some((shaping_all(true), shaping_all(false))),
@@ -1059,7 +1072,7 @@ async fn a_required_shaped_link_proposes_before_it_refuses_and_the_rung_opens() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
     // B on the default: accept room peers, asked per request.
-    let mut p = trio("w1", proposer(), DirectLinksConfig::default()).await;
+    let mut p = trio("w1", proposer(), answerer()).await;
     assert!(!p.facilitator.is_empty());
     let (_spine, b_addr) = open_call(&p).await;
     let mut arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");
@@ -1246,7 +1259,7 @@ async fn a_refused_upgrade_leaves_the_dial_as_it_was() {
 /// address of B's was learned or sent), and B never moves anything direct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_outside_our_rooms_is_refused_and_learns_nothing() {
-    let mut p = trio("w6", proposer(), DirectLinksConfig::default()).await;
+    let mut p = trio("w6", proposer(), answerer()).await;
     let (_spine, b_addr) = open_call_with(&p, false).await;
     assert!(!p.b.transport.should_accept_direct(&p.a.key.key_id));
     let _ = p.a.transport.open_av_link(&p.b.key.key_id, &b_addr).await;
@@ -1336,7 +1349,11 @@ async fn quad(tag: &str) -> Quad {
         key_b,
         &dirs[2],
         &tmp.path().join("b"),
-        client(DirectLinksConfig::default()),
+        client(DirectLinksConfig {
+            proposing: ciris_edge::transport::direct_path::Proposing::Off,
+            facilitator: Some(format!("127.0.0.1:{f_port}")),
+            ..DirectLinksConfig::default()
+        }),
     )
     .await;
     let c = side_cfg(
@@ -1573,8 +1590,12 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
             delivered.lock().unwrap().contains(&(seq - 1))
         })
         .await,
-        "B hears A over R: {:?}",
-        delivered.lock().unwrap()
+        "B hears A over R: {:?}; R booked congested {:?}; A {:?}; R {:?}; B {:?}",
+        delivered.lock().unwrap(),
+        admissions.congested_drops(),
+        q.a.metrics.av_plane(),
+        q.r.metrics.av_plane(),
+        q.b.metrics.av_plane()
     );
 
     // The direct leg: A's dial punches through R and reaches B directly.
@@ -2386,7 +2407,7 @@ async fn a_host_signing_as_another_id_builds_and_is_refused_by_name() {
 /// and the room's later traffic rides it, with `T` gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_send_to_a_room_peer_brings_the_link_direct_915() {
-    let mut p = trio("r915", proposer(), DirectLinksConfig::default()).await;
+    let mut p = trio("r915", proposer(), answerer()).await;
     // The room is shared both ways; no A/V leg is dialled.
     let (_spine, _b_addr) = open_call(&p).await;
     assert!(p.b.transport.should_accept_direct(&p.a.key.key_id));
@@ -2434,7 +2455,7 @@ async fn a_send_to_a_room_peer_brings_the_link_direct_915() {
 /// nothing: a proposal reveals this node's public address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_send_outside_every_room_proposes_nothing_915() {
-    let p = trio("n915", proposer(), DirectLinksConfig::default()).await;
+    let p = trio("n915", proposer(), answerer()).await;
     p.a.transport
         .send(&p.b.key.key_id, b"no-room-915")
         .await
@@ -2512,7 +2533,7 @@ async fn a_peer_that_refused_before_joining_the_room_comes_up_direct_once_it_joi
 /// (`a_send_outside_every_room_proposes_nothing_915`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consented_contacts_go_direct_without_a_room() {
-    let mut p = trio("c1030", proposer(), DirectLinksConfig::default()).await;
+    let mut p = trio("c1030", proposer(), answerer()).await;
     assert!(!p.b.transport.should_accept_direct(&p.a.key.key_id));
     assert!(p.a.transport.allow_direct_contact(&p.b.key.key_id));
     assert!(p.b.transport.allow_direct_contact(&p.a.key.key_id));
@@ -2550,7 +2571,7 @@ async fn consented_contacts_go_direct_without_a_room() {
 /// minutes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_punched_link_that_stops_acking_is_retired_by_the_stall_guard() {
-    let mut p = trio("w926", proposer(), DirectLinksConfig::default()).await;
+    let mut p = trio("w926", proposer(), answerer()).await;
     let (_spine, b_addr) = open_call(&p).await;
     let _arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");
     let _link =
@@ -2891,14 +2912,7 @@ async fn one_side_moves_the_other_sends(
     } else {
         (Some(Arc::clone(&held)), None)
     };
-    let mut p = trio_uplink(
-        tag,
-        proposer(),
-        DirectLinksConfig::default(),
-        a_uplink,
-        b_uplink,
-    )
-    .await;
+    let mut p = trio_uplink(tag, proposer(), answerer(), a_uplink, b_uplink).await;
     held.store(u64::try_from(HOLD.as_millis()).unwrap(), Ordering::Relaxed);
     // A's first send, before any room: the link exists and nothing proposes.
     p.a.transport
@@ -3039,7 +3053,7 @@ async fn call_on_a_punched_interface(
     ciris_edge::transport::av_sink::AcceptedAvArrival,
     [u8; 16],
 ) {
-    let mut p = trio(tag, proposer(), DirectLinksConfig::default()).await;
+    let mut p = trio(tag, proposer(), answerer()).await;
     let mut arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");
     let (spine, b_addr) = open_call(&p).await;
     let leg =
@@ -3126,7 +3140,7 @@ async fn a_call_on_a_punched_interface_outlives_the_inbound_idle_bound() {
 /// link with no call ages too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wedged_punched_link_with_no_call_is_still_reaped() {
-    let mut p = trio("reap-wedge", proposer(), DirectLinksConfig::default()).await;
+    let mut p = trio("reap-wedge", proposer(), answerer()).await;
     let (_spine, _b_addr) = open_call(&p).await;
     p.a.transport
         .send(&p.b.key.key_id, b"go-direct")
@@ -3188,7 +3202,7 @@ fn census(side: &Side) -> ciris_edge::observability::EdgeMetricsBundle {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // one witness, read top to bottom
 async fn links_peers_and_lifetimes_are_counted_by_medium_and_cause_1025() {
-    let mut p = trio("c1025", proposer(), DirectLinksConfig::default()).await;
+    let mut p = trio("c1025", proposer(), answerer()).await;
     let a0 = census(&p.a);
     assert_eq!(a0.links_active.len(), 20, "every key present");
     assert_eq!(a0.distinct_peers_1h, 0);
@@ -3336,4 +3350,110 @@ async fn links_peers_and_lifetimes_are_counted_by_medium_and_cause_1025() {
         1
     );
     assert_eq!(flat.counters["links_active.udp-direct:outbound"], 0);
+}
+
+// ─── CIRISEdge#1028: an anonymous identity never upgrades ───────────────
+
+/// Turn `side`'s Anonymous Tier on: opted in, with a dealt period whose every
+/// layer answers (CC 5.4.6). `tier()` is then `Ok`.
+fn anonymous(side: &Side) {
+    use ciris_edge::onion::policy::OnionPolicy;
+    use ciris_edge::transport::onion_layers::{deal_layers, RelayCandidate};
+    use ciris_edge::transport::onion_liveness::LivenessEvidence;
+    let onion = side.transport.onion();
+    onion.set_policy(OnionPolicy {
+        enabled: true,
+        ..OnionPolicy::default()
+    });
+    let mut ids: Vec<String> = (0..8).map(|i| format!("relay-1028-{i}")).collect();
+    ids.push(side.key.key_id.clone());
+    let candidates: Vec<RelayCandidate> = ids
+        .iter()
+        .map(|k| RelayCandidate {
+            key_id: k.clone(),
+            is_seat: true,
+            relay_standing: false,
+            row_live: true,
+            announced: true,
+            hop_key_valid: true,
+            opted_out: false,
+            owner_bound_under_bundle_root: true,
+        })
+        .collect();
+    let deal = deal_layers(&candidates, 5, 2);
+    assert!(deal.available, "the deal meets every layer's floor");
+    for k in deal.layers.iter().flatten() {
+        onion.observe(k, LivenessEvidence::ShapedLinkUp);
+    }
+    onion.install_deal(deal);
+    assert_eq!(onion.tier(), Ok(()), "the tier is active");
+}
+
+/// **#1028** — a node whose Anonymous Tier is active ANSWERS a direct-link
+/// request with a refusal: accepting would hand the proposer (and the
+/// facilitator) this node's reflexive address, and an anonymous identity holds
+/// only layer and rendezvous links (CC 5.4.6). A shares a room with B and
+/// proposes on its send, as #915 does; B refuses, nothing goes direct. Red
+/// before: B accepted (the room was all it asked).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anonymous_node_refuses_a_direct_link_request_1028() {
+    let mut p = trio("a1028", proposer(), answerer()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    anonymous(&p.b);
+    p.a.transport
+        .send(&p.b.key.key_id, b"room-1028")
+        .await
+        .expect("A's send to B ships through T");
+    let asked = next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Requested { .. })
+    })
+    .await
+    .expect("B's host was asked");
+    assert!(
+        matches!(
+            &asked,
+            DirectPathEvent::Requested {
+                accepted: false,
+                ..
+            }
+        ),
+        "an anonymous node refuses: {asked:?}"
+    );
+    let failed = next_event(&mut p.a.events, Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            DirectPathEvent::Failed { .. } | DirectPathEvent::Established { .. }
+        )
+    })
+    .await
+    .expect("A's outcome");
+    assert!(
+        matches!(&failed, DirectPathEvent::Failed { .. }),
+        "nothing goes direct: {failed:?}"
+    );
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_refused"), 1);
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_accepted"), 0);
+    assert_eq!(p.b.metrics.direct_links_active(), 0);
+}
+
+/// **#1028** — a node whose Anonymous Tier is active PROPOSES nothing: a
+/// proposal reveals its address to the peer and makes it probe the
+/// facilitator. Its send to a room peer (#915's proposal hook) ships and
+/// proposes nothing; the peer is never asked. Red before: A proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anonymous_node_proposes_no_direct_link_1028() {
+    let mut p = trio("p1028", proposer(), answerer()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    anonymous(&p.a);
+    p.a.transport
+        .send(&p.b.key.key_id, b"room-1028")
+        .await
+        .expect("A's send to B ships through T");
+    let asked = next_event(&mut p.b.events, Duration::from_secs(10), |e| {
+        matches!(e, DirectPathEvent::Requested { .. })
+    })
+    .await;
+    assert!(asked.is_none(), "B is never asked: {asked:?}");
+    assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 0);
+    assert_eq!(p.a.metrics.direct_links_active(), 0);
 }

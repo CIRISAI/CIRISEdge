@@ -9,10 +9,13 @@
 //! What it runs:
 //!
 //! - **This node's stream, as parent 0**: an [`Admission`] (C2) answering the
-//!   other members' C3 `SUBSCRIBE`s. A small room starts as the full mesh it
-//!   always was (the publisher's probe allowance is the room, up to
-//!   [`PUBLISHER_INITIAL_FANOUT`]); measured congestion then sheds the most
-//!   recent subscribers to member relays (T7).
+//!   other members' C3 `SUBSCRIBE`s. A publisher starts at
+//!   [`PUBLISHER_INITIAL_PROBE`] direct children into an unmeasured uplink
+//!   and widens one step a clean window while members wait (G8 slow
+//!   start: the rest hear it through the first child meanwhile); measured
+//!   congestion, or an uplink-stall verdict, sheds the most recent
+//!   subscribers to member relays (T7) and holds the probe
+//!   [`STALL_PROBE_HOLD_MS`].
 //! - **Every other member's stream, as subscriber**: a [`ParentSelector`]
 //!   (C4/C6) choosing among the publisher itself and the members that
 //!   forward it, from their C3 `OFFER`s. Room membership gates candidacy
@@ -33,6 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use super::rxmove::{self, LatencyFloor, Reading};
 use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av::StreamId;
 use crate::transport::realtime_av_alm::controller::wire::{
@@ -41,15 +45,68 @@ use crate::transport::realtime_av_alm::controller::wire::{
 };
 use crate::transport::realtime_av_alm::controller::{
     Admission, AdmitDecision, ChunkPos, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
-    DecisionLog, EgressMeter, ParentSelector, PathChunk, RefuseReason, Role, SelectorAction,
-    ShedReason, SplitMix64, SubscribeRequest,
+    DecisionLog, EgressMeter, EgressWindow, ParentSelector, PathChunk, RefuseReason, Role,
+    SelectorAction, ShedReason, SplitMix64, SubscribeRequest,
 };
 
 /// How often a forwarder offers each stream it can serve.
 pub(super) const OFFER_EVERY_MS: u64 = 1_000;
-/// The publisher's starting probe allowance, in streams: a small room is
-/// served as the full mesh it was; measurement then rules.
-pub(super) const PUBLISHER_INITIAL_FANOUT: u64 = 8;
+/// The publisher's starting probe allowance, in streams (G8 slow start): an
+/// unmeasured uplink takes two copies first (a three-person room is the full
+/// mesh it was), and the probe widens while members wait for it. Full fan-out from the first
+/// chunk overloaded a capped uplink at once (the 45.1.9 matrix: 250 kbit
+/// against three copies of ~190).
+pub(super) const PUBLISHER_INITIAL_PROBE: u64 = 2;
+/// G8 — after an uplink-stall verdict, how long nothing widens this node's
+/// rooms (`Admission::hold_probe`).
+pub(super) const STALL_PROBE_HOLD_MS: u64 = 10_000;
+/// Row B1b — under a latched stall verdict, how often a member that holds no
+/// commitment here is sent this node's offers (the leg's liveness minimum).
+pub(super) const STALL_NONCHILD_OFFER_MS: u64 = 2_000;
+/// Row B2 — the longest a non-child's offer interval stretches under the
+/// budget (the model accepts ~3.5 s of dead detection on such a leg).
+pub(super) const STALL_NONCHILD_OFFER_MAX_MS: u64 = 3_500;
+/// Row B2 — what one sealed offer costs on the wire beyond its plaintext
+/// (E1 link seal, the Channel and RNS headers), for the budget's arithmetic.
+const OFFER_WIRE_OVERHEAD: usize = 120;
+
+/// Row B2, the transition: latched verdict → this node's periodic control
+/// (its offers) stays within ¼ of what the uplink carries beyond one media
+/// copy (`ceiling − one`, the admission's measured ceiling). Children and
+/// parents keep 1 s (F14a); the non-children's interval stretches from
+/// [`STALL_NONCHILD_OFFER_MS`] up to [`STALL_NONCHILD_OFFER_MAX_MS`] to fit
+/// what is left. Unmeasured: the 2 s minimum.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub(super) fn stall_offer_interval_ms(
+    ceiling_bps: Option<f64>,
+    one_copy_bps: u64,
+    offer_len: usize,
+    keep: usize,
+    rest: usize,
+) -> u64 {
+    let Some(c) = ceiling_bps else {
+        return STALL_NONCHILD_OFFER_MS;
+    };
+    let budget = ((c - one_copy_bps as f64) / 4.0).max(0.0);
+    let bits = ((offer_len + OFFER_WIRE_OVERHEAD) * 8) as f64;
+    let left = budget - keep as f64 * bits;
+    if rest == 0 {
+        return STALL_NONCHILD_OFFER_MS;
+    }
+    if left <= 0.0 {
+        return STALL_NONCHILD_OFFER_MAX_MS;
+    }
+    let ms = (rest as f64 * bits * 1000.0 / left).ceil() as u64;
+    ms.clamp(STALL_NONCHILD_OFFER_MS, STALL_NONCHILD_OFFER_MAX_MS)
+}
+/// G8 slow start — how long a member refused for room still gets the
+/// publisher's chunks: two offer periods, so a child's OFFER has reached it
+/// and it has moved before the bridge ends.
+pub(super) const SLOW_START_BRIDGE_MS: u64 = 2 * OFFER_EVERY_MS;
 /// How long a C3 peer that has not yet chosen a parent for this node's
 /// stream keeps receiving it (the join gap: join jitter + one offer + one
 /// round trip). Past it, a peer that chose nothing gets nothing.
@@ -139,6 +196,20 @@ pub struct AlmParents {
     pub parent_changes: u64,
 }
 
+/// Calls cut — what a relay forwarded to one child node
+/// ([`super::Call::relayed_to`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayedTo {
+    /// The child node.
+    pub child: String,
+    /// Bytes forwarded to it (each chunk's sealed size on the wire).
+    pub bytes: u64,
+    /// Chunks forwarded to it.
+    pub chunks: u64,
+    /// The streams forwarded to it.
+    pub streams: Vec<StreamId>,
+}
+
 /// What the ALM counted on a call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlmCounts {
@@ -161,15 +232,24 @@ pub struct AlmCounts {
     /// Legs shed to the base layer under congestion (C5).
     pub legs_shed_to_base: u64,
     /// `OFFER`s claiming depth 0 from anyone but the stream's publisher, or
-    /// before its binding arrived, dropped.
+    /// before its binding arrived, or a serve seat's for a stream it does not
+    /// publish, dropped.
     pub offers_refused: u64,
+    /// Calls cut — bytes this node forwarded as a media parent (each chunk's
+    /// sealed size), to every child.
+    pub relayed_bytes: u64,
 }
 
 /// The call's ALM controller state (see the module docs).
+#[allow(clippy::struct_excessive_bools)] // independent switches, each its own lever
 pub(super) struct AlmState {
     me: String,
     cfg: ControllerConfig,
     t0: Instant,
+    /// Tests only: the clock a simulated world sets, so a sim's time is the
+    /// world's steps and never the host's compute time.
+    #[cfg(test)]
+    sim_now_ms: Option<u64>,
     rng: SplitMix64,
     log: DecisionLog,
     own_stream: StreamId,
@@ -201,12 +281,17 @@ pub(super) struct AlmState {
     last_primary: BTreeMap<StreamId, Option<String>>,
     egress: EgressMeter,
     leg_queue_ms: BTreeMap<String, f64>,
+    /// Row ProbeAfterDrain — out legs that cannot read as drained now: their
+    /// queue gauge is unmeasured (no `min_rtt` yet, or right after a path
+    /// move) or a Channel message is still outstanding on them.
+    leg_busy: BTreeSet<String>,
     members: Vec<String>,
     tier: ServiceTier,
     own_rate: Rate,
     rates: BTreeMap<StreamId, Rate>,
     forwarded_seen: BTreeMap<StreamId, SeenRing>,
-    min_offset: BTreeMap<StreamId, (i64, u64)>,
+    /// RM1 — each received stream's latency floor ([`LatencyFloor`]).
+    min_offset: BTreeMap<StreamId, LatencyFloor>,
     last_offer_ms: u64,
     pub(super) counts: AlmCounts,
     pub(super) labels: Vec<&'static str>,
@@ -227,7 +312,95 @@ pub(super) struct AlmState {
     /// every SUBSCRIBE it sends a parent that takes one.
     wanted_layers: BTreeMap<StreamId, crate::transport::realtime_av::ReceiverLayerPolicy>,
     pub(super) events: Vec<super::CallEvent>,
+    /// Calls cut — this node is a serve seat (a canonical): it never relays
+    /// call media, audio included, whatever the host asked
+    /// ([`CANONICAL_AV_FALLBACK`] off).
+    serve_seat: bool,
+    /// Calls cut — the serve seats this node knows of: their OFFERs for a
+    /// stream they do not publish are dropped (or, with the lever on, put on
+    /// the canonical tier).
+    seats: BTreeSet<String>,
+    /// Calls cut — streams a serve seat offered and this node refused: the
+    /// media-path event's `refused_by_policy` when no member offered.
+    seat_offered: BTreeSet<StreamId>,
+    /// Calls cut — the last `RelayStatus` emitted, and the one seen last tick
+    /// (a value is emitted only after it holds for one tick).
+    relay_status: Option<(bool, u16)>,
+    relay_status_pending: Option<(bool, u16)>,
+    /// Calls cut — primary-parent changes since the call last read them:
+    /// `(stream, new primary)`, for the media-path event.
+    pub(super) parent_moves: Vec<(StreamId, Option<String>)>,
+    /// Calls cut — per child node: bytes, chunks and streams forwarded.
+    relayed: BTreeMap<String, (u64, u64, BTreeSet<StreamId>)>,
+    /// G8 — this node's uplink is stalled: its legs' Channels hold messages
+    /// unproved far past the RTT floor ([`UPLINK_STALL_MS`] on at least
+    /// [`UPLINK_STALL_LEGS`] legs). On a datagram uplink this is the only
+    /// sender-side sign of a bottleneck past the process (a router, a
+    /// bufferbloated cellular queue): the egress meter's refusals never
+    /// come (`path_meter` "Limit: datagram legs").
+    uplink_stall: bool,
+    /// G8 — when the stall was last detected: the verdict holds
+    /// [`UPLINK_STALL_LATCH_MS`] past it (the stalled legs' links can die,
+    /// and their detection with them, before the queue has drained).
+    uplink_stall_seen_ms: Option<u64>,
+    /// G8 — frames made between ticks (the shed on a stall's rise), sent
+    /// with the next tick's.
+    pending_out: Vec<Outgoing>,
+    /// Row B1b — when each peer was last sent this node's offers.
+    offered_at: BTreeMap<String, u64>,
+    /// RM5 — when this node last published each of its own streams (call
+    /// ms): a stream published within [`STREAM_LIVE_MS`] is live.
+    own_published_ms: BTreeMap<StreamId, u64>,
+    /// RM2 — each (stream, delivering peer)'s latency readings.
+    readings: BTreeMap<(StreamId, String), Reading>,
+    /// RM2 — streams in a late episode this node already moved in (one move
+    /// an episode); the episode ends when the primary reads on time.
+    late_moved: BTreeSet<StreamId>,
+    /// RM4/RM6 — streams whose current late episode was already counted as
+    /// spared or guarded (one label an episode, not one a tick).
+    late_noted: BTreeSet<StreamId>,
+    /// RM4 — offer periods so far (rotates the order offers go out in).
+    offer_round: u64,
 }
+
+/// RM5 — an own stream published this recently is live: a direct child's
+/// departure from it is read as congestion.
+pub(super) const STREAM_LIVE_MS: u64 = 2_000;
+
+/// G8 — a leg whose oldest unproved Channel message has waited this long is
+/// stalled: far above any propagation floor this mesh runs at, and under
+/// leviculum's ~1.3 s retry budget (leviculum#113).
+pub(super) const UPLINK_STALL_MS: u64 = 400;
+/// G8 — how many stalled legs make it the UPLINK (not one slow peer). With
+/// one leg (a two-person call) there is no verdict, and none is needed: a
+/// publisher with one child has nothing to shed.
+pub(super) const UPLINK_STALL_LEGS: usize = 2;
+/// G8 — the earlier verdict: a leg's oldest unproved Channel message is
+/// BACKLOGGED when it was already unproved at the previous watch tick (its
+/// age is rising) and has waited this long past the leg's own RTT floor
+/// (`min_rtt`, so a long but uncongested path is not a queue). The uplink is
+/// stalled when EVERY leg with something unproved is backlogged and there
+/// are at least [`UPLINK_STALL_LEGS`] of them: one slow peer is one leg, and
+/// a leg that proves its messages in time vetoes the verdict.
+pub(super) const UPLINK_BACKLOG_MS: u64 = 200;
+/// G8 — how long a stall verdict holds after its last detection: about the
+/// time a shed publisher's queue takes to drain the backlog its legs saw.
+pub(super) const UPLINK_STALL_LATCH_MS: u64 = 2_000;
+
+/// **The canonical audio fallback lever** (`FSD/CIRIS_MESH.md` §6.4; Eric
+/// 2026-11-21: no traffic on the canonical, audio included, while the mesh
+/// scales). Off: a serve seat never relays call media, and a receiver drops a
+/// serve seat's `OFFER` for a stream the seat does not publish. On: the seat
+/// may relay and receivers place it on the canonical tier (never video, an
+/// audio standby only, [`ParentSelector::set_tier`]). Off for 45.x.
+pub const CANONICAL_AV_FALLBACK: bool = false;
+
+/// The `ShedReason` a relay that turned off sends its children. An older
+/// peer refuses an unknown shed code as malformed and would then wait out
+/// the silence, so the wire carries `UpstreamLost` (the child fails over at
+/// once) and the precise reason is the local label
+/// [`crate::observability::ALM_RELAY_OFF_SHED`].
+const RELAY_OFF_WIRE_REASON: ShedReason = ShedReason::UpstreamLost;
 
 impl AlmState {
     /// A fresh state for `me` publishing `own_stream` in a room of `members`.
@@ -243,13 +416,18 @@ impl AlmState {
         cfg.direct_first = true;
         let mut own = Admission::publisher(me.to_owned(), cfg.clone(), None);
         own.set_members(members.iter().cloned());
-        let fanout = (members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);
-        own.set_probe_streams(fanout);
+        own.set_slow_start(true);
+        own.set_probe_backoff(true);
+        own.set_shed_on_verdict_only(true);
+        own.set_shed_rank(Some(own_stream.0));
+        own.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         Self {
             me: me.to_owned(),
             egress: EgressMeter::new(cfg.meter_window_ms, cfg.congestion_queue_ms),
             cfg,
             t0: Instant::now(),
+            #[cfg(test)]
+            sim_now_ms: None,
             rng: SplitMix64(seed),
             log: DecisionLog::new(64),
             own_stream,
@@ -268,6 +446,7 @@ impl AlmState {
             draining_parent: BTreeMap::new(),
             last_primary: BTreeMap::new(),
             leg_queue_ms: BTreeMap::new(),
+            leg_busy: BTreeSet::new(),
             members: members.to_vec(),
             tier: ServiceTier::FullOps,
             own_rate: Rate::default(),
@@ -285,11 +464,268 @@ impl AlmState {
             layer_caps: BTreeMap::new(),
             wanted_layers: BTreeMap::new(),
             events: Vec::new(),
+            serve_seat: false,
+            seats: BTreeSet::new(),
+            seat_offered: BTreeSet::new(),
+            relay_status: None,
+            relay_status_pending: None,
+            parent_moves: Vec::new(),
+            relayed: BTreeMap::new(),
+            uplink_stall: false,
+            uplink_stall_seen_ms: None,
+            pending_out: Vec::new(),
+            offered_at: BTreeMap::new(),
+            own_published_ms: BTreeMap::new(),
+            readings: BTreeMap::new(),
+            late_moved: BTreeSet::new(),
+            late_noted: BTreeSet::new(),
+            offer_round: 0,
         }
+    }
+
+    /// G8 serial redial — whether this node's own stream carried media in
+    /// its last measured window (a silent listener's legs carry no media).
+    pub(super) fn publishing(&self) -> bool {
+        self.own_rate.full_bps > 0.0 || self.own_rate.win_full > 0
+    }
+
+    /// G8 — whether the stall verdict holds now (detected, or latched).
+    pub(super) fn uplink_stalled(&self) -> bool {
+        self.uplink_stall
+    }
+
+    /// G8 — whether this watch tick DETECTED this node's uplink stalled (the
+    /// call reads its legs' unproved Channel ages). The verdict holds
+    /// [`UPLINK_STALL_LATCH_MS`] past the last detection. On its rise it is
+    /// counted and this node sheds AT ONCE, not at the next egress window:
+    /// at 2-3x overload the stalled legs' links die (Channel retry
+    /// exhaustion, ~1.3 s) before a window closes, and their detection with
+    /// them (CIRISEdge 45.2.0, the capped witness: verdict 1, shed 0). The
+    /// shed keeps ONE direct child (LIFO) and lets the relay work go. While
+    /// the verdict holds, every egress window reads congested at that room.
+    /// Offers keep their cadence (row D1): only a BACKLOGGED leg's offer is
+    /// held, at the send (`alm_offer_held:backlog`).
+    pub(super) fn set_uplink_stall(&mut self, detected: bool) {
+        let now = self.now_ms();
+        if detected {
+            self.uplink_stall_seen_ms = Some(now);
+        }
+        let stalled = self
+            .uplink_stall_seen_ms
+            .is_some_and(|t| now.saturating_sub(t) < UPLINK_STALL_LATCH_MS);
+        let rose = stalled && !self.uplink_stall;
+        self.uplink_stall = stalled;
+        if detected {
+            // No upward re-probe until a hold past the last detection.
+            let until = now.saturating_add(STALL_PROBE_HOLD_MS);
+            self.own.hold_probe(until);
+            for (a, _) in self.shares.values_mut() {
+                a.hold_probe(until);
+            }
+            for a in self.relays.values_mut() {
+                a.hold_probe(until);
+            }
+        }
+        if rose {
+            self.label(crate::observability::ALM_UPLINK_STALL);
+            // Nobody unsubscribed keeps this node's own chunks on a stalled
+            // uplink (the provisional join window, the slow-start bridge).
+            let own: Vec<StreamId> = self.own_admissions().map(|(s, _)| s).collect();
+            self.provisional.retain(|(s, _), _| !own.contains(s));
+            let w = EgressWindow {
+                sent_bps: 0.0,
+                delivered_bps: 0.0,
+                dropped_bytes: 0,
+                max_queue_ms: 0.0,
+                congested: true,
+                capacity_bps: None,
+            };
+            let out = self.fold_egress_window(now, w);
+            self.pending_out.extend(out);
+        }
+    }
+
+    /// Calls cut — one chunk of `stream` forwarded to `child`.
+    pub(super) fn note_relayed(&mut self, child: &str, stream: StreamId, wire_bytes: u64) {
+        self.counts.relayed_bytes = self.counts.relayed_bytes.saturating_add(wire_bytes);
+        let e = self.relayed.entry(child.to_owned()).or_default();
+        e.0 = e.0.saturating_add(wire_bytes);
+        e.1 = e.1.saturating_add(1);
+        e.2.insert(stream);
+    }
+
+    /// Calls cut — what this node forwarded, per child node.
+    pub(super) fn relayed_to(&self) -> Vec<RelayedTo> {
+        self.relayed
+            .iter()
+            .map(|(child, (bytes, chunks, streams))| RelayedTo {
+                child: child.clone(),
+                bytes: *bytes,
+                chunks: *chunks,
+                streams: streams.iter().copied().collect(),
+            })
+            .collect()
+    }
+
+    /// Calls cut — this node is a serve seat: with [`CANONICAL_AV_FALLBACK`]
+    /// off it never relays, so relaying turns off at once (its children
+    /// fail over make-before-break) and stays off.
+    pub(super) fn set_serve_seat(&mut self, seat: bool) -> Vec<Outgoing> {
+        self.serve_seat = seat && !CANONICAL_AV_FALLBACK;
+        if self.serve_seat {
+            self.set_relay(false)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Calls cut — the serve seats this node knows of (the canonical set).
+    pub(super) fn set_seats(&mut self, seats: impl IntoIterator<Item = String>) {
+        self.seats = seats.into_iter().collect();
+        if CANONICAL_AV_FALLBACK {
+            let seats: Vec<String> = self.seats.iter().cloned().collect();
+            for sel in self.sels.values_mut() {
+                for p in &seats {
+                    sel.set_tier(
+                        p,
+                        crate::transport::realtime_av_alm::controller::Tier::Canonical,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether this node offers relay now.
+    pub(super) fn relay_capable(&self) -> bool {
+        self.relay_capable
+    }
+
+    /// Calls cut — `Call::set_relay`: start or stop relaying, live.
+    ///
+    /// Off: every relay admission closes (its offer reads no room), every
+    /// child is shed make-before-break (the commitment leaves the ledger now,
+    /// but this node keeps forwarding to it until it unsubscribes or the
+    /// drain passes, so its standby or another relay takes over first), each
+    /// is told with a SHED ([`RELAY_OFF_WIRE_REASON`] on the wire, booked
+    /// `relay_shed:relay_off`), offers stop, and an emptied relay is dropped
+    /// on a later tick. On: admission reopens at the service tier and every
+    /// received stream gets a relay admission on the next tick. A serve seat
+    /// stays off. Returns the SHED frames to send.
+    pub(super) fn set_relay(&mut self, on: bool) -> Vec<Outgoing> {
+        let on = on && !self.serve_seat;
+        if on == self.relay_capable {
+            return Vec::new();
+        }
+        self.relay_capable = on;
+        for sel in self.sels.values_mut() {
+            sel.set_forward_capable(on);
+        }
+        let mut out = Vec::new();
+        if on {
+            let closed = !self.tier.admits_new_relay_work();
+            for a in self.relays.values_mut() {
+                a.set_admit_closed(closed);
+            }
+        } else {
+            let now = self.now_ms();
+            let mut shed = Vec::new();
+            for (stream, a) in &mut self.relays {
+                a.set_admit_closed(true);
+                self.log.set_stream(Some(stream_label(*stream)));
+                for p in a.shed_all_draining(now, RELAY_OFF_WIRE_REASON, &mut self.log) {
+                    shed.push((*stream, p));
+                }
+            }
+            for (stream, p) in shed {
+                self.counts.shed += 1;
+                self.label(crate::observability::ALM_SHED);
+                self.label(crate::observability::ALM_RELAY_OFF_SHED);
+                out.push(Outgoing {
+                    to: p,
+                    frame: encode(
+                        stream,
+                        &ControlMsg::Shed {
+                            reason: RELAY_OFF_WIRE_REASON,
+                        },
+                    ),
+                });
+            }
+        }
+        let status = (self.relay_capable, self.relaying_for());
+        self.relay_status = Some(status);
+        self.relay_status_pending = None;
+        self.events.push(super::CallEvent::RelayStatus {
+            relaying: status.0,
+            relaying_for: status.1,
+        });
+        out
+    }
+
+    /// Calls cut — how many distinct child NODES this node forwards others'
+    /// streams to now (admitted, or draining after a make-before-break shed).
+    /// Its own stream's children are not counted: that is publishing, not
+    /// relaying. Nodes, not people: the host maps a node to its owner.
+    pub(super) fn relaying_for(&self) -> u16 {
+        let kids: BTreeSet<String> = self
+            .relays
+            .values()
+            .flat_map(|a| a.forwarding_to().into_iter().map(|(p, _)| p))
+            .collect();
+        u16::try_from(kids.len()).unwrap_or(u16::MAX)
+    }
+
+    /// Calls cut — streams a serve seat offered here and was refused, and no
+    /// member offered (the media-path event's `refused_by_policy`).
+    pub(super) fn only_a_seat_offered(&self, stream: StreamId) -> bool {
+        self.seat_offered.contains(&stream)
+            && self.sels.get(&stream).is_none_or(|s| {
+                s.candidates()
+                    .iter()
+                    .all(|(p, _, _)| self.seats.contains(p))
+            })
+    }
+
+    /// Calls cut — whether any member other than the publisher offers
+    /// `stream` here now (a relay could carry it).
+    pub(super) fn member_offers(&self, stream: StreamId) -> bool {
+        let publisher = self.publisher_of.get(&stream);
+        self.sels.get(&stream).is_some_and(|s| {
+            s.candidates().iter().any(|(p, st, _)| {
+                Some(p) != publisher
+                    && !self.seats.contains(p)
+                    && !matches!(
+                        st,
+                        crate::transport::realtime_av_alm::controller::PeerState::Down
+                    )
+            })
+        })
+    }
+
+    /// The streams this node receives, with the publisher each names.
+    pub(super) fn streams_of(&self, publisher: &str) -> Vec<StreamId> {
+        self.publisher_of
+            .iter()
+            .filter(|(_, p)| p.as_str() == publisher)
+            .map(|(s, _)| *s)
+            .collect()
+    }
+
+    /// The primary parent this node chose for `stream`, if any.
+    pub(super) fn primary_of(&self, stream: StreamId) -> Option<String> {
+        self.sels.get(&stream).and_then(|s| s.primary().cloned())
+    }
+
+    /// The publisher `stream` names.
+    pub(super) fn publisher_of(&self, stream: StreamId) -> Option<&str> {
+        self.publisher_of.get(&stream).map(String::as_str)
     }
 
     /// The call's monotonic clock (ms).
     pub(super) fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(t) = self.sim_now_ms {
+            return t;
+        }
         u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
@@ -429,6 +865,7 @@ impl AlmState {
         }
         self.caps.retain(|p, _| members.contains(p));
         self.provisional.retain(|(_, p), _| members.contains(p));
+        self.relayed.retain(|p, _| members.contains(p));
     }
 
     /// The service tier (§7.2): Admit-close on relays at ≥ 1, A-shed (LIFO,
@@ -446,6 +883,7 @@ impl AlmState {
         for (stream, a) in &mut self.relays {
             a.set_admit_closed(!tier.admits_new_relay_work());
             if tier.sheds_relayed_audio() {
+                self.log.set_stream(Some(stream_label(*stream)));
                 for p in a.shed_all_draining(now, ShedReason::LoadShed, &mut self.log) {
                     shed_frames.push((*stream, p));
                 }
@@ -473,7 +911,8 @@ impl AlmState {
     pub(super) fn on_parent_link_down(&mut self, peer: &str) {
         let now = self.now_ms();
         let p = peer.to_owned();
-        for s in self.sels.values_mut() {
+        for (st, s) in &mut self.sels {
+            self.log.set_stream(Some(stream_label(*st)));
             s.on_link_down(now, &p, &mut self.log);
         }
     }
@@ -482,6 +921,9 @@ impl AlmState {
     /// so `peer` holds no commitment here.
     pub(super) fn on_child_link_down(&mut self, peer: &str) {
         self.layer_caps.retain(|(_, c), _| c != peer);
+        // Its leg is gone: it no longer counts toward the uplink's drain.
+        self.leg_queue_ms.remove(peer);
+        self.leg_busy.remove(peer);
         let p = peer.to_owned();
         self.own.release(&p);
         for (a, _) in self.shares.values_mut() {
@@ -491,6 +933,57 @@ impl AlmState {
             a.release(&p);
         }
         self.provisional.retain(|(_, c), _| c != peer);
+        self.ensure_own_primaries();
+    }
+
+    /// An ADMIT this node made could not be delivered (its resend budget
+    /// spent): the commitment it named is released, so no slot is held for
+    /// a child that never heard it was admitted (it asks again). Row E2 then
+    /// applies as for any other loss.
+    pub(super) fn on_admit_undelivered(&mut self, peer: &str, frame: &[u8]) {
+        let Ok(crate::transport::realtime_av_alm::controller::wire::WireFrame::Control(
+            ControlFrame {
+                stream,
+                msg: ControlMsg::Decision(AdmitDecision::Admit { .. }),
+            },
+        )) = crate::transport::realtime_av_alm::controller::wire::decode(frame, &self.me)
+        else {
+            return;
+        };
+        let p = peer.to_owned();
+        if let Some(a) = self.own_admission_mut(stream) {
+            a.release(&p);
+        } else if let Some(a) = self.relays.get_mut(&stream) {
+            a.release(&p);
+        }
+        self.ensure_own_primaries();
+    }
+
+    /// Row E2 — every own stream with any subscriber keeps a PRIMARY: when
+    /// its last primary is lost by any cause (a link close, an unsubscribe, a
+    /// shed), the oldest standby is promoted at once and told with an ADMIT
+    /// as primary (sent with the next tick's frames); its media resumes
+    /// because it now holds a primary commitment. With no standby, the next
+    /// SUBSCRIBE is admitted whatever the room reads (row S3).
+    fn ensure_own_primaries(&mut self) {
+        let streams: Vec<StreamId> = self.own_admissions().map(|(s, _)| s).collect();
+        for s in streams {
+            let promoted = self
+                .own_admission_mut(s)
+                .and_then(Admission::promote_standby_if_no_primary);
+            if let Some(child) = promoted {
+                self.label(crate::observability::ALM_ADMIT);
+                self.pending_out.push(Outgoing {
+                    to: child,
+                    frame: encode(
+                        s,
+                        &ControlMsg::Decision(AdmitDecision::Admit {
+                            role: Role::Primary,
+                        }),
+                    ),
+                });
+            }
+        }
     }
 
     /// The service tier now.
@@ -567,9 +1060,20 @@ impl AlmState {
             self.relay_capable,
             self.members.clone(),
         );
+        let seats: Vec<String> = if CANONICAL_AV_FALLBACK {
+            self.seats.iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
         self.sels.entry(stream).or_insert_with(|| {
             let mut s = ParentSelector::new(me, cfg, fc);
             s.set_members(members);
+            for p in &seats {
+                s.set_tier(
+                    p,
+                    crate::transport::realtime_av_alm::controller::Tier::Canonical,
+                );
+            }
             s
         })
     }
@@ -578,6 +1082,28 @@ impl AlmState {
     /// leg's link stats (refreshed each watch tick).
     pub(super) fn set_leg_queue_ms(&mut self, peer: &str, ms: f64) {
         self.leg_queue_ms.insert(peer.to_owned(), ms);
+    }
+
+    /// Row ProbeAfterDrain — whether `peer`'s out leg cannot read as drained
+    /// now (its queue gauge unmeasured, or a message outstanding on it).
+    pub(super) fn set_leg_busy(&mut self, peer: &str, busy: bool) {
+        if busy {
+            self.leg_busy.insert(peer.to_owned());
+        } else {
+            self.leg_busy.remove(peer);
+        }
+    }
+
+    /// Row ProbeAfterDrain — the uplink measures drained: no stall verdict,
+    /// at least one out leg, and every one with a known queue gauge under
+    /// `congestion_queue_ms` and nothing outstanding.
+    fn uplink_drained(&self) -> bool {
+        #[allow(clippy::cast_precision_loss)]
+        let limit = self.cfg.congestion_queue_ms as f64;
+        !self.uplink_stall
+            && !self.leg_queue_ms.is_empty()
+            && self.leg_busy.is_empty()
+            && self.leg_queue_ms.values().all(|q| *q < limit)
     }
 
     /// C1, sender side: `bytes` left on `peer`'s leg.
@@ -603,6 +1129,8 @@ impl AlmState {
     /// This node published `bytes` of its own (primary) stream.
     #[cfg(test)]
     pub(super) fn on_own_published(&mut self, bytes: u64, base_or_audio: bool) {
+        let now = self.now_ms();
+        self.own_published_ms.insert(self.own_stream, now);
         self.own_rate.add(bytes, base_or_audio);
     }
 
@@ -614,6 +1142,8 @@ impl AlmState {
         bytes: u64,
         base_or_audio: bool,
     ) {
+        let now = self.now_ms();
+        self.own_published_ms.insert(stream, now);
         if stream == self.own_stream {
             self.own_rate.add(bytes, base_or_audio);
         } else if let Some((_, r)) = self.shares.get_mut(&stream) {
@@ -651,7 +1181,9 @@ impl AlmState {
                 };
                 match adm.role_of(p) {
                     Some(Role::Primary) => false,
-                    Some(Role::Standby) => !base_or_audio,
+                    // Stall row S1: latched verdict → a standby gets nothing
+                    // (an opaque/audio standby is a full second copy).
+                    Some(Role::Standby) => self.uplink_stall || !base_or_audio,
                     None => {
                         let fresh = self
                             .provisional
@@ -706,9 +1238,11 @@ impl AlmState {
         }
         let mut a = Admission::publisher(self.me.clone(), self.cfg.clone(), None);
         a.set_members(self.members.iter().cloned());
-        let fanout =
-            (self.members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);
-        a.set_probe_streams(fanout);
+        a.set_slow_start(true);
+        a.set_probe_backoff(true);
+        a.set_shed_on_verdict_only(true);
+        a.set_shed_rank(Some(stream.0));
+        a.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         self.shares.insert(stream, (a, Rate::default()));
         let now = self.now_ms();
         let c3: Vec<String> = self
@@ -765,7 +1299,9 @@ impl AlmState {
             .forwarding_to()
             .into_iter()
             .filter(|(p, role)| {
-                p != from && p != publisher && (*role == Role::Primary || base_or_audio)
+                p != from
+                    && p != publisher
+                    && (*role == Role::Primary || (base_or_audio && !self.uplink_stall))
             })
             .map(|(p, _)| p)
             .collect();
@@ -821,13 +1357,18 @@ impl AlmState {
         }
         let wall = crate::transport::av_chunk_auth::unix_ms_now();
         let offset = wall as i64 - source_ms as i64;
-        let entry = self.min_offset.entry(stream).or_insert((offset, now));
-        // The floor decays: a better floor wins at once, a stale one is
-        // replaced after 30 s.
-        if offset < entry.0 || now.saturating_sub(entry.1) > 30_000 {
-            *entry = (offset, now);
-        }
-        let latency = (offset - entry.0).max(0) as f64;
+        // RM1: a better floor wins at once; only an on-time sample
+        // re-anchors an old one (drift), never a queued one.
+        let latency = self
+            .min_offset
+            .entry(stream)
+            .or_insert_with(|| LatencyFloor::new(offset, now))
+            .sample(offset, now) as f64;
+        // RM2: per path, so the publisher's own delivery is read alone.
+        self.readings
+            .entry((stream, from.to_owned()))
+            .or_default()
+            .push(now, latency);
         let Some(sel) = self.sels.get_mut(&stream) else {
             return;
         };
@@ -873,6 +1414,18 @@ impl AlmState {
                 .filter(|(s, _)| **s != stream)
                 .map(|(_, a)| a.committed_bps())
                 .sum::<u64>()
+    }
+
+    /// 45.3 (row S3) — the RELAY part of [`Self::external_except`]: what the
+    /// streams this node forwards for other members commit. Set beside it on
+    /// every own admission: a publisher with no primary child admits one
+    /// past this, never past its own other streams.
+    fn relay_except(&self, stream: StreamId) -> u64 {
+        self.relays
+            .iter()
+            .filter(|(s, _)| **s != stream)
+            .map(|(_, a)| a.committed_bps())
+            .sum()
     }
 
     /// The SUBSCRIBE this node sends `parent` for `stream` in `role`: with
@@ -934,6 +1487,7 @@ impl AlmState {
         a.set_role_costs(full, audio);
         a.set_members(self.members.iter().cloned());
         a.set_admit_closed(!self.tier.admits_new_relay_work());
+        a.set_shed_on_verdict_only(true);
         self.relays.insert(s, a);
         self.sync_upstream(s);
     }
@@ -961,6 +1515,7 @@ impl AlmState {
     ) -> Vec<Outgoing> {
         let now = self.now_ms();
         let stream = f.stream;
+        self.log.set_stream(Some(stream_label(stream)));
         self.counts.c3_received += 1;
         self.label(crate::observability::ALM_C3_RECEIVED);
         let mut out = Vec::new();
@@ -969,16 +1524,71 @@ impl AlmState {
                 if !self.is_own(stream) {
                     self.ensure_relay(stream);
                 }
-                let (decision, preempted) = if self.is_own(stream) {
+                let (decision, preempted) = if self.serve_seat && !self.is_own(stream) {
+                    // Calls cut — a serve seat never relays call media. The
+                    // wire carries `ClassRefused` (a code every C3 peer
+                    // reads); the local token names the rule.
+                    self.label(crate::observability::ALM_REFUSE_SERVE_SEAT);
+                    (
+                        AdmitDecision::Refuse {
+                            reason: RefuseReason::ClassRefused,
+                            retry_after_ms: self.cfg.backoff_base_ms * 4,
+                        },
+                        Vec::new(),
+                    )
+                } else if self.is_own(stream)
+                    && self.uplink_stall
+                    && req.role == Role::Standby
+                    && self
+                        .own_admission(stream)
+                        .is_some_and(|a| a.role_of(&req.subscriber).is_none())
+                {
+                    // Stall row S2: a latched verdict admits no new standby
+                    // (a shed child is never left as one).
+                    self.provisional.remove(&(stream, peer.to_owned()));
+                    (
+                        AdmitDecision::Refuse {
+                            reason: RefuseReason::Capacity,
+                            retry_after_ms: UPLINK_STALL_LATCH_MS,
+                        },
+                        Vec::new(),
+                    )
+                } else if self.is_own(stream) {
                     self.provisional.remove(&(stream, peer.to_owned()));
                     let ext = self.external_except(stream);
+                    let relay = self.relay_except(stream);
                     let (mut rng, mut log) = (self.rng.clone(), std::mem::take(&mut self.log));
                     let a = self.own_admission_mut(stream).expect("own");
                     a.set_external_committed(ext);
+                    a.set_external_relay_committed(relay);
                     let d = a.request(now, &req, &mut rng, &mut log);
                     let pre = a.take_preempted();
+                    let unmeasured = a.ceiling_bps().is_none();
                     self.rng = rng;
                     self.log = log;
+                    // G8 slow start — a member the probe has no room for yet
+                    // keeps this node's chunks for SLOW_START_BRIDGE_MS, while
+                    // the first children start offering the stream, so the
+                    // move to a relay costs it nothing. Only while the uplink
+                    // is unmeasured, and not when it is stalled: there the
+                    // bridge is the overload.
+                    if unmeasured
+                        && !self.uplink_stall
+                        && matches!(
+                            d,
+                            AdmitDecision::Refuse {
+                                reason: RefuseReason::Capacity,
+                                ..
+                            }
+                        )
+                    {
+                        let since = now.saturating_sub(PROVISIONAL_MS - SLOW_START_BRIDGE_MS);
+                        let e = self
+                            .provisional
+                            .entry((stream, peer.to_owned()))
+                            .or_insert(since);
+                        *e = (*e).max(since);
+                    }
                     (d, pre)
                 } else if self.relays.contains_key(&stream) {
                     let ext = self.external_except(stream);
@@ -1047,20 +1657,50 @@ impl AlmState {
                 let p = peer.to_owned();
                 if self.is_own(stream) {
                     self.provisional.remove(&(stream, p.clone()));
+                    let live = self
+                        .own_published_ms
+                        .get(&stream)
+                        .is_some_and(|t| now.saturating_sub(*t) <= STREAM_LIVE_MS);
+                    let ext = self.external_except(stream);
+                    let relay = self.relay_except(stream);
+                    let mut log = std::mem::take(&mut self.log);
+                    let mut departed = false;
                     if let Some(a) = self.own_admission_mut(stream) {
+                        // RM5: a direct child (a primary in the ledger, not
+                        // one being shed: that one counts once, at its shed)
+                        // leaving a live stream is congestion.
+                        let direct = a.role_of(&p) == Some(Role::Primary) && !a.is_draining(&p);
                         a.release(&p);
+                        if direct && live {
+                            a.set_external_committed(ext);
+                            a.set_external_relay_committed(relay);
+                            a.on_departure(now, &mut log);
+                            departed = true;
+                        }
                     }
+                    self.log = log;
+                    if departed {
+                        self.label(crate::observability::ALM_DEPARTURE_CONGESTION);
+                    }
+                    self.ensure_own_primaries();
                 } else if let Some(a) = self.relays.get_mut(&stream) {
                     a.release(&p);
                 }
             }
             ControlMsg::Decision(d) => {
-                let acts = match self.sels.get_mut(&stream) {
-                    Some(s) => {
-                        s.on_decision(now, &peer.to_owned(), &d, &mut self.rng, &mut self.log)
-                    }
-                    None => Vec::new(),
+                let (acts, late) = match self.sels.get_mut(&stream) {
+                    Some(s) => (
+                        s.on_decision(now, &peer.to_owned(), &d, &mut self.rng, &mut self.log),
+                        s.take_late_moved(),
+                    ),
+                    None => (Vec::new(), false),
                 };
+                if late {
+                    // RM3: switched on the relay's admit; the publisher is
+                    // left in `acts`. One move this late episode.
+                    self.late_moved.insert(stream);
+                    self.label(crate::observability::ALM_LATE_MOVE);
+                }
                 out.extend(self.action_frames(stream, acts));
                 self.sync_upstream(stream);
             }
@@ -1074,6 +1714,18 @@ impl AlmState {
             }
             ControlMsg::Offer(o) => {
                 if self.is_own(stream) || !self.members.iter().any(|m| m == peer) {
+                    return out;
+                }
+                // Calls cut — a serve seat's OFFER for a stream it does not
+                // publish: dropped while the canonical fallback is off.
+                if !CANONICAL_AV_FALLBACK
+                    && self.seats.contains(peer)
+                    && self.bound_publisher.get(&stream).is_none_or(|p| p != peer)
+                {
+                    self.counts.offers_refused += 1;
+                    self.seat_offered.insert(stream);
+                    self.label(crate::observability::ALM_OFFER_REFUSED);
+                    self.label(crate::observability::ALM_OFFER_REFUSED_SERVE_SEAT);
                     return out;
                 }
                 if o.depth == 0 {
@@ -1147,6 +1799,8 @@ impl AlmState {
     /// selector learns the new stream id and asks.
     pub(super) fn replace_own_stream(&mut self, stream: StreamId) {
         self.own_stream = stream;
+        // RM4: the receivers rank by the new stream id.
+        self.own.set_shed_rank(Some(stream.0));
         let now = self.now_ms();
         let c3: Vec<String> = self
             .caps
@@ -1180,6 +1834,9 @@ impl AlmState {
         self.rates.remove(&old);
         self.forwarded_seen.remove(&old);
         self.min_offset.remove(&old);
+        self.readings.retain(|(s, _), _| *s != old);
+        self.late_moved.remove(&old);
+        self.late_noted.remove(&old);
         self.last_primary.remove(&old);
         self.told_publisher.remove(&old);
         self.draining_parent.remove(&old);
@@ -1244,6 +1901,74 @@ impl AlmState {
         (bps as f64 * scale).min(u64::MAX as f64 / 2.0).round() as u64
     }
 
+    /// C2 — fold one egress window into every admission on this uplink and
+    /// return the sheds it made. While the uplink is stalled (G8) the window
+    /// reads congested whatever the (blind) meter said: every relayed stream
+    /// and share at one stream's room (that work goes), and this node's own
+    /// stream at one stream ABOVE the reserve and whatever the node still
+    /// holds elsewhere, so exactly one direct child is kept, never zero.
+    #[allow(clippy::cast_precision_loss)] // bits/s, far below 2^52
+    fn fold_egress_window(&mut self, now: u64, mut w: EgressWindow) -> Vec<Outgoing> {
+        let mut out = Vec::new();
+        let one = self.own_rate.costs().0 as f64;
+        if self.uplink_stall {
+            w.congested = true;
+            w.capacity_bps = Some(w.capacity_bps.map_or(one, |c| c.min(one)));
+        }
+        let streams: Vec<StreamId> = self.relays.keys().copied().collect();
+        let mut shed: Vec<(StreamId, String)> = Vec::new();
+        for s in streams {
+            let ext = self.external_except(s);
+            let a = self.relays.get_mut(&s).expect("present");
+            a.set_external_committed(ext);
+            self.log.set_stream(Some(stream_label(s)));
+            for p in a.on_egress_window(now, &w, &mut self.log) {
+                shed.push((s, p));
+            }
+        }
+        let ext = self.external_except(self.own_stream);
+        let relay = self.relay_except(self.own_stream);
+        self.own.set_external_committed(ext);
+        self.own.set_external_relay_committed(relay);
+        let drained = self.uplink_drained();
+        self.own.set_uplink_drained(now, drained);
+        let mut own_w = w;
+        if self.uplink_stall {
+            own_w.capacity_bps = Some(one + self.cfg.reserve_bps as f64 + ext as f64);
+        }
+        self.log.set_stream(Some(stream_label(self.own_stream)));
+        for p in self.own.on_egress_window(now, &own_w, &mut self.log) {
+            shed.push((self.own_stream, p));
+        }
+        // v45 — each share sheds by its own commitments.
+        let shares: Vec<StreamId> = self.shares.keys().copied().collect();
+        for s in shares {
+            let ext = self.external_except(s);
+            let relay = self.relay_except(s);
+            let (a, _) = self.shares.get_mut(&s).expect("present");
+            a.set_external_committed(ext);
+            a.set_external_relay_committed(relay);
+            self.log.set_stream(Some(stream_label(s)));
+            for p in a.on_egress_window(now, &w, &mut self.log) {
+                shed.push((s, p));
+            }
+        }
+        for (s, p) in shed {
+            self.counts.shed += 1;
+            self.label(crate::observability::ALM_SHED);
+            out.push(Outgoing {
+                to: p,
+                frame: encode(
+                    s,
+                    &ControlMsg::Shed {
+                        reason: ShedReason::OverCommitted,
+                    },
+                ),
+            });
+        }
+        out
+    }
+
     /// One watch tick: egress windows (C2 measurement and over-commit
     /// shedding), selector ticks (C4/C6) with the upstream refresh after
     /// each decision, relay admissions for newly forwarded streams, offers to
@@ -1252,7 +1977,7 @@ impl AlmState {
     #[allow(clippy::too_many_lines)]
     pub(super) fn tick(&mut self, c3_legs: &[String]) -> Vec<Outgoing> {
         let now = self.now_ms();
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.pending_out);
 
         // Measured rates price commitments (production streams are the
         // host's bitrate, not a nominal one).
@@ -1278,50 +2003,15 @@ impl AlmState {
 
         // C2: one egress window feeds every admission on this uplink.
         if let Some(w) = self.egress.roll(now) {
-            let streams: Vec<StreamId> = self.relays.keys().copied().collect();
-            let mut shed: Vec<(StreamId, String)> = Vec::new();
-            for s in streams {
-                let ext = self.external_except(s);
-                let a = self.relays.get_mut(&s).expect("present");
-                a.set_external_committed(ext);
-                for p in a.on_egress_window(now, &w, &mut self.log) {
-                    shed.push((s, p));
-                }
-            }
-            let ext = self.external_except(self.own_stream);
-            self.own.set_external_committed(ext);
-            for p in self.own.on_egress_window(now, &w, &mut self.log) {
-                shed.push((self.own_stream, p));
-            }
-            // v45 — each share sheds by its own commitments.
-            let shares: Vec<StreamId> = self.shares.keys().copied().collect();
-            for s in shares {
-                let ext = self.external_except(s);
-                let (a, _) = self.shares.get_mut(&s).expect("present");
-                a.set_external_committed(ext);
-                for p in a.on_egress_window(now, &w, &mut self.log) {
-                    shed.push((s, p));
-                }
-            }
-            for (s, p) in shed {
-                self.counts.shed += 1;
-                self.label(crate::observability::ALM_SHED);
-                out.push(Outgoing {
-                    to: p,
-                    frame: encode(
-                        s,
-                        &ControlMsg::Shed {
-                            reason: ShedReason::OverCommitted,
-                        },
-                    ),
-                });
-            }
+            let shed = self.fold_egress_window(now, w);
+            out.extend(shed);
         }
 
         // C4/C6 per stream; the relay's upstream view is refreshed after
         // every decision (the simultaneous-failover loop).
         let streams: Vec<StreamId> = self.sels.keys().copied().collect();
         for s in streams {
+            self.log.set_stream(Some(stream_label(s)));
             let has_children = self
                 .relays
                 .get(&s)
@@ -1335,6 +2025,8 @@ impl AlmState {
             }
             self.log = log;
             out.extend(self.action_frames(s, acts));
+            let moved = self.receiver_move(s, now);
+            out.extend(moved);
             self.sync_upstream(s);
 
             let sel = &self.sels[&s];
@@ -1346,6 +2038,7 @@ impl AlmState {
                     self.label(crate::observability::ALM_PARENT_CHANGE);
                 }
                 self.last_primary.insert(s, primary.clone());
+                self.parent_moves.push((s, primary.clone()));
             }
             // The publisher keeps sending a C3 member that has not chosen
             // (the join gap): tell it once this node chose another parent.
@@ -1395,10 +2088,31 @@ impl AlmState {
             }
         }
 
-        // Offers (C3) to every C3 member this node can reach.
+        // Offers (C3) to every C3 member this node can reach, every
+        // OFFER_EVERY_MS, stalled or not. Row D1: latched verdict ∧ a leg
+        // with nothing unproved → that leg keeps the normal cadence (its
+        // Channel traffic is what a dead peer is noticed by: the gap between
+        // messages plus the retry ladder); latched ∧ backlogged leg → its
+        // offer is held at the send (av_call `send_alm`). Never a blanket
+        // hold-back: 5 s on every leg made a dead listener noticed ~4 s late.
         if now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0 {
             self.last_offer_ms = now.max(1);
             let mut own_offer = self.own.offer();
+            // The publisher's upstream latency is its own uplink queue: what
+            // a child admitted now waits for its first chunk (the child's
+            // selector owes a new subscription that much before calling it
+            // silent).
+            let queued = self
+                .leg_queue_ms
+                .values()
+                .copied()
+                .fold(0.0_f64, f64::max)
+                .clamp(0.0, f64::from(u32::MAX));
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                own_offer.upstream_latency_ms =
+                    own_offer.upstream_latency_ms.max(queued.round() as u32);
+            }
             own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
             own_offer.forwarder_headroom_bps =
                 self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
@@ -1416,7 +2130,7 @@ impl AlmState {
             let relay_offers: Vec<(StreamId, Vec<String>, Vec<u8>)> = self
                 .relays
                 .iter()
-                .filter(|(_, a)| a.forwarding())
+                .filter(|(_, a)| self.relay_capable && a.forwarding())
                 .map(|(s, a)| {
                     let mut o = a.offer();
                     let rate = self.rates.get(s).cloned().unwrap_or_default();
@@ -1429,31 +2143,258 @@ impl AlmState {
                     (*s, skip, encode(*s, &ControlMsg::Offer(o)))
                 })
                 .collect();
+            // Row B1b: latched verdict ∧ the peer is neither a child here nor
+            // a parent this node receives from → its offers go at
+            // the liveness minimum, one per STALL_NONCHILD_OFFER_MS; a child
+            // keeps the 1 s cadence. Answers are never delayed (they are not
+            // offers). Dead detection on such a leg is then ~2 s + the cold
+            // retry ladder.
+            let children: BTreeSet<String> = if self.uplink_stall {
+                self.own_admissions()
+                    .flat_map(|(_, a)| a.forwarding_to().into_iter().map(|(p, _)| p))
+                    .chain(
+                        self.relays
+                            .values()
+                            .flat_map(|a| a.forwarding_to().into_iter().map(|(p, _)| p)),
+                    )
+                    // F14a: and every node this one receives a stream from
+                    // keeps the 1 s cadence too (its leg's evidence).
+                    .chain(self.sels.values().flat_map(|sel| {
+                        sel.primary()
+                            .cloned()
+                            .into_iter()
+                            .chain(sel.standby().cloned())
+                    }))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            let nonchild_every = if self.uplink_stall {
+                let keep = c3_legs.iter().filter(|p| children.contains(*p)).count();
+                let rest = c3_legs.len().saturating_sub(keep);
+                stall_offer_interval_ms(
+                    self.own.ceiling_bps(),
+                    self.own_rate.costs().0,
+                    own_frame.len(),
+                    keep,
+                    rest,
+                )
+            } else {
+                OFFER_EVERY_MS
+            };
+            // RM4 — the receivers spare by the relays' offers, so no offer
+            // may be the one always sent last: a leg that refuses the tail
+            // of a burst (a busy Channel; the periodic offer is not retried)
+            // would starve that stream's relay offers for good. The order
+            // rotates each offer period.
+            self.offer_round = self.offer_round.wrapping_add(1);
             for peer in c3_legs {
                 if !self.members.iter().any(|m| m == peer) {
                     continue;
                 }
-                out.push(Outgoing {
-                    to: peer.clone(),
-                    frame: own_frame.clone(),
-                });
-                for f in &share_frames {
+                if self.uplink_stall && !children.contains(peer) {
+                    let last = self.offered_at.get(peer).copied().unwrap_or(0);
+                    if last != 0 && now.saturating_sub(last) < nonchild_every {
+                        continue;
+                    }
+                }
+                self.offered_at.insert(peer.clone(), now.max(1));
+                let mut frames: Vec<&Vec<u8>> = std::iter::once(&own_frame)
+                    .chain(share_frames.iter())
+                    .chain(
+                        relay_offers
+                            .iter()
+                            .filter(|(_, skip, _)| !skip.contains(peer))
+                            .map(|(_, _, f)| f),
+                    )
+                    .collect();
+                if !frames.is_empty() {
+                    let k = usize::try_from(self.offer_round).unwrap_or(0) % frames.len();
+                    frames.rotate_left(k);
+                }
+                for f in frames {
                     out.push(Outgoing {
                         to: peer.clone(),
                         frame: f.clone(),
                     });
                 }
-                for (_, skip, f) in &relay_offers {
-                    if !skip.contains(peer) {
-                        out.push(Outgoing {
-                            to: peer.clone(),
-                            frame: f.clone(),
-                        });
-                    }
-                }
             }
         }
+
+        // Calls cut — a relay turned off keeps forwarding to its draining
+        // children until each unsubscribes or its drain passes; then the
+        // emptied admission goes.
+        if !self.relay_capable {
+            for a in self.relays.values_mut() {
+                a.expire_drains(now);
+            }
+            self.relays.retain(|_, a| !a.forwarding_to().is_empty());
+        }
+
+        // Calls cut — `RelayStatus`, on change, once a value has held for a
+        // tick (a make-before-break hand-off does not fire twice).
+        let status = (self.relay_capable, self.relaying_for());
+        if self.relay_status == Some(status) {
+            self.relay_status_pending = None;
+        } else if self.relay_status_pending == Some(status) {
+            self.relay_status = Some(status);
+            self.relay_status_pending = None;
+            self.events.push(super::CallEvent::RelayStatus {
+                relaying: status.0,
+                relaying_for: status.1,
+            });
+        } else {
+            self.relay_status_pending = Some(status);
+        }
         out
+    }
+
+    /// RM2 — ReceiverMoves, once a watch tick for each received stream: a
+    /// direct child of the publisher whose media from it reads late moves
+    /// itself to a member relay, make-before-break (the relay's admit
+    /// switches and leaves the publisher, RM3, in [`Self::on_control`]).
+    ///
+    /// Transition: observable, the publisher's own delivery of `stream`
+    /// (its signed `source_ts_ms` over the RM1 floor) reads late, ≥
+    /// [`rxmove::LATE_MS`] on two readings not falling; state, the primary is
+    /// the publisher, nothing is pending, this late episode moved nothing
+    /// yet, this node is not the lowest-ranked of the publisher's direct
+    /// children (RM4, from the offers); action, ask the best member relay
+    /// with room, not this node's descendant and offering within 5 s, that
+    /// is not a direct child which may itself move (only the spared one, or
+    /// a member deeper in the tree); must never, move when spared, move to a
+    /// stale offer or one without room, move twice in one episode, or leave
+    /// the publisher before the admit.
+    ///
+    /// Must never (RM2, the loop rule): ask a direct child of the publisher
+    /// that may itself move (any but the lowest-ranked). Two late movers
+    /// asking each other would both be admitted, each the other's parent: a
+    /// loop with the publisher's stream reaching neither.
+    fn receiver_move(&mut self, s: StreamId, now: u64) -> Vec<Outgoing> {
+        let Some(publisher) = self.bound_publisher.get(&s).cloned() else {
+            return Vec::new();
+        };
+        let Some(sel) = self.sels.get(&s) else {
+            return Vec::new();
+        };
+        let primary = sel.primary().cloned();
+        // The episode ends when the primary (wherever it is) reads on time.
+        if let Some(p) = &primary {
+            let on_time = self
+                .readings
+                .get(&(s, p.clone()))
+                .and_then(|r| r.current(now))
+                .is_some_and(|l| l < rxmove::LATE_MS);
+            if on_time {
+                self.late_moved.remove(&s);
+                self.late_noted.remove(&s);
+            }
+        }
+        if primary.as_ref() != Some(&publisher)
+            || sel.primary_pending()
+            || self.late_moved.contains(&s)
+        {
+            return Vec::new();
+        }
+        let late = self
+            .readings
+            .get(&(s, publisher.clone()))
+            .is_some_and(|r| r.sustained_late(now, rxmove::LATE_MS));
+        if !late {
+            return Vec::new();
+        }
+        let directs = sel.direct_children_by_offer(now, &publisher);
+        // RM6 before RM4: both mean "no move", but the own-downlink verdict
+        // does not depend on this node's rank, so it is read (and counted)
+        // first, whichever child the publisher keeps.
+        if self.own_downlink_slow(s, &publisher, now) {
+            if self.late_noted.insert(s) {
+                self.label(crate::observability::ALM_LATE_OWN_DOWNLINK);
+            }
+            return Vec::new();
+        }
+        if rxmove::spared(s, &self.me, &directs) {
+            if self.late_noted.insert(s) {
+                self.label(crate::observability::ALM_LATE_SPARED);
+            }
+            return Vec::new();
+        }
+        // A direct child that is not the spared one may move itself: never
+        // a target (two movers onto each other would loop).
+        let keep = rxmove::lowest(s, &directs).cloned();
+        let allowed = |c: &String| !directs.contains(c) || Some(c) == keep.as_ref();
+        self.log.set_stream(Some(stream_label(s)));
+        let mut log = std::mem::take(&mut self.log);
+        let act = self
+            .sels
+            .get_mut(&s)
+            .and_then(|sel| sel.late_move(now, &publisher, &allowed, &mut log));
+        self.log = log;
+        if let Some(SelectorAction::Subscribe { parent, .. }) = &act {
+            tracing::debug!(
+                target: "ciris_edge::rxmove",
+                me = %self.me,
+                stream = %crate::transport::realtime_av::stream_label(s),
+                to = %parent,
+                readings = ?self
+                    .readings
+                    .iter()
+                    .map(|((st, from), r)| {
+                        (crate::transport::realtime_av::stream_label(*st), from.clone(), r.current(now))
+                    })
+                    .collect::<Vec<_>>(),
+                "late from its publisher: asking a member relay"
+            );
+        }
+        if act.is_none() && self.late_noted.insert(s) {
+            // Late, not spared, not guarded, and no member relay to move to.
+            tracing::debug!(
+                target: "ciris_edge::rxmove",
+                me = %self.me,
+                stream = %crate::transport::realtime_av::stream_label(s),
+                directs = ?directs,
+                candidates = ?self.sels.get(&s).map(ParentSelector::candidates),
+                "late from its publisher, no member relay to move to"
+            );
+        }
+        act.map(|a| self.action_frames(s, vec![a]))
+            .unwrap_or_default()
+    }
+
+    /// RM6 — the own-downlink guard: whether every other source this node
+    /// hears reads late too, so the lateness is this node's own downlink and
+    /// no relay would help.
+    ///
+    /// Transition: observable, the current reading of every other path
+    /// this node hears (median over the last 250 ms); state, `publisher`'s
+    /// stream reads late from it (RM2); action, no move when at least one
+    /// other publisher's stream is heard and every such stream reads ≥
+    /// [`rxmove::OTHER_LATE_MS`], unless a relayed copy of `publisher`'s
+    /// stream reads on time (then this node's downlink is fine); with no
+    /// other publisher heard (a one-publisher room) the guard cannot run
+    /// and the move goes ahead; must never, move when every source is late.
+    /// A relayed copy of `publisher`'s stream never fires the guard: it left
+    /// through the same uplink, so it is late whenever that uplink is. Paths
+    /// from `publisher` (other streams it relays) are left out for the same
+    /// reason.
+    fn own_downlink_slow(&self, s: StreamId, publisher: &str, now: u64) -> bool {
+        let mut others: Option<bool> = None;
+        for ((st, from), r) in &self.readings {
+            if from == publisher {
+                continue;
+            }
+            let Some(l) = r.current(now) else {
+                continue;
+            };
+            if *st == s {
+                if l < rxmove::OTHER_LATE_MS {
+                    return false;
+                }
+                continue;
+            }
+            others = Some(others.unwrap_or(true) && l >= rxmove::OTHER_LATE_MS);
+        }
+        others == Some(true)
     }
 
     /// Every stream this node receives, with its chosen parents.
@@ -1525,6 +2466,11 @@ impl AlmState {
         self.label(crate::observability::ALM_C3_MALFORMED);
         self.label(e.token());
     }
+}
+
+/// The decision log's name for a stream: its id's first two bytes, hex.
+fn stream_label(s: StreamId) -> String {
+    format!("{:02x}{:02x}", s.0[0], s.0[1])
 }
 
 #[cfg(test)]
@@ -1778,6 +2724,1176 @@ mod tests {
             }))
         )));
         assert!(a.relays[&s(7)].admit_closed());
+    }
+
+    /// A relay with two children (B primary, C standby) on stream 7.
+    fn relaying_a() -> AlmState {
+        let mut a = AlmState::new("a", s(1), &roster(), true, 1);
+        let mut adm = Admission::relay("a".to_owned(), ControllerConfig::interactive(), None);
+        adm.set_members(roster());
+        adm.set_upstream(Some(1), vec!["x".into()], true, 10);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        // Standbys: a cold relay's one trial slot holds one primary.
+        for (p, role) in [("b", Role::Standby), ("c", Role::Standby)] {
+            let _ = adm.request(
+                0,
+                &SubscribeRequest {
+                    subscriber: p.into(),
+                    role,
+                    forward_capable: false,
+                    layers: None,
+                },
+                &mut rng,
+                &mut log,
+            );
+        }
+        a.relays.insert(s(7), adm);
+        a
+    }
+
+    fn sheds(out: &[Outgoing]) -> Vec<(String, ShedReason)> {
+        out.iter()
+            .filter_map(|o| match decode(&o.frame, "a") {
+                Ok(WireFrame::Control(ControlFrame {
+                    msg: ControlMsg::Shed { reason },
+                    ..
+                })) => Some((o.to.clone(), reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Calls cut — `set_relay(false)` mid-call: every child is shed
+    /// make-before-break (told with a code every C3 peer decodes, booked
+    /// `relay_shed:relay_off`), forwarding continues to the draining children,
+    /// offers stop, `RelayStatus` fires at once, and the emptied relay goes
+    /// once the drains pass. `set_relay(true)` reopens.
+    #[test]
+    fn a_relay_turned_off_hands_its_children_off_and_stops_offering() {
+        let mut a = relaying_a();
+        assert_eq!(a.relaying_for(), 2);
+        let out = a.set_relay(false);
+        let mut shed = sheds(&out);
+        shed.sort();
+        assert_eq!(
+            shed,
+            vec![
+                ("b".to_owned(), ShedReason::UpstreamLost),
+                ("c".to_owned(), ShedReason::UpstreamLost)
+            ],
+            "every child told, on a code an older peer decodes"
+        );
+        assert!(a.labels.contains(&crate::observability::ALM_RELAY_OFF_SHED));
+        assert_eq!(a.caps_bits() & CAP_RELAY, 0, "CAPS no longer names relay");
+        assert!(matches!(
+            a.events.last(),
+            Some(super::super::CallEvent::RelayStatus {
+                relaying: false,
+                relaying_for: 2
+            })
+        ));
+        // Make-before-break: still forwarding to both while they drain.
+        let mut kids = a.relay_children(s(7));
+        kids.sort();
+        assert_eq!(kids.len(), 2, "{kids:?}");
+        // No relay offer goes out while off.
+        let out = a.tick(&["b".to_owned(), "c".to_owned()]);
+        assert!(
+            !out.iter().any(|o| matches!(
+                decode(&o.frame, "a"),
+                Ok(WireFrame::Control(ControlFrame { stream, msg: ControlMsg::Offer(_) })) if stream == s(7)
+            )),
+            "no offer of the relayed stream"
+        );
+        // The drains pass: the relay goes, and the status settles to 0.
+        a.t0 = Instant::now()
+            .checked_sub(Duration::from_millis(a.cfg.down_silence_ms + 1_000))
+            .expect("past the drain");
+        let _ = a.tick(&[]);
+        let _ = a.tick(&[]);
+        assert!(a.relays.is_empty(), "the emptied relay is dropped");
+        assert_eq!(a.relaying_for(), 0);
+        assert!(a.events.iter().any(|e| matches!(
+            e,
+            super::super::CallEvent::RelayStatus {
+                relaying: false,
+                relaying_for: 0
+            }
+        )));
+        // On again: CAPS says so and RelayStatus fires.
+        let out = a.set_relay(true);
+        assert!(out.is_empty());
+        assert_ne!(a.caps_bits() & CAP_RELAY, 0);
+        assert!(matches!(
+            a.events.last(),
+            Some(super::super::CallEvent::RelayStatus {
+                relaying: true,
+                relaying_for: 0
+            })
+        ));
+    }
+
+    /// Calls cut — `RelayStatus` fires on change, only after a value held
+    /// one tick, and never on a repeat.
+    #[test]
+    fn relay_status_fires_on_change_after_holding_a_tick() {
+        let mut a = relaying_a();
+        let count = |a: &AlmState| {
+            a.events
+                .iter()
+                .filter(|e| matches!(e, super::super::CallEvent::RelayStatus { .. }))
+                .count()
+        };
+        let _ = a.tick(&[]);
+        assert_eq!(count(&a), 0, "a first value waits a tick");
+        let _ = a.tick(&[]);
+        assert_eq!(count(&a), 1);
+        assert!(matches!(
+            a.events.last(),
+            Some(super::super::CallEvent::RelayStatus {
+                relaying: true,
+                relaying_for: 2
+            })
+        ));
+        let _ = a.tick(&[]);
+        let _ = a.tick(&[]);
+        assert_eq!(count(&a), 1, "no repeat");
+    }
+
+    /// Calls cut — a serve seat never relays call media, audio included:
+    /// turning seat on sheds what it relayed, it never offers relay again,
+    /// `set_relay(true)` cannot reopen it, and a relay SUBSCRIBE is refused
+    /// (`relay_class_refused` on the wire, `relay_serve_seat` here). Its own
+    /// stream is still served.
+    #[test]
+    fn a_serve_seat_never_relays() {
+        let mut a = relaying_a();
+        let out = a.set_serve_seat(true);
+        assert_eq!(sheds(&out).len(), 2, "what it relayed is handed off");
+        assert!(!a.relay_capable());
+        assert!(a.set_relay(true).is_empty());
+        assert!(!a.relay_capable(), "a seat stays off");
+        let sub = |stream| ControlFrame {
+            stream,
+            msg: ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: "b".into(),
+                role: Role::Standby,
+                forward_capable: false,
+                layers: None,
+            }),
+        };
+        let out = a.on_control("b", sub(s(9)), 10.0);
+        assert!(matches!(
+            decode(&out[0].frame, "a"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Decision(AdmitDecision::Refuse {
+                    reason: RefuseReason::ClassRefused,
+                    ..
+                }),
+                ..
+            }))
+        ));
+        assert!(a
+            .labels
+            .contains(&crate::observability::ALM_REFUSE_SERVE_SEAT));
+        assert!(!a.relays.contains_key(&s(9)), "no relay admission is made");
+        // Its own stream is publishing, not relaying.
+        a.on_caps("b", CAPS_THIS_BUILD);
+        let out = a.on_control("b", sub(s(1)), 10.0);
+        assert!(matches!(
+            decode(&out[0].frame, "a"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Decision(AdmitDecision::Admit { .. }),
+                ..
+            }))
+        ));
+    }
+
+    /// Calls cut — a receiver drops a serve seat's OFFER for a stream the seat
+    /// does not publish: it is never a candidate, and the stream reads
+    /// `only_a_seat_offered` (the media-path event's `refused_by_policy`).
+    #[test]
+    fn a_serve_seats_offer_is_dropped_by_its_receiver() {
+        let mut b = AlmState::new("b", s(2), &roster(), true, 2);
+        b.set_seats(["c".to_owned()]);
+        b.note_publisher(s(1), "a");
+        b.note_bound_publisher(s(1), "a");
+        let offer = ControlFrame {
+            stream: s(1),
+            msg: ControlMsg::Offer(crate::transport::realtime_av_alm::controller::Offer {
+                from: "c".to_owned(),
+                depth: 1,
+                ancestry: vec!["a".to_owned()],
+                headroom_bps: 1_000_000,
+                forwarder_headroom_bps: 1_000_000,
+                upstream_latency_ms: 10,
+                forwarding: true,
+            }),
+        };
+        let _ = b.on_control("c", offer, 10.0);
+        assert_eq!(b.counts.offers_refused, 1);
+        assert!(b
+            .labels
+            .contains(&crate::observability::ALM_OFFER_REFUSED_SERVE_SEAT));
+        assert!(!b.member_offers(s(1)));
+        assert!(b.only_a_seat_offered(s(1)));
+        assert!(b
+            .sels
+            .get(&s(1))
+            .is_none_or(|sel| sel.candidates().iter().all(|(p, _, _)| p != "c")));
+    }
+
+    /// G8 — a stalled datagram uplink is congested at one stream's room: the
+    /// publisher keeps ONE child and sheds the rest (most recent first), its
+    /// offers pause, and the stall is counted once on the rise.
+    #[test]
+    fn a_stalled_uplink_sheds_the_publisher_to_one_child() {
+        let mut a = publisher_with(&["b", "c", "d"]);
+        a.set_uplink_stall(true);
+        a.set_uplink_stall(true);
+        assert_eq!(
+            a.labels
+                .iter()
+                .filter(|l| **l == crate::observability::ALM_UPLINK_STALL)
+                .count(),
+            1,
+            "counted once on the rise"
+        );
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            out.extend(a.tick(&["b".into(), "c".into(), "d".into()]));
+        }
+        let kids = a.own_children();
+        assert_eq!(kids.len(), 1, "one child kept: {kids:?}");
+        let lowest = ["b", "c", "d"]
+            .into_iter()
+            .min_by_key(|k| spec_rank(s(1), k))
+            .expect("three");
+        assert_eq!(kids[0].0, lowest, "the lowest-ranked child is kept (RM4)");
+        let shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
+        assert!(
+            ["b", "c", "d"]
+                .iter()
+                .filter(|k| **k != lowest)
+                .all(|k| shed.contains(&(*k).to_owned())),
+            "{shed:?}"
+        );
+        // Row D1: the verdict holds back no offers here (a backlogged leg's
+        // is held at the send); a leg with nothing outstanding keeps its
+        // normal cadence, so a dead peer on it is still noticed in time.
+        let offers = out
+            .iter()
+            .filter(|o| {
+                matches!(
+                    decode(&o.frame, "a"),
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Offer(_),
+                        ..
+                    }))
+                )
+            })
+            .count();
+        assert!(offers >= 2, "an offer each window while stalled: {offers}");
+    }
+
+    /// G8 — publisher `a` of a four-person room with `kids` children admitted
+    /// in order and six seconds of media behind it (its stream has a
+    /// measured rate, the last egress window just closed).
+    fn publisher_with(kids: &[&str]) -> AlmState {
+        let roster4: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let mut a = AlmState::new("a", s(1), &roster4, true, 1);
+        let mut rng = SplitMix64(5);
+        let mut log = DecisionLog::default();
+        // Slow start: each child after the probe's two is admitted once a
+        // clean window has shown the uplink carrying the ones before it.
+        for p in kids {
+            let mut d = None;
+            for _ in 0..4 {
+                let now = a.now_ms();
+                let r = a.own.request(
+                    now,
+                    &SubscribeRequest {
+                        subscriber: (*p).into(),
+                        role: Role::Primary,
+                        forward_capable: true,
+                        layers: None,
+                    },
+                    &mut rng,
+                    &mut log,
+                );
+                if matches!(r, AdmitDecision::Admit { .. }) {
+                    d = Some(r);
+                    break;
+                }
+                for _ in 0..30 {
+                    a.on_own_published(600, true);
+                    a.on_sent("b", 700);
+                }
+                a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+                let _ = a.tick(&[]);
+            }
+            assert!(d.is_some(), "{p} admitted within four clean windows");
+        }
+        for _ in 0..6 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let _ = a.tick(&[]);
+        }
+        assert_eq!(a.own_children().len(), kids.len(), "clean uplink: no shed");
+        a
+    }
+
+    /// G8 — the race the capped matrix lost (CIRISEdge 45.1.9, the loopback
+    /// witness on leviculum c75fdeb0): the stall verdict rises between two
+    /// egress windows, the stalled legs' links die before the next window
+    /// closes, and their detection with them. The shed must go out on the
+    /// RISE (one child kept, the newest shed first), and the verdict must
+    /// hold for [`UPLINK_STALL_LATCH_MS`] after its last detection, so the
+    /// window that closes next still reads the uplink as congested.
+    #[test]
+    fn a_stall_whose_links_die_before_the_window_closes_still_sheds() {
+        let mut a = publisher_with(&["b", "c", "d"]);
+        let legs: Vec<String> = vec!["b".into(), "c".into(), "d".into()];
+        a.set_uplink_stall(true);
+        // The same watch tick: no egress window has closed yet.
+        let mut out = a.tick(&legs);
+        // RM4: the kept child is the lowest-ranked; the rest go highest first.
+        let mut by_rank = ["b", "c", "d"];
+        by_rank.sort_by_key(|k| spec_rank(s(1), k));
+        assert_eq!(
+            a.own_children(),
+            vec![(by_rank[0].to_owned(), Role::Primary)],
+            "shed at the rise, to the lowest-ranked child"
+        );
+        // The stalled legs are gone a tick later: nothing is detected.
+        a.t0 = a.t0.checked_sub(Duration::from_millis(250)).expect("clock");
+        a.set_uplink_stall(false);
+        assert!(a.uplink_stalled(), "latched past the last detection");
+        a.t0 = a.t0.checked_sub(Duration::from_millis(800)).expect("clock");
+        a.set_uplink_stall(false);
+        for _ in 0..30 {
+            a.on_own_published(600, true);
+            a.on_sent("b", 700);
+        }
+        out.extend(a.tick(&legs));
+        let shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            shed,
+            vec![by_rank[2].to_owned(), by_rank[1].to_owned()],
+            "highest rank first, once each"
+        );
+        assert_eq!(a.own_children().len(), 1, "the window keeps one child");
+        // The latch ends UPLINK_STALL_LATCH_MS after the last detection.
+        a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+        a.set_uplink_stall(false);
+        assert!(!a.uplink_stalled(), "released after the latch");
+    }
+
+    /// G8 — after a stall verdict nothing widens the publisher's room for
+    /// [`STALL_PROBE_HOLD_MS`]: a member refused meanwhile (the demand that
+    /// would step the ceiling up a clean window) waits the hold out, then one
+    /// step admits it.
+    #[test]
+    fn no_upward_probe_for_a_hold_after_a_stall() {
+        let mut a = publisher_with(&["b"]);
+        let mut rng = SplitMix64(9);
+        let mut log = DecisionLog::default();
+        let c = SubscribeRequest {
+            subscriber: "c".to_owned(),
+            role: Role::Primary,
+            forward_capable: true,
+            layers: None,
+        };
+        let media = |a: &mut AlmState, ms: u64| {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            // Row ProbeAfterDrain: the leg's gauge reads drained (the hold
+            // is what keeps the room shut here, not a queue).
+            a.set_leg_queue_ms("b", 0.0);
+            a.t0 = a.t0.checked_sub(Duration::from_millis(ms)).expect("clock");
+        };
+        a.set_uplink_stall(true);
+        let _ = a.tick(&[]);
+        let mut waited = 0u64;
+        while waited + 1_000 < STALL_PROBE_HOLD_MS {
+            media(&mut a, 1_000);
+            waited += 1_000;
+            a.set_uplink_stall(false);
+            let _ = a.tick(&[]);
+            let now = a.now_ms();
+            let d = a.own.request(now, &c, &mut rng, &mut log);
+            assert!(
+                !matches!(d, AdmitDecision::Admit { .. }),
+                "admitted {waited} ms after the stall"
+            );
+        }
+        let mut admitted = false;
+        for _ in 0..4 {
+            media(&mut a, 1_000);
+            a.set_uplink_stall(false);
+            let _ = a.tick(&[]);
+            let now = a.now_ms();
+            if matches!(
+                a.own.request(now, &c, &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ) {
+                admitted = true;
+                break;
+            }
+        }
+        assert!(admitted, "one step once the hold has passed");
+        assert_eq!(a.own_children().len(), 2);
+    }
+
+    /// Admit `p` on `a`'s own stream in `role`, forward-capable.
+    fn admit_as(a: &mut AlmState, p: &str, role: Role) {
+        let mut rng = SplitMix64(7);
+        let mut log = DecisionLog::default();
+        let now = a.now_ms();
+        let d = a.own.request(
+            now,
+            &SubscribeRequest {
+                subscriber: p.into(),
+                role,
+                forward_capable: true,
+                layers: None,
+            },
+            &mut rng,
+            &mut log,
+        );
+        assert!(matches!(d, AdmitDecision::Admit { .. }), "{p}: {d:?}");
+    }
+
+    /// Stall row S1 / E1 — under a latched stall verdict P sends ONE copy of
+    /// its stream: a standby child (for an opaque / audio stream a full second
+    /// copy) gets nothing until the verdict clears.
+    #[test]
+    fn a_latched_stall_sends_one_copy_per_stream() {
+        let mut a = publisher_with(&["b"]);
+        admit_as(&mut a, "c", Role::Standby);
+        // Both speak C3 (a pre-C3 peer is served the full mesh as before).
+        a.on_caps("b", CAP_C3_V1);
+        a.on_caps("c", CAP_C3_V1);
+        let legs: Vec<String> = vec!["b".into(), "c".into()];
+        a.uplink_stall = true;
+        let excluded = a.own_exclude(&legs, true);
+        let copies = legs.iter().filter(|l| !excluded.contains(l)).count();
+        assert_eq!(copies, 1, "excluded {excluded:?}");
+        a.uplink_stall = false;
+        assert!(
+            a.own_exclude(&legs, true).is_empty(),
+            "fed again once it clears"
+        );
+    }
+
+    /// Stall rows S2, S3 / E2 — a stall shed takes standbys first and never
+    /// the last primary (here the standby is the OLDER commitment, so LIFO
+    /// alone would shed the primary), and a shed child asking back as a
+    /// standby while the verdict holds is refused.
+    #[test]
+    fn a_stall_shed_keeps_a_primary_and_admits_no_standby() {
+        let roster4: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let mut a = AlmState::new("a", s(1), &roster4, true, 1);
+        admit_as(&mut a, "c", Role::Standby);
+        admit_as(&mut a, "b", Role::Primary);
+        for _ in 0..6 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let _ = a.tick(&[]);
+        }
+        a.set_uplink_stall(true);
+        let _ = a.tick(&["b".into(), "c".into()]);
+        assert_eq!(a.own_children(), vec![("b".to_owned(), Role::Primary)]);
+        let _ = a.on_control(
+            "c",
+            ControlFrame {
+                stream: s(1),
+                msg: ControlMsg::Subscribe(SubscribeRequest {
+                    subscriber: "c".into(),
+                    role: Role::Standby,
+                    forward_capable: true,
+                    layers: None,
+                }),
+            },
+            10.0,
+        );
+        assert_eq!(
+            a.own_children(),
+            vec![("b".to_owned(), Role::Primary)],
+            "no standby re-admitted under the verdict"
+        );
+    }
+
+    /// F14a — a SILENT listener (it publishes nothing) still sends one fresh
+    /// Channel message a second on its own leg toward the node it receives a
+    /// stream from: its own stream's OFFER, to every C3 leg,
+    /// the publisher included. That keeps evidence flowing on both of the
+    /// publisher's links to it (leviculum's same-key form).
+    #[test]
+    fn a_silent_listener_offers_on_its_leg_to_its_parent_each_second() {
+        let roster: Vec<String> = vec!["a".into(), "b".into()];
+        // Its own uplink is clear (a listener's is not the bottleneck); were
+        // it stalled, row B1b keeps a parent at 1 s too.
+        let mut b = AlmState::new("b", s(2), &roster, true, 1);
+        let mut offers = 0;
+        for _ in 0..3 {
+            b.t0 = b.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            for o in b.tick(&["a".into()]) {
+                if o.to == "a"
+                    && matches!(
+                        decode(&o.frame, "b"),
+                        Ok(WireFrame::Control(ControlFrame {
+                            msg: ControlMsg::Offer(_),
+                            ..
+                        }))
+                    )
+                {
+                    offers += 1;
+                }
+            }
+        }
+        assert!(offers >= 3, "one a second toward the parent: {offers}");
+    }
+
+    /// Row B1b — under a latched verdict a member that is not a child gets
+    /// this node's offers once per STALL_NONCHILD_OFFER_MS; a child keeps the
+    /// 1 s cadence.
+    #[test]
+    fn a_latched_stall_offers_non_children_every_two_seconds() {
+        let mut a = publisher_with(&["b"]);
+        let (mut to_b, mut to_c) = (0, 0);
+        for _ in 0..4 {
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            a.uplink_stall = true;
+            for o in a.tick(&["b".into(), "c".into()]) {
+                if matches!(
+                    decode(&o.frame, "a"),
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Offer(_),
+                        ..
+                    }))
+                ) {
+                    if o.to == "b" {
+                        to_b += 1;
+                    } else if o.to == "c" {
+                        to_c += 1;
+                    }
+                }
+            }
+        }
+        assert!(to_b >= 4, "the child keeps 1 s: {to_b}");
+        assert!(to_c <= 2, "a non-child at 2 s: {to_c}");
+    }
+
+    /// Row B2 — the non-children's offer interval fits ¼ of the leftover
+    /// capacity, between 2 s and 3.5 s.
+    #[test]
+    fn the_stall_offer_budget_stretches_non_children_within_bounds() {
+        // A roomy leftover: the 2 s floor.
+        assert_eq!(
+            stall_offer_interval_ms(Some(2_000_000.0), 100_000, 100, 1, 2),
+            2_000
+        );
+        // ~30 kbit/s leftover -> 7.5 kbit/s budget; one kept leg at 1 s
+        // (~1.8 kbit/s) leaves ~5.7 for two others: ~0.6 s, so the floor.
+        assert_eq!(
+            stall_offer_interval_ms(Some(130_000.0), 100_000, 100, 1, 2),
+            2_000
+        );
+        // Many non-children on a thin leftover stretch to the cap.
+        assert_eq!(
+            stall_offer_interval_ms(Some(104_000.0), 100_000, 100, 1, 10),
+            3_500
+        );
+        assert_eq!(stall_offer_interval_ms(None, 100_000, 100, 1, 2), 2_000);
+    }
+
+    /// The ADMIT-as-primary frames in `out`, by recipient.
+    fn primary_admits(out: &[Outgoing]) -> Vec<String> {
+        out.iter()
+            .filter(|o| {
+                matches!(
+                    decode(&o.frame, "a"),
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Decision(AdmitDecision::Admit {
+                            role: Role::Primary
+                        }),
+                        ..
+                    }))
+                )
+            })
+            .map(|o| o.to.clone())
+            .collect()
+    }
+
+    /// An ADMIT that could not be delivered leaves no commitment behind.
+    #[test]
+    fn an_undelivered_admit_releases_its_commitment() {
+        let mut a = publisher_with(&["b", "c"]);
+        let admit = encode(
+            s(1),
+            &ControlMsg::Decision(AdmitDecision::Admit {
+                role: Role::Primary,
+            }),
+        );
+        a.on_admit_undelivered("c", &admit);
+        assert_eq!(a.own_children(), vec![("b".to_owned(), Role::Primary)]);
+        // Anything that is not an ADMIT changes nothing.
+        let offer_like = encode(
+            s(1),
+            &ControlMsg::Shed {
+                reason: ShedReason::OverCommitted,
+            },
+        );
+        a.on_admit_undelivered("b", &offer_like);
+        assert_eq!(a.own_children(), vec![("b".to_owned(), Role::Primary)]);
+    }
+
+    /// Row E2, cause: a link close — the publisher's last primary's leg goes
+    /// while a standby remains: the standby is promoted at once and told.
+    #[test]
+    fn a_lost_primary_link_promotes_the_standby() {
+        let mut a = publisher_with(&["b"]);
+        admit_as(&mut a, "c", Role::Standby);
+        a.on_child_link_down("b");
+        assert_eq!(a.own_children(), vec![("c".to_owned(), Role::Primary)]);
+        assert_eq!(primary_admits(&a.tick(&[])), vec!["c".to_owned()]);
+    }
+
+    /// Row E2, cause: an unsubscribe — the same when the last primary leaves.
+    #[test]
+    fn an_unsubscribing_primary_promotes_the_standby() {
+        let mut a = publisher_with(&["b"]);
+        admit_as(&mut a, "c", Role::Standby);
+        let _ = a.on_control(
+            "b",
+            ControlFrame {
+                stream: s(1),
+                msg: ControlMsg::Unsubscribe {
+                    subscriber: "b".to_owned(),
+                },
+            },
+            10.0,
+        );
+        assert_eq!(a.own_children(), vec![("c".to_owned(), Role::Primary)]);
+        assert_eq!(primary_admits(&a.tick(&[])), vec!["c".to_owned()]);
+    }
+
+    /// G8 — a stalled uplink with ONE child has nothing to shed: the verdict
+    /// keeps the last direct path whatever the reserve or the relay work.
+    #[test]
+    fn a_stall_never_sheds_the_last_child() {
+        let mut a = publisher_with(&["b"]);
+        a.set_uplink_stall(true);
+        let mut out = a.tick(&["b".into()]);
+        for _ in 0..3 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            a.set_uplink_stall(true);
+            out.extend(a.tick(&["b".into()]));
+        }
+        assert!(sheds(&out).is_empty(), "{:?}", sheds(&out));
+        assert_eq!(a.own_children().len(), 1);
+    }
+
+    // ── ReceiverMoves (docs/design/call_congestion, rows RM1–RM6, N4) ────
+
+    /// The rank every member computes for `member` on `stream` (RM4):
+    /// sha256(stream id ‖ the member's canonical encoding), the first eight
+    /// bytes big-endian. Spelled out here so the test is the specification.
+    fn spec_rank(stream: StreamId, member: &str) -> u64 {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(stream.0);
+        let mut enc = Vec::new();
+        crate::transport::realtime_av_alm::controller::PeerRef::encode(
+            &member.to_owned(),
+            &mut enc,
+        );
+        h.update(&enc);
+        let d = h.finalize();
+        u64::from_be_bytes(d[..8].try_into().expect("eight bytes"))
+    }
+
+    /// A chunk of `stream` from `from`, sent `delay_ms` ago by its signed
+    /// clock.
+    fn late_chunk(n: &mut AlmState, stream: StreamId, from: &str, seq: u64, delay_ms: u64) {
+        let src = crate::transport::av_chunk_auth::unix_ms_now() - delay_ms;
+        n.on_chunk(stream, from, 1, seq, 300, src, true, 0);
+    }
+
+    /// The receiver's floor for `stream` (its minimum clock offset).
+    fn floor_of(n: &AlmState, stream: StreamId) -> i64 {
+        n.min_offset[&stream].floor()
+    }
+
+    /// RM1 — observable: a chunk's signed `source_ts_ms` against the wall
+    /// clock; state: the stream queued 500 ms behind its floor for 40 s;
+    /// action: the floor stays; must never: re-anchor while the stream is
+    /// late. Mutation (45.2.0 before RM1): the floor was replaced once 30 s
+    /// old, so after 30 s of queueing the latency read 0 and the late signal
+    /// was gone.
+    #[test]
+    fn a_stream_late_for_forty_seconds_still_reads_late() {
+        let mut b = AlmState::new("b", s(2), &roster(), true, 2);
+        b.on_caps("a", CAPS_THIS_BUILD);
+        b.note_publisher(s(1), "a");
+        b.note_bound_publisher(s(1), "a");
+        let mut seq = 0;
+        for _ in 0..100 {
+            late_chunk(&mut b, s(1), "a", seq, 0);
+            seq += 1;
+            b.t0 = b.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+        }
+        let on_time = floor_of(&b, s(1));
+        for _ in 0..2_000 {
+            late_chunk(&mut b, s(1), "a", seq, 500);
+            seq += 1;
+            b.t0 = b.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+        }
+        assert!(
+            floor_of(&b, s(1)) - on_time < 50,
+            "the floor moved {} ms during 40 s of queueing",
+            floor_of(&b, s(1)) - on_time
+        );
+    }
+
+    /// N4 — observable: the egress window; state: a permanent cap of one
+    /// stream, a member waiting (demand), each widening read congested at
+    /// once (the probe failed); action: every widening waits 2 windows ×
+    /// 2^fails after the last congestion or widening, fails ≤ 2; must never:
+    /// widen sooner. Mutation (45.2.0 before N4): the demand step widened
+    /// every clean window, so a capped publisher probed, overloaded and shed
+    /// every other second (probe, late, leave, repeat).
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_capped_publishers_probe_backs_off_instead_of_oscillating() {
+        let mut a = publisher_with(&["b"]);
+        let one = a.own_rate.costs().0 as f64;
+        let mut rng = SplitMix64(11);
+        let mut log = DecisionLog::default();
+        let win = |congested: bool, sent: f64| EgressWindow {
+            sent_bps: sent,
+            delivered_bps: sent,
+            dropped_bytes: u64::from(congested) * 1_000,
+            max_queue_ms: if congested { 500.0 } else { 0.0 },
+            congested,
+            capacity_bps: congested.then_some(one),
+        };
+        // The cap is measured: one stream.
+        a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+        let now = a.now_ms();
+        let _ = a.own.on_egress_window(now, &win(true, one), &mut log);
+        let mut widenings = Vec::new();
+        for w in 0..60u64 {
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let now = a.now_ms();
+            let mut admitted = false;
+            for p in ["b", "c"] {
+                if a.own.role_of(&p.to_owned()).is_none() {
+                    let r = SubscribeRequest {
+                        subscriber: p.to_owned(),
+                        role: Role::Primary,
+                        forward_capable: true,
+                        layers: None,
+                    };
+                    admitted |= matches!(
+                        a.own.request(now, &r, &mut rng, &mut log),
+                        AdmitDecision::Admit { .. }
+                    );
+                }
+            }
+            if admitted {
+                widenings.push(w);
+            }
+            // Two copies into a one-copy cap read congested; one is clean.
+            let two = a.own.ledger().len() > 1;
+            let _ = a.own.on_egress_window(now, &win(two, one), &mut log);
+            assert!(!a.own.ledger().is_empty(), "never zero direct children");
+        }
+        assert!(
+            widenings.len() <= 9,
+            "{} widenings in 60 windows under a permanent cap: {widenings:?}",
+            widenings.len()
+        );
+        let gaps: Vec<u64> = widenings.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!(
+            gaps.iter().skip(2).all(|g| *g >= 8),
+            "the wait reaches 8 windows and stays: {gaps:?}"
+        );
+    }
+
+    /// RM4 — observable: an uplink-stall verdict; state: three direct
+    /// children; action: the stall shed keeps the LOWEST-RANKED child by
+    /// hash(stream id ‖ member key), the same order every receiver computes;
+    /// must never: keep a different child than the receivers spare, keep
+    /// zero, or keep two. The lowest-ranked child is admitted last here, so
+    /// the mutation (45.2.0 before RM4: LIFO by admission) sheds it.
+    #[test]
+    fn a_stall_shed_keeps_the_lowest_ranked_child() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| std::cmp::Reverse(spec_rank(s(1), k)));
+        let lowest = *kids.last().expect("three");
+        let mut a = publisher_with(&kids);
+        a.set_uplink_stall(true);
+        let out = a.tick(&["b".into(), "c".into(), "d".into()]);
+        assert_eq!(
+            a.own_children(),
+            vec![(lowest.to_owned(), Role::Primary)],
+            "the lowest-ranked child is kept"
+        );
+        let mut shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
+        shed.sort();
+        let mut want: Vec<String> = kids
+            .iter()
+            .filter(|k| **k != lowest)
+            .map(|k| (*k).to_owned())
+            .collect();
+        want.sort();
+        assert_eq!(shed, want, "every other child is shed, once");
+    }
+
+    /// RM5 — observable: a direct child's UNSUBSCRIBE while this node's
+    /// stream is live; state: two direct children on an unmeasured probe;
+    /// action: room = the children left, no widening for 2 windows × 2^fails
+    /// (fails = 1 now); must never: widen sooner. Mutation (45.2.0 before
+    /// RM5): the slot the leaver freed was offered at once, so the next
+    /// member landed straight back on the congested uplink.
+    #[test]
+    fn a_direct_childs_departure_is_read_as_congestion() {
+        let mut a = publisher_with(&["b", "c"]);
+        let leave = Outgoing {
+            to: "a".to_owned(),
+            frame: encode(
+                s(1),
+                &ControlMsg::Unsubscribe {
+                    subscriber: "b".to_owned(),
+                },
+            ),
+        };
+        let _ = deliver(&mut a, "b", &[leave]);
+        assert_eq!(a.own_children().len(), 1, "the premise: b left");
+        assert_eq!(a.own.offer().headroom_bps, 0, "room = the children left");
+        let mut rng = SplitMix64(13);
+        let mut log = DecisionLog::default();
+        let d = SubscribeRequest {
+            subscriber: "d".to_owned(),
+            role: Role::Primary,
+            forward_capable: true,
+            layers: None,
+        };
+        let mut admitted_after = None;
+        for w in 1..=8u64 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("c", 700);
+            }
+            // Row ProbeAfterDrain: c's leg reads drained, so the room may
+            // re-open once the backoff allows.
+            a.set_leg_queue_ms("c", 0.0);
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let _ = a.tick(&[]);
+            let now = a.now_ms();
+            if matches!(
+                a.own.request(now, &d, &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ) {
+                admitted_after = Some(w);
+                break;
+            }
+        }
+        let w = admitted_after.expect("the room widens again after the backoff");
+        assert!(w >= 4, "widened {w} windows after a departure (backoff 4)");
+    }
+
+    /// RM4 — the rank the shed uses is the rank spelled out above.
+    #[test]
+    fn the_shed_rank_is_the_specified_hash() {
+        for m in ["a", "b", "some-longer-member-key"] {
+            assert_eq!(
+                crate::transport::realtime_av_alm::controller::hash_rank(&s(7).0, &m.to_owned()),
+                spec_rank(s(7), m)
+            );
+        }
+    }
+
+    /// A receiver `me` of `a`'s stream s(1) in a room of a, b, c, d: joined
+    /// to `a` directly, with each of `relays` offering it as a direct child
+    /// of `a` (depth 1) with room, every subscribe answered Admit, two
+    /// seconds of on-time media. Returns the receiver and the frames it sent.
+    fn joined_receiver(me: &str, relays: &[&str]) -> (AlmState, Vec<Outgoing>) {
+        let roster4: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let mut n = AlmState::new(me, s(9), &roster4, true, 3);
+        for p in ["a", "b", "c", "d"].into_iter().filter(|p| *p != me) {
+            n.on_caps(p, CAPS_THIS_BUILD | CAP_RELAY);
+        }
+        n.note_publisher(s(1), "a");
+        n.note_bound_publisher(s(1), "a");
+        let mut sent = Vec::new();
+        for (seq, step) in (0u64..).zip(0..200u64) {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", seq, 0);
+            if let Some(sb) = n.sels.get(&s(1)).and_then(|x| x.standby().cloned()) {
+                late_chunk(&mut n, s(1), &sb, seq, 0);
+            }
+            if step % 50 == 0 {
+                offers_to(&mut n, relays);
+            }
+            if step % 12 == 0 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits(&mut n, &out));
+                sent.extend(out);
+            }
+        }
+        (n, sent)
+    }
+
+    /// `a`'s offer (depth 0) and each relay's (depth 1 under `a`, room) to `n`.
+    fn offers_to(n: &mut AlmState, relays: &[&str]) {
+        let me = n.me.clone();
+        let a = Outgoing {
+            to: me.clone(),
+            frame: offer_frame(s(1), "a"),
+        };
+        let _ = deliver(n, "a", &[a]);
+        for r in relays {
+            let f = Outgoing {
+                to: me.clone(),
+                frame: wire::encode(
+                    s(1),
+                    &ControlMsg::Offer(crate::transport::realtime_av_alm::controller::Offer {
+                        from: (*r).to_owned(),
+                        depth: 1,
+                        ancestry: vec!["a".to_owned()],
+                        headroom_bps: 100_000_000,
+                        forwarder_headroom_bps: 100_000_000,
+                        upstream_latency_ms: 0,
+                        forwarding: true,
+                    }),
+                ),
+            };
+            let _ = deliver(n, r, &[f]);
+        }
+    }
+
+    /// Answer every SUBSCRIBE in `out` with an Admit from its parent, except
+    /// to `hold` (whose answer the test gives itself).
+    fn answer_admits_but(n: &mut AlmState, out: &[Outgoing], hold: Option<&str>) -> Vec<Outgoing> {
+        let mut more = Vec::new();
+        for o in out {
+            if let Ok(WireFrame::Control(ControlFrame {
+                stream,
+                msg: ControlMsg::Subscribe(req),
+            })) = decode(&o.frame, &n.me)
+            {
+                if Some(o.to.as_str()) == hold {
+                    continue;
+                }
+                let admit = Outgoing {
+                    to: n.me.clone(),
+                    frame: encode(
+                        stream,
+                        &ControlMsg::Decision(AdmitDecision::Admit { role: req.role }),
+                    ),
+                };
+                more.extend(deliver(n, &o.to, &[admit]));
+            }
+        }
+        more
+    }
+
+    fn answer_admits(n: &mut AlmState, out: &[Outgoing]) -> Vec<Outgoing> {
+        answer_admits_but(n, out, None)
+    }
+
+    /// Whether `out` holds a `kind` frame (subscribe / unsubscribe) to `to`.
+    fn sends(out: &[Outgoing], to: &str, subscribe: bool) -> bool {
+        out.iter().filter(|o| o.to == to).any(|o| {
+            matches!(
+                (decode(&o.frame, "x"), subscribe),
+                (
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Subscribe(_),
+                        ..
+                    })),
+                    true
+                ) | (
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Unsubscribe { .. },
+                        ..
+                    })),
+                    false
+                )
+            )
+        })
+    }
+
+    /// RM2 + RM3 — observable: the median latency of `a`'s stream as `a`
+    /// itself delivers it, ≥ 300 ms over the last 250 ms of chunks and not
+    /// falling; state: this node's primary is `a`, nothing pending, it is not
+    /// the lowest-ranked of `a`'s direct children (RM4, from the offers), a
+    /// member that is not its descendant offers the stream with room;
+    /// action: subscribe to that member, keep `a` until it admits (RM3), then
+    /// switch and unsubscribe `a`; must never: unsubscribe `a` before the
+    /// admit, move when spared, move to a direct child that may itself move.
+    /// Mutation (45.2.0 before RM2): nothing moves; the child waits for a
+    /// shed notice queued behind the very backlog that made it late.
+    #[test]
+    fn a_late_direct_child_moves_to_the_kept_child_make_before_break() {
+        let mut kids = ["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let (kept, mover) = (kids[0], kids[2]);
+        let others: Vec<&str> = kids.iter().copied().filter(|k| *k != mover).collect();
+        let (mut n, _) = joined_receiver(mover, &others);
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "the premise");
+        // a's queue: its chunks now arrive 400 ms late.
+        let mut asked_at = None;
+        let mut sent = Vec::new();
+        for step in 0..60u64 {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+            if step % 50 == 0 {
+                offers_to(&mut n, &others);
+            }
+            if step % 12 == 11 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits_but(&mut n, &out, Some(kept)));
+                if asked_at.is_none() && sends(&out, kept, true) {
+                    asked_at = Some(step * 20);
+                }
+                sent.extend(out);
+                if asked_at.is_some() {
+                    break;
+                }
+            }
+        }
+        let at = asked_at.expect("the late child asks the kept child");
+        assert!(at <= 1_000, "asked {at} ms after its media turned late");
+        assert!(
+            !sends(&sent, others[1], true),
+            "never onto a child that may move"
+        );
+        assert!(
+            !sends(&sent, "a", false),
+            "a is kept until the relay admits"
+        );
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"));
+        // The admit: switch, then leave a.
+        let admit = Outgoing {
+            to: mover.to_owned(),
+            frame: encode(
+                s(1),
+                &ControlMsg::Decision(AdmitDecision::Admit {
+                    role: Role::Primary,
+                }),
+            ),
+        };
+        let out = deliver(&mut n, kept, &[admit]);
+        assert_eq!(
+            n.primary_of(s(1)).as_deref(),
+            Some(kept),
+            "switched on the admit"
+        );
+        assert!(sends(&out, "a", false), "and only then left a: {out:?}");
+    }
+
+    /// RM4 — the lowest-ranked of `a`'s direct children never moves on late
+    /// media: it is the child `a`'s shed keeps.
+    #[test]
+    fn the_lowest_ranked_direct_child_is_spared() {
+        let mut kids = ["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let me = kids[0];
+        let (mut n, _) = joined_receiver(me, &kids[1..]);
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "the premise");
+        let mut sent = Vec::new();
+        for step in 0..150u64 {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+            if step % 50 == 0 {
+                offers_to(&mut n, &kids[1..]);
+            }
+            if step % 12 == 11 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits(&mut n, &out));
+                sent.extend(out);
+            }
+        }
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "spared: {sent:?}");
+        assert!(!sends(&sent, "a", false));
+    }
+
+    /// RM6 — observable: `a`'s stream late ≥ 300 ms from `a`, and every
+    /// other source this node hears late ≥ 150 ms; state: as RM2; action: no
+    /// move (it is this node's downlink, and a relay would not help); must
+    /// never: move. With another publisher heard on time the move goes
+    /// ahead, and so it does with no other source at all (the one-publisher
+    /// room). A relayed copy of `a`'s stream rides `a`'s uplink, so late it
+    /// proves nothing; on time it shows this node's downlink is fine.
+    /// Mutation (45.2.0 before RM6): the slow receiver moved for nothing.
+    #[test]
+    fn a_receiver_late_from_every_source_does_not_move() {
+        let mut kids = ["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let (kept, mover, other) = (kids[0], kids[2], kids[1]);
+        for other_late in [true, false] {
+            let (mut n, _) = joined_receiver(mover, &[kept, other]);
+            n.note_publisher(s(5), other);
+            n.note_bound_publisher(s(5), other);
+            // `other` publishes too, heard from it directly: on time first.
+            for step in 0..20u64 {
+                n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+                late_chunk(&mut n, s(1), "a", 9_000 + step, 0);
+                late_chunk(&mut n, s(5), other, step, 0);
+            }
+            let mut sent = Vec::new();
+            for step in 0..100u64 {
+                n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+                late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+                late_chunk(
+                    &mut n,
+                    s(5),
+                    other,
+                    100 + step,
+                    if other_late { 400 } else { 20 },
+                );
+                if step % 50 == 0 {
+                    offers_to(&mut n, &[kept, other]);
+                }
+                if step % 12 == 11 {
+                    let out = n.tick(&[]);
+                    sent.extend(answer_admits_but(&mut n, &out, Some(kept)));
+                    sent.extend(out);
+                }
+            }
+            assert_eq!(
+                sends(&sent, kept, true),
+                !other_late,
+                "other publisher late={other_late}: {sent:?}"
+            );
+            if other_late {
+                assert!(n
+                    .labels
+                    .contains(&crate::observability::ALM_LATE_OWN_DOWNLINK));
+            }
+        }
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────
@@ -2721,6 +4837,11 @@ mod tests {
         const STEP_MS: u64 = 33;
         /// One stream, as a rate: 30 chunks/s of `CHUNK` bytes.
         const STREAM_BYTES_PER_S: u64 = 30 * CHUNK;
+        /// Re-open probes a held cap may see over 120 s: one per dwell (10 s)
+        /// at most, and every probe that fails doubles the wait from the 2 s
+        /// base (2 windows x 2^fails): gaps of 10, 10, 16, 32, 64 s fit five
+        /// in 120 s. Without the doubling past the dwell: one per ~10 s.
+        const HELD_CAP_PROBES_MAX: u64 = 5;
 
         /// A delivery held back by a stalled receiver: released at `at`.
         struct Held {
@@ -2760,6 +4881,7 @@ mod tests {
                     .map(|i| AlmState::new(NAMES[i], streams[i], &roster, true, i as u64 + 1))
                     .collect();
                 for (i, n) in nodes.iter_mut().enumerate() {
+                    n.sim_now_ms = Some(0);
                     for (j, peer) in NAMES.iter().enumerate() {
                         if i != j {
                             n.on_caps(peer, CAPS_THIS_BUILD | CAP_RELAY);
@@ -2908,10 +5030,11 @@ mod tests {
             fn step(&mut self) {
                 self.now += STEP_MS;
                 self.steps += 1;
+                // The world's clock, not the host's: `t0.elapsed()` added
+                // each step's compute time to every node's clock, so a run's
+                // outcome moved with the box's load.
                 for n in &mut self.nodes {
-                    n.t0 =
-                        n.t0.checked_sub(Duration::from_millis(STEP_MS))
-                            .expect("the clock is past the shift");
+                    n.sim_now_ms = Some(self.now);
                 }
                 if self.now >= self.window_start + 1_000 {
                     self.window_start = self.now;
@@ -2972,6 +5095,21 @@ mod tests {
                 self.nodes[i].counts.shed
             }
 
+            /// The publisher of `stream`'s re-open steps so far.
+            pub(super) fn reopen_steps(&self, stream: usize) -> u64 {
+                self.nodes[stream].own.reopen_steps()
+            }
+
+            /// Every listener's primary changes on `stream`'s publisher's
+            /// stream so far.
+            pub(super) fn moves(&self, stream: usize) -> u64 {
+                (0..N)
+                    .filter(|rx| *rx != stream)
+                    .filter_map(|rx| self.nodes[rx].sels.get(&self.streams[stream]))
+                    .map(ParentSelector::parent_changes)
+                    .sum()
+            }
+
             pub(super) fn tail(&self) -> String {
                 self.nodes
                     .iter()
@@ -3002,6 +5140,32 @@ mod tests {
                 let h = w.worst_heard(st, 10_000, 58_000);
                 assert!(h >= 0.99, "stream {st} heard {h}\n{}", w.tail());
             }
+        }
+
+        /// Row ProbeAfterDrain under a cap that never lifts: the publisher's
+        /// re-probes get rarer (N4, PROBE_FAILS_MAX above the dwell), so its
+        /// listeners are not moved on a fixed ~10 s rhythm for the life of
+        /// the call. Moves over 120 s of a held cap, after it settles.
+        #[test]
+        fn n4_a_held_cap_reprobes_ever_more_rarely() {
+            let mut w = World::new();
+            w.run_until(20_000);
+            w.cap[0] = Some(STREAM_BYTES_PER_S * 5 / 2);
+            w.run_until(50_000);
+            let (m0, p0) = (w.moves(0), w.reopen_steps(0));
+            w.run_until(170_000);
+            let (m1, p1) = (w.moves(0), w.reopen_steps(0));
+            eprintln!(
+                "[N4HELD] over 120 s of a held cap: {} re-open probes, {} listener moves",
+                p1 - p0,
+                m1 - m0
+            );
+            assert!(
+                p1 - p0 <= HELD_CAP_PROBES_MAX,
+                "{} probes over 120 s of a held cap\n{}",
+                p1 - p0,
+                w.tail()
+            );
         }
 
         /// A real cap sheds, and recovers once lifted: `a`'s uplink carries

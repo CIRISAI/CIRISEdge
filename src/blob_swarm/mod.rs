@@ -181,7 +181,25 @@ pub struct PeerState {
     /// peer was sent, if any of its requests has timed out since the peer
     /// last answered. Cleared by any answer ([`Self::record_answer`]).
     pub silent_since: Option<Instant>,
+    /// Calls cut — how this node reaches the holder (lower is better):
+    /// [`PATH_RANK_DIRECT`], [`PATH_RANK_PEER_RELAY`], [`PATH_RANK_OTHER`],
+    /// [`PATH_RANK_SEAT_ONLY`]. A fetch asks only holders at the best rank
+    /// any undemoted holder has, so a body never crosses the canonical while
+    /// a member reaches it otherwise.
+    pub path_rank: u8,
 }
+
+/// Calls cut — the holder is a one-hop neighbour: the derived address, no
+/// forwarder.
+pub const PATH_RANK_DIRECT: u8 = 0;
+/// Calls cut — reached through another member (a roster relay).
+pub const PATH_RANK_PEER_RELAY: u8 = 1;
+/// Calls cut — no path known, or a forwarder that is neither a roster member
+/// nor a serve seat (and every holder off a Reticulum transport).
+pub const PATH_RANK_OTHER: u8 = 2;
+/// Calls cut — reachable only through a serve seat (the canonical): asked
+/// last, only when no other holder is left.
+pub const PATH_RANK_SEAT_ONLY: u8 = 3;
 
 impl PeerState {
     /// Apply one observed RTT sample to the EWMA, per
@@ -1213,10 +1231,27 @@ impl SwarmScheduler {
         // Per-peer state, fetch-scoped. Keyed on the routable holders only —
         // an unroutable holder is not a candidate, so `pick_peer` can never
         // select one and no dispatch can reach it.
-        let mut peers: HashMap<String, PeerState> = routes
-            .keys()
-            .map(|k| (k.clone(), PeerState::default()))
-            .collect();
+        let mut peers: HashMap<String, PeerState> = HashMap::with_capacity(routes.len());
+        for k in routes.keys() {
+            let path_rank = self.edge.holder_path_rank(k).await;
+            peers.insert(
+                k.clone(),
+                PeerState {
+                    path_rank,
+                    ..PeerState::default()
+                },
+            );
+        }
+        // Calls cut — how the best holder of this fetch is reached, booked in
+        // `blob_scoped_carriers` beside the carrier choice.
+        if let Some(best) = peers.values().map(|p| p.path_rank).min() {
+            metrics.inc_blob_scoped_carrier(match best {
+                PATH_RANK_DIRECT => "holder_rank:direct",
+                PATH_RANK_PEER_RELAY => "holder_rank:peer_relay",
+                PATH_RANK_SEAT_ONLY => "holder_rank:seat_only",
+                _ => "holder_rank:other",
+            });
+        }
 
         // Pending chunks in arrival order. We pop from the front for
         // FIFO fairness; demoted-peer retries go back to the front so
@@ -1595,9 +1630,12 @@ impl SwarmScheduler {
             if dispatched.iter().any(|(_, c)| c == chunk_sha) {
                 continue;
             }
+            let best = best_rank(peers);
             let candidate = peers
                 .iter()
-                .filter(|(_, p)| p.can_accept(self.config.max_in_flight_per_peer))
+                .filter(|(_, p)| {
+                    p.path_rank == best && p.can_accept(self.config.max_in_flight_per_peer)
+                })
                 .map(|(k, _)| k.clone())
                 .next();
             if let Some(peer) = candidate {
@@ -1669,14 +1707,29 @@ fn resolve_holder_routes(
                         .collect(),
                     _ => Vec::new(),
                 };
-                tracing::warn!(
-                    blob_sha = %blob_hex,
-                    holder = %holder,
-                    reason = refusal.reason_tag(),
-                    installed_groups = ?installed,
-                    "blob holder DROPPED from the swarm candidate set — no address for \
-                     this content's scope. NOT retried at the federation address: {refusal}",
-                );
+                // CIRISEdge#1029 F5 — a group not installed YET is the room
+                // still keying: the pull parks on the install and the install
+                // wakes it, so it is not a fault, and at WARN it repeated per
+                // holder per retry on every joiner. Other refusals stay WARN.
+                if matches!(refusal, ScopeRouteRefusal::GroupNotInstalled { .. }) {
+                    tracing::info!(
+                        blob_sha = %blob_hex,
+                        holder = %holder,
+                        reason = refusal.reason_tag(),
+                        installed_groups = ?installed,
+                        "blob holder dropped from the swarm candidate set until its group is \
+                         installed here; the pull waits for the install: {refusal}",
+                    );
+                } else {
+                    tracing::warn!(
+                        blob_sha = %blob_hex,
+                        holder = %holder,
+                        reason = refusal.reason_tag(),
+                        installed_groups = ?installed,
+                        "blob holder DROPPED from the swarm candidate set — no address for \
+                         this content's scope. NOT retried at the federation address: {refusal}",
+                    );
+                }
                 if first_refusal.is_none() {
                     first_refusal = Some(refusal.to_string());
                 }
@@ -1695,10 +1748,24 @@ fn resolve_holder_routes(
 /// peers (no RTT samples yet) sort BEFORE timed peers — we want to
 /// give every holder at least one chunk so the scheduler has RTT
 /// data to make subsequent choices.
+/// Calls cut — the best path rank any undemoted holder has (`u8::MAX` when
+/// every holder is demoted).
+fn best_rank(peers: &HashMap<String, PeerState>) -> u8 {
+    peers
+        .values()
+        .filter(|p| !p.demoted)
+        .map(|p| p.path_rank)
+        .min()
+        .unwrap_or(u8::MAX)
+}
+
 fn pick_peer(peers: &HashMap<String, PeerState>, max_in_flight: u32) -> Option<String> {
+    // Calls cut — only the best-reached holders: a busy direct holder is
+    // waited for, never spilled past onto a holder behind the canonical.
+    let rank = best_rank(peers);
     let mut best: Option<(String, Option<Duration>)> = None;
     for (key, state) in peers {
-        if !state.can_accept(max_in_flight) {
+        if state.path_rank != rank || !state.can_accept(max_in_flight) {
             continue;
         }
         match (&best, state.ewma_rtt) {
@@ -1849,6 +1916,42 @@ mod tests {
 
         let pick = pick_peer(&peers, 4).unwrap();
         assert_eq!(pick, "free");
+    }
+
+    #[test]
+    fn pick_peer_asks_the_best_reached_holders_first() {
+        let mut peers = HashMap::new();
+        let seat_only = PeerState {
+            path_rank: PATH_RANK_SEAT_ONLY,
+            ..PeerState::default()
+        };
+        let direct = PeerState {
+            path_rank: PATH_RANK_DIRECT,
+            ewma_rtt: Some(Duration::from_millis(80)),
+            ..PeerState::default()
+        };
+        peers.insert("b-behind-the-seat".to_string(), seat_only);
+        peers.insert("c-direct".to_string(), direct);
+        // Faster or untimed, a holder behind the canonical is not asked
+        // while the direct one is there.
+        assert_eq!(pick_peer(&peers, 4).as_deref(), Some("c-direct"));
+        // At capacity, the direct holder is waited for: no spill.
+        peers.get_mut("c-direct").expect("c").in_flight = 4;
+        assert_eq!(pick_peer(&peers, 4), None);
+        // Demoted, the next rank is asked.
+        let c = peers.get_mut("c-direct").expect("c");
+        c.in_flight = 0;
+        c.demoted = true;
+        assert_eq!(pick_peer(&peers, 4).as_deref(), Some("b-behind-the-seat"));
+        // A peer relay outranks the seat.
+        peers.insert(
+            "d-via-a-member".to_string(),
+            PeerState {
+                path_rank: PATH_RANK_PEER_RELAY,
+                ..PeerState::default()
+            },
+        );
+        assert_eq!(pick_peer(&peers, 4).as_deref(), Some("d-via-a-member"));
     }
 
     #[test]

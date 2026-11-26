@@ -200,6 +200,7 @@ fn build_bridge(
         )
         .with_metrics(config.metrics.clone())
         .with_membership_widener(config.membership_widener.clone())
+        .with_events(config.events.clone())
         .with_key_grant_wake(key_grant_wake)
         .with_mesh_config(mesh_config)
         // Workstream F — installed iff the operator turned enforcement ON. See
@@ -1004,6 +1005,11 @@ pub struct ReplicationRuntimeConfig {
     /// issued (see [`crate::membership`]). `None` (the default): acceptances
     /// are stored and nothing is widened by this node.
     pub membership_widener: Option<crate::membership::MembershipWidener>,
+    /// CIRISEdge#1029 — the node's event bus ([`crate::Edge::events`]). When
+    /// `Some`, a row a room's membership or keying turns on, admitted from a
+    /// peer, is announced as [`crate::events::EventKind::RowAdmitted`] on its
+    /// union channel. `None` (the default): no event.
+    pub events: Option<Arc<crate::events::EventBus>>,
 }
 
 /// Live replication runtime — bridge + registry + scheduler task +

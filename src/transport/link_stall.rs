@@ -188,6 +188,9 @@ pub fn stall_step(
 #[derive(Debug, Default)]
 pub struct LinkStallGuard {
     runs: std::sync::Mutex<HashMap<[u8; 16], StallRun>>,
+    /// When each link last carried verified proof that its peer is alive (a
+    /// media chunk signed by the member at the far end).
+    alive: std::sync::Mutex<HashMap<[u8; 16], Instant>>,
 }
 
 impl LinkStallGuard {
@@ -245,6 +248,50 @@ impl LinkStallGuard {
             .remove(link);
     }
 
+    /// Verified proof just arrived on `link` that its peer is alive.
+    pub fn note_peer_alive(&self, link: [u8; 16]) {
+        let mut alive = self
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        alive.insert(link, Instant::now());
+        if alive.len() > PRUNE_ABOVE {
+            let cut = Instant::now();
+            alive.retain(|_, t| cut.saturating_duration_since(*t) < STALL_BOUND);
+        }
+    }
+
+    /// Whether any of `links` (one peer's links) carried proof of that peer
+    /// within `within`.
+    #[must_use]
+    pub fn peer_alive_within(&self, links: &[[u8; 16]], within: Duration) -> bool {
+        let alive = self
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        links.iter().any(|l| {
+            alive
+                .get(l)
+                .is_some_and(|t| now.saturating_duration_since(*t) < within)
+        })
+    }
+
+    /// The peer is demonstrably alive and reaching this node, so `link`'s
+    /// run is not a dead link yet: its count starts over, its clock does not
+    /// (so [`STALL_BOUND`] still ends it).
+    pub fn hold(&self, link: &[u8; 16]) {
+        if let Some(run) = self
+            .runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(link)
+        {
+            run.dead = false;
+            run.zero_sends = 0;
+        }
+    }
+
     /// Zero-landing sends in `link`'s current run (0 when it has none).
     #[must_use]
     pub fn zero_sends(&self, link: &[u8; 16]) -> u32 {
@@ -259,6 +306,49 @@ impl LinkStallGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link whose peer is demonstrably alive is held, not judged dead, and
+    /// its clock keeps running so the bound still ends it. Mutation (45.2.0
+    /// before this): three zero-landing sends in ~3 s retired the punched
+    /// path to the one child a capped publisher still fed, though that child
+    /// was receiving its media the whole time (server matrix, N=6 at 300
+    /// kbit/s: the call tree cut for 14 s).
+    #[test]
+    fn a_stalled_link_whose_peer_is_alive_is_held_and_still_bounded() {
+        let guard = LinkStallGuard::default();
+        let (link, other) = ([7u8; 16], [8u8; 16]);
+        let t0 = Instant::now();
+        let mut verdict = StallVerdict::Healthy;
+        for _ in 0..STALL_MAX_ZERO_SENDS {
+            verdict = guard.observe(link, ChannelLanding::Starved, Some(0), t0, |_| true);
+        }
+        assert!(matches!(verdict, StallVerdict::Dead { .. }));
+        assert!(guard.is_dead(&link));
+        // No proof of the peer on any of its links: nothing to hold on.
+        assert!(!guard.peer_alive_within(&[link, other], Duration::from_secs(2)));
+        // Proof arrives on ANOTHER link to the same peer (its media).
+        guard.note_peer_alive(other);
+        assert!(guard.peer_alive_within(&[link, other], Duration::from_secs(2)));
+        assert!(!guard.peer_alive_within(&[link], Duration::from_secs(2)));
+        guard.hold(&link);
+        assert!(!guard.is_dead(&link), "held: chosen again");
+        assert_eq!(guard.zero_sends(&link), 0, "its count starts over");
+        // The run's clock did not start over: a send that began at the run's
+        // start and ends past the bound is dead on the bound alone.
+        let (_, late) = stall_step(
+            Some(StallRun {
+                zero_sends: 0,
+                since: t0,
+                delivered: 0,
+                dead: false,
+            }),
+            ChannelLanding::Starved,
+            Some(0),
+            t0,
+            t0 + STALL_BOUND,
+        );
+        assert!(matches!(late, StallVerdict::Dead { .. }), "still bounded");
+    }
 
     const S: ChannelLanding = ChannelLanding::Starved;
     const L: ChannelLanding = ChannelLanding::Landed;

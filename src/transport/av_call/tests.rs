@@ -982,3 +982,130 @@ fn a_replacement_is_not_a_leave() {
     assert_eq!(ev, added("carol", 7));
     assert!(!a.ended.contains(&("carol".to_owned(), StreamId([5; 32]))));
 }
+
+/// G8 — a periodic re-announce skips every leg while the uplink stall
+/// verdict holds, else only the backlogged legs; a clear leg on a clear
+/// uplink still gets it; and no leg goes more than REANNOUNCE_MAX_SKIPS
+/// rounds in a row without one.
+#[test]
+fn a_reannounce_skips_backlogged_legs_and_a_stalled_uplink() {
+    let legs: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+    let backlogged: std::collections::HashSet<String> = ["b".to_owned()].into_iter().collect();
+    let mut n = HashMap::new();
+    assert_eq!(
+        reannounce_skips(&legs, false, &backlogged, &mut n),
+        vec!["b".to_owned()]
+    );
+    assert_eq!(
+        reannounce_skips(&legs, true, &backlogged, &mut n),
+        legs,
+        "stalled: none"
+    );
+    assert!(reannounce_skips(&legs, false, &std::collections::HashSet::new(), &mut n).is_empty());
+    let mut n = HashMap::new();
+    let mut sent_b = 0;
+    for _ in 0..=REANNOUNCE_MAX_SKIPS {
+        if !reannounce_skips(&legs, false, &backlogged, &mut n).contains(&"b".to_owned()) {
+            sent_b += 1;
+        }
+    }
+    assert_eq!(
+        sent_b, 1,
+        "bounded: a backlogged leg still gets one every max rounds"
+    );
+    let mut n = HashMap::new();
+    for _ in 0..(REANNOUNCE_MAX_SKIPS + 2) {
+        assert_eq!(
+            reannounce_skips(&legs, true, &backlogged, &mut n),
+            legs,
+            "B1a: suspended outright while latched"
+        );
+    }
+}
+
+/// G8 serial redial — under a latched stall verdict at most one leg setup is
+/// in flight; a member heard through a relay is deferred when this node is
+/// stalled or publishes nothing; an unstalled publishing node dials everyone
+/// at once as before.
+#[test]
+fn a_stalled_uplink_redials_one_leg_at_a_time() {
+    let g = redial_gate;
+    assert_eq!(
+        g(false, true, 3, false, true),
+        RedialGate::Dial,
+        "unstalled: as before"
+    );
+    assert_eq!(
+        g(false, true, 3, true, true),
+        RedialGate::Dial,
+        "publishing, unstalled"
+    );
+    assert_eq!(
+        g(true, true, 0, false, true),
+        RedialGate::Dial,
+        "the first setup"
+    );
+    assert_eq!(
+        g(true, true, 1, false, true),
+        RedialGate::Wait,
+        "one in flight"
+    );
+    assert_eq!(
+        g(true, true, 0, true, true),
+        RedialGate::Defer,
+        "stalled, heard via a relay"
+    );
+    assert_eq!(
+        g(false, false, 0, true, true),
+        RedialGate::Defer,
+        "a silent listener's redial"
+    );
+    assert_eq!(
+        g(false, false, 0, false, true),
+        RedialGate::Dial,
+        "no relay: dial"
+    );
+    // A first dial (the call's setup) is never deferred: the merged run left
+    // a silent member's leg undialled while it heard that member relayed.
+    assert_eq!(
+        g(false, false, 0, true, false),
+        RedialGate::Dial,
+        "setup is never deferred"
+    );
+    assert_eq!(g(true, false, 0, true, false), RedialGate::Dial);
+}
+
+/// G8 pacing — a re-announce puts at most one binding part per leg per
+/// second on the uplink: at the base MTU's ~400-byte part that is ~3.2
+/// kbit/s per leg, under 3% of a 127 kbit/s cap for three legs.
+#[test]
+fn a_reannounce_sends_one_part_per_leg_per_second() {
+    const { assert!(REANNOUNCE_PART_GAP.as_millis() >= 1_000) };
+    let part = 400u64;
+    let legs = 3u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let per_s = part * legs * 1_000 / REANNOUNCE_PART_GAP.as_millis() as u64;
+    assert!(per_s * 8 * 100 / 127_000 < 3 * 8, "{per_s} B/s");
+}
+
+/// G8 — a relayed periodic binding repeat goes only to this node's
+/// children of the stream, and to none of them under a stall verdict or on
+/// a backlogged leg.
+#[test]
+fn a_relayed_binding_repeat_goes_only_to_children() {
+    let legs: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+    let children: Vec<String> = vec!["b".into()];
+    let none = std::collections::HashSet::new();
+    assert_eq!(
+        repeat_binding_skips(&legs, &children, false, &none),
+        vec!["a".to_owned(), "c".to_owned()]
+    );
+    assert_eq!(repeat_binding_skips(&legs, &children, true, &none), legs);
+    let b: std::collections::HashSet<String> = ["b".to_owned()].into_iter().collect();
+    assert_eq!(repeat_binding_skips(&legs, &children, false, &b), legs);
+    assert_eq!(
+        repeat_binding_skips(&legs, &[], false, &none),
+        legs,
+        "no children: nobody"
+    );
+}

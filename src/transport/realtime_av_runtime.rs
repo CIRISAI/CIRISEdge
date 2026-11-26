@@ -1324,6 +1324,78 @@ pub use leviculum_link::{
 };
 
 #[cfg(feature = "_reticulum-module")]
+/// G8 diagnostic — edge-sealed A/V bytes per link and frame kind, as each
+/// send returned (`sent` when leviculum took it, `refused` when it refused
+/// a sealed frame). Off unless a test turns it on; then one map update per
+/// send.
+#[doc(hidden)]
+pub mod send_diag {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    type Map = HashMap<(usize, [u8; 16], &'static str), (u64, u64)>;
+    static MAP: OnceLock<Mutex<Map>> = OnceLock::new();
+
+    /// Start counting.
+    pub fn enable() {
+        ON.store(true, Ordering::Relaxed);
+    }
+
+    /// Record one send.
+    pub fn note(node: usize, link: [u8; 16], kind: &'static str, bytes: usize, ok: bool) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut m = MAP
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let e = m.entry((node, link, kind)).or_insert((0, 0));
+        if ok {
+            e.0 += bytes as u64;
+        } else {
+            e.1 += bytes as u64;
+        }
+    }
+
+    /// `(link, kind, bytes sent, bytes refused)` so far, for the node whose
+    /// transport tag is `node` (`ReticulumTransport::send_diag_tag`).
+    #[must_use]
+    pub fn snapshot(node: usize) -> Vec<([u8; 16], &'static str, u64, u64)> {
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|((n, _, _), _)| *n == node)
+            .map(|((_, l, k), (s, r))| (*l, *k, *s, *r))
+            .collect()
+    }
+
+    /// The kind of an edge control frame on an A/V link's Channel.
+    #[must_use]
+    pub fn kind_of(bytes: &[u8]) -> &'static str {
+        if bytes.starts_with(&crate::transport::av_chunk_auth::BINDING_PART_MAGIC) {
+            return "binding_part";
+        }
+        if crate::transport::realtime_av_alm::controller::wire::is_control_frame(bytes) {
+            return match bytes.get(5) {
+                Some(0x01) => "caps",
+                Some(0x02) => "subscribe",
+                Some(0x03) => "unsubscribe",
+                Some(0x04) => "admit",
+                Some(0x05) => "refuse",
+                Some(0x06) => "shed",
+                Some(0x07) => "offer",
+                _ => "c3_other",
+            };
+        }
+        "other_ctl"
+    }
+}
+
+#[cfg(feature = "_reticulum-module")]
 mod leviculum_link {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1344,6 +1416,12 @@ mod leviculum_link {
     /// rather than the queue growing without bound or the producer — the
     /// transport's event loop, which replication shares — waiting.
     pub const AV_LINK_QUEUE_DEPTH: usize = 256;
+
+    /// 45.2.0 — bound on each link's queue of ALM C3 control frames, kept
+    /// apart from the media queue so a media flood never sheds them: an
+    /// offer a second per stream and a handful of answers fill it only
+    /// under abuse, where the newest is dropped like media.
+    pub const AV_LINK_CONTROL_DEPTH: usize = 1024;
 
     /// What [`AvLinkQueue::offer`] did with a frame.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1366,6 +1444,9 @@ mod leviculum_link {
     /// cannot drift.
     pub(crate) struct AvLinkQueue {
         tx: mpsc::Sender<InboundWireFrame>,
+        /// 45.2.0 — the link's ALM C3 control frames: never shed with media
+        /// (a listener behind a media flood lost its admits, delivered).
+        control_tx: mpsc::Sender<InboundWireFrame>,
         dropped_since_queued: u64,
     }
 
@@ -1380,13 +1461,16 @@ mod leviculum_link {
         /// while the arrivals queue was full, CIRISEdge#805).
         pub(crate) fn with_dropped(link_id: LinkId, dropped: u64) -> (Self, PumpReceiver) {
             let (tx, rx) = mpsc::channel::<InboundWireFrame>(AV_LINK_QUEUE_DEPTH);
+            let (control_tx, control_rx) = mpsc::channel::<InboundWireFrame>(AV_LINK_CONTROL_DEPTH);
             (
                 Self {
                     tx,
+                    control_tx,
                     dropped_since_queued: dropped,
                 },
                 PumpReceiver {
                     rx: Mutex::new(rx),
+                    control_rx: Mutex::new(control_rx),
                     link_id,
                 },
             )
@@ -1402,6 +1486,20 @@ mod leviculum_link {
 
         /// Offer one frame. Never awaits.
         pub(crate) fn offer(&mut self, bytes: Vec<u8>) -> QueueOffer {
+            // A control frame takes no hop counter: its own queue, and the
+            // media's drop count waits for the next media frame.
+            if crate::transport::realtime_av_alm::controller::wire::is_control_frame(&bytes) {
+                let frame = InboundWireFrame {
+                    dropped_before: 0,
+                    bytes,
+                    queued_at: Some(std::time::Instant::now()),
+                };
+                return match self.control_tx.try_send(frame) {
+                    Ok(()) => QueueOffer::Queued,
+                    Err(mpsc::error::TrySendError::Full(_)) => QueueOffer::DroppedFull,
+                    Err(mpsc::error::TrySendError::Closed(_)) => QueueOffer::ConsumerGone,
+                };
+            }
             let frame = InboundWireFrame {
                 dropped_before: self.dropped_since_queued,
                 bytes,
@@ -1600,6 +1698,13 @@ mod leviculum_link {
             &self.link_id
         }
 
+        /// 45.3 — close the link at the node (its `LinkClosed` event does the
+        /// transport's bookkeeping, as for a close the peer made). Used for a
+        /// peer-opened A/V link no live call on this node takes.
+        pub async fn close(&self) {
+            let _ = self.node.close_link(&self.link_id).await;
+        }
+
         /// The most one Channel message on this link carries (its plaintext,
         /// with room left for the E1 seal), or `None` when leviculum no
         /// longer holds the link.
@@ -1660,7 +1765,7 @@ mod leviculum_link {
         }
 
         async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
-            self.send_with(bytes, None).await
+            self.send_with(bytes, None, false, false).await
         }
 
         /// leviculum#102 — a leg whose peer takes datagrams sends each media
@@ -1668,18 +1773,48 @@ mod leviculum_link {
         /// the Channel, timed when the peer takes timed frames, and counts
         /// the fallback.
         async fn send_media(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            self.media(bytes, false).await
+        }
+
+        /// Calls cut — a forwarded chunk: the same send, sealed into the wire
+        /// ledger's `relay` plane.
+        async fn send_media_relayed(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            self.media(bytes, true).await
+        }
+    }
+
+    impl LeviculumAvSender {
+        /// One media frame: a datagram on a datagram leg, else a (timed)
+        /// Channel message. `relayed`: forwarded for another member.
+        async fn media(&self, bytes: &[u8], relayed: bool) -> Result<(), AvDispatcherError> {
             if self.media_ttl.uses_datagrams() {
-                return self.send_datagram(bytes);
+                return self.send_datagram(bytes, relayed);
             }
-            let sent = self.send_with(bytes, self.media_ttl.for_chunk(bytes)).await;
+            let sent = self
+                .send_with(bytes, self.media_ttl.for_chunk(bytes), relayed, true)
+                .await;
             if sent.is_ok() {
                 self.count(crate::observability::AV_SENT_DATAGRAM_FALLBACK);
             }
             sent
         }
-    }
 
-    impl LeviculumAvSender {
+        /// Seal `bytes` on `lane` under the link's keys; a forwarded chunk is
+        /// counted in the `relay` plane.
+        fn seal_lane(
+            &self,
+            lane: crate::transport::link_seal::Lane,
+            bytes: &[u8],
+            relayed: bool,
+        ) -> Result<Vec<u8>, crate::transport::link_seal::SealRefusal> {
+            if relayed {
+                self.seals
+                    .seal_relayed(self.link_id.into_bytes(), lane, bytes)
+            } else {
+                self.seals.seal(self.link_id.into_bytes(), lane, bytes)
+            }
+        }
+
         /// leviculum#102 — one media frame as one unordered link datagram,
         /// sealed on the E1 datagram lane. Never waits: a full action queue
         /// (`Busy`) or interface (`PacingDelay`) refuses it before leviculum
@@ -1688,7 +1823,7 @@ mod leviculum_link {
         /// never retried: an interface with no room sheds it
         /// (`DropReason::DatagramShed`, `av_datagram_shed`) and the receiver
         /// sees the sequence gap.
-        fn send_datagram(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+        fn send_datagram(&self, bytes: &[u8], relayed: bool) -> Result<(), AvDispatcherError> {
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
 
@@ -1707,11 +1842,9 @@ mod leviculum_link {
                 }));
             }
             // CC 5.3.3.5 E1 — sealed under the link's keys, or not sent.
-            let Ok(sealed) = self.seals.seal(
-                self.link_id.into_bytes(),
-                crate::transport::link_seal::Lane::Datagram,
-                bytes,
-            ) else {
+            let Ok(sealed) =
+                self.seal_lane(crate::transport::link_seal::Lane::Datagram, bytes, relayed)
+            else {
                 self.count(crate::observability::AV_SEND_FAILED);
                 if let Some(m) = self.metrics.as_ref() {
                     m.inc_link_seal(crate::observability::LINK_SEAL_REFUSED_UNSEALED_SEND);
@@ -1728,6 +1861,13 @@ mod leviculum_link {
                 .try_send_unordered(&sealed)
             {
                 Ok(_sequence) => {
+                    crate::transport::realtime_av_runtime::send_diag::note(
+                        std::sync::Arc::as_ptr(&self.seals) as usize,
+                        self.link_id.into_bytes(),
+                        "media_datagram",
+                        sealed.len(),
+                        true,
+                    );
                     self.count(crate::observability::AV_SENT);
                     self.count(crate::observability::AV_SENT_DATAGRAM);
                     if let Some(stamps) = self.outbound_liveness.as_deref() {
@@ -1765,7 +1905,10 @@ mod leviculum_link {
             &self,
             bytes: &[u8],
             ttl: Option<std::time::Duration>,
+            relayed: bool,
+            media: bool,
         ) -> Result<(), AvDispatcherError> {
+            use crate::transport::realtime_av_runtime::send_diag;
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
             /// leviculum#94's timed wrapper: msgtype u16 ‖ sent_ms u32 ‖ ttl_ms u32.
@@ -1786,11 +1929,9 @@ mod leviculum_link {
                 }));
             }
             // CC 5.3.3.5 E1 — sealed under the link's keys, or not sent.
-            let Ok(sealed) = self.seals.seal(
-                self.link_id.into_bytes(),
-                crate::transport::link_seal::Lane::Channel,
-                bytes,
-            ) else {
+            let Ok(sealed) =
+                self.seal_lane(crate::transport::link_seal::Lane::Channel, bytes, relayed)
+            else {
                 self.count(crate::observability::AV_SEND_FAILED);
                 if let Some(m) = self.metrics.as_ref() {
                     m.inc_link_seal(crate::observability::LINK_SEAL_REFUSED_UNSEALED_SEND);
@@ -1816,6 +1957,17 @@ mod leviculum_link {
                 Some(ttl) => handle.try_send_timed(&sealed, ttl).await,
                 None => handle.try_send(&sealed).await,
             };
+            crate::transport::realtime_av_runtime::send_diag::note(
+                std::sync::Arc::as_ptr(&self.seals) as usize,
+                self.link_id.into_bytes(),
+                if media {
+                    "media_channel"
+                } else {
+                    send_diag::kind_of(bytes)
+                },
+                sealed.len(),
+                sent.is_ok(),
+            );
             match sent {
                 Ok(()) => {
                     self.count(crate::observability::AV_SENT);
@@ -1859,6 +2011,8 @@ mod leviculum_link {
     /// sink or by [`LinkDataPump`].
     pub struct PumpReceiver {
         rx: Mutex<mpsc::Receiver<InboundWireFrame>>,
+        /// The link's control frames, taken before any media waiting.
+        control_rx: Mutex<mpsc::Receiver<InboundWireFrame>>,
         link_id: LinkId,
     }
 
@@ -1877,7 +2031,19 @@ mod leviculum_link {
         }
 
         async fn recv_frame(&self) -> Result<InboundWireFrame, AvDispatcherError> {
-            self.rx.lock().await.recv().await.ok_or_else(|| {
+            let mut control = self.control_rx.lock().await;
+            let mut media = self.rx.lock().await;
+            // Control first: an answer never waits behind media.
+            let got = tokio::select! {
+                biased;
+                Some(f) = control.recv() => Some(f),
+                f = media.recv() => match f {
+                    Some(f) => Some(f),
+                    // The media half closed: whatever control is left.
+                    None => control.try_recv().ok(),
+                },
+            };
+            got.ok_or_else(|| {
                 AvDispatcherError::RecvFailed(format!(
                     "leviculum link {:?} inbound queue closed (link closed or node down)",
                     self.link_id

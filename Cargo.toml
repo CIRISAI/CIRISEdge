@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "45.1.10"
+version = "45.2.1"
 edition = "2021"
 rust-version = "1.92"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -471,7 +471,7 @@ publish = false
 # author, the stranded repair rebinds only onto one that does, and a body that does not open heals on read). No migration.
 # 45.1.7: persist v61.4.2 (tag; commit 213a1c86): the capsule proxy routes 34 FederationDirectory methods it refused before
 # (list_live_consent_grants_by among them); wire-compatible, DIRECTORY_ABI_VERSION 13, DirectoryOp variants appended. No migration.
-# 45.1.10: persist v61.4.4 (tag; commit 5ef264f3) moves every Verify pin to v22.2.4. 45.1.9: persist v61.4.3 (tag; commit 157ee52c): MAX_CALLER_LABELS 32 -> 128 and TelemetrySnapshot.caller_label_refusals; telemetry only. No migration.
+# 45.2.1: no pin moved. 45.2.0: leviculum v0.34.0+ciris.4 by tag; persist and Verify unchanged. 45.1.10: persist v61.4.4 (tag; commit 5ef264f3) moves every Verify pin to v22.2.4. 45.1.9: persist v61.4.3 (tag; commit 157ee52c): MAX_CALLER_LABELS 32 -> 128 and TelemetrySnapshot.caller_label_refusals; telemetry only. No migration.
 ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.4.4", version = "61", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
@@ -977,8 +977,16 @@ tempfile       = { version = "3", optional = true }
 # send's sequence and `ReticulumNode::link_seq_stats` (`LinkSeqStats`,
 # `delivered_through`) proves it delivered. Additive: `LinkStats`, the wire
 # and the `send_on_link` error mapping are unchanged.
-leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
+# v0.34.0+ciris.4 (d3565cf1) — the direct-link punch (port prediction, many
+# sockets, a second observer) and nomination with its secret; the Channel
+# reliability series (per-attempt receipts, a learned timeout held to the
+# stale bound, the peer-evidence hold, RACK loss detection, pacing from the
+# path's minimum RTT, a path move judged by the old path's RTT). SOURCE BREAKS
+# edge adopted: `DirectLinkSettings` is non-exhaustive (start from `default()`),
+# `ReticulumNode::note_peer_evidence`, `LinkStats::learned_srtt_ms`.
+# `LinkStats::min_rtt_ms()` may be `None` right after a path move.
+leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.4", version = "0.34", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.4", version = "0.34", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -988,7 +996,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.4", version = "0.34", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in

@@ -367,7 +367,7 @@ async fn a_backfill_page_keeps_only_the_joined_groups_rows() {
         c.groups_changed(&k, &set(&[ROOM]));
     }
     let kept: BTreeSet<String> = bridge
-        .group_history_backfill(&k)
+        .group_history_backfill(&k, &HashSet::new(), &BTreeMap::new())
         .await
         .into_iter()
         .map(|a| a.attestation_id)
@@ -375,4 +375,320 @@ async fn a_backfill_page_keeps_only_the_joined_groups_rows() {
     let want: BTreeSet<String> = history.iter().cloned().collect();
     assert_eq!(kept, want, "the joined room's rows, and only those");
     assert!(elsewhere.iter().all(|id| !kept.contains(id)));
+}
+
+/// CIRISEdge#1029 F1 — an MLS handshake row placed in the room, as `chat.rs`
+/// writes one: `mls_bytes` (base64), and on a Welcome `mls_epoch` and
+/// `mls_for_key_id` (the joiner, named in the body only); a Commit `mls_epoch`,
+/// the epoch it advanced to. `pad` bytes of
+/// handshake stand in for a PQC-sized ratchet tree.
+async fn handshake_row(
+    backend: &SqliteBackend,
+    author: &str,
+    dimension: &str,
+    welcome_for: Option<(&str, u64)>,
+    pad: usize,
+) -> String {
+    use base64::Engine as _;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut envelope = serde_json::json!({
+        "dimension": dimension,
+        "community_id": ROOM,
+        "mls_bytes": base64::engine::general_purpose::STANDARD.encode(vec![0x5a; pad]),
+    });
+    if let Some((recipient, epoch)) = welcome_for {
+        // A Commit carries the epoch it advanced to and names nobody.
+        if dimension != crate::chat::COMMIT_DIMENSION {
+            envelope["mls_for_key_id"] = serde_json::json!(recipient);
+        }
+        envelope["mls_epoch"] = serde_json::json!(epoch);
+    }
+    seed_scoped_attestation(
+        backend,
+        &id,
+        author,
+        author,
+        "scores",
+        "community",
+        envelope,
+    )
+    .await;
+    id
+}
+
+/// The room's handshake history before carol: for each earlier member, a
+/// KeyPackage, alice's Welcome for it, and alice's Commit adding it, each
+/// PQC-sized. Over [`crate::replication::session::PROACTIVE_PUSH_BUDGET_BYTES`]
+/// in all, as at N = 12. Returns (KeyPackages, Welcomes, Commits).
+async fn handshake_history(backend: &SqliteBackend) -> (Vec<String>, Vec<String>, Vec<String>) {
+    const MEMBERS: u64 = 10;
+    const PAD: usize = 24 * 1024;
+    let (mut kps, mut welcomes, mut commits) = (Vec::new(), Vec::new(), Vec::new());
+    for n in 1..=MEMBERS {
+        let member = format!("person-member-{n}");
+        // A KeyPackage is written by a member of the room (persist's write
+        // scope); alice's devices stand in for the members who joined.
+        kps.push(
+            handshake_row(
+                backend,
+                "person-alice",
+                crate::chat::KEY_PACKAGE_DIMENSION,
+                None,
+                PAD / 4,
+            )
+            .await,
+        );
+        welcomes.push(
+            handshake_row(
+                backend,
+                "person-alice",
+                crate::chat::WELCOME_DIMENSION,
+                Some((&member, n)),
+                PAD,
+            )
+            .await,
+        );
+        commits.push(
+            handshake_row(
+                backend,
+                "person-alice",
+                crate::chat::COMMIT_DIMENSION,
+                Some((&member, n)),
+                PAD,
+            )
+            .await,
+        );
+    }
+    (kps, welcomes, commits)
+}
+
+/// The envelopes one round's proactive push carries to carol, as the
+/// production session builds it over this bridge.
+async fn first_push(bridge: FederationDirectoryReplicationBridge) -> Vec<Attestation> {
+    use crate::replication::directory::DirectoryStateAdapter;
+    use crate::replication::session::{ReplicationOutcome, Session, SessionRole};
+    let provider = DirectoryStateAdapter::new(Arc::new(bridge)).with_peer(JOINER);
+    let mut session = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation)
+        .with_proactive_publish(true);
+    let msgs = match session.start_round(&provider).await {
+        ReplicationOutcome::Send(msgs) | ReplicationOutcome::SendAndComplete { msgs, .. } => msgs,
+        other => panic!("a round opens with a send: {other:?}"),
+    };
+    msgs.into_iter()
+        .filter_map(|m| match m {
+            crate::replication::protocol::ReplicationMessage::Deliver(d) => Some(d.envelopes),
+            _ => None,
+        })
+        .flatten()
+        .map(|bytes| serde_json::from_slice::<Attestation>(&bytes).expect("a pushed row"))
+        .collect()
+}
+
+/// CIRISEdge#1029 F1 — **the joiner's own Welcome leads the push, past a
+/// handshake backlog larger than the budget, and the backlog it can never use
+/// is not offered.** Field (12-person star): the founder's push to the joiner
+/// is oldest-first and stops at 256 KiB, the Welcome was the newest room row
+/// behind every other member's KeyPackage, ten earlier Welcomes and ten
+/// Commits, and reached the joiner four rounds (160 s) after it was placed.
+/// Red before: the Welcome is not in the first push.
+#[tokio::test]
+async fn the_joiners_welcome_leads_the_push_past_a_backlog_over_the_budget_1029() {
+    let backend = audience_backend().await;
+    room(&backend).await;
+    let (kps, welcomes, commits) = handshake_history(&backend).await;
+    let history = said_in_room(&backend, 3).await;
+    let bridge = bridge(backend.clone());
+    // The baseline: carol is not in the room yet.
+    offered(&bridge, &backend, &history[..1]).await;
+    carol_joins(&backend).await;
+    // carol's KeyPackage reached alice, and alice placed carol's Welcome.
+    // (Her own row is hers to hold: the session's diff, not the backfill,
+    // decides whether it goes back to her.)
+    let _own_kp = handshake_row(
+        &backend,
+        "person-carol",
+        crate::chat::KEY_PACKAGE_DIMENSION,
+        None,
+        4096,
+    )
+    .await;
+    let welcome = handshake_row(
+        &backend,
+        "person-alice",
+        crate::chat::WELCOME_DIMENSION,
+        Some(("person-carol", 11)),
+        24 * 1024,
+    )
+    .await;
+
+    let pushed: BTreeSet<String> = first_push(bridge)
+        .await
+        .into_iter()
+        .map(|a| a.attestation_id)
+        .collect();
+    assert!(
+        pushed.contains(&welcome),
+        "the joiner's Welcome is in the first push ({} rows pushed)",
+        pushed.len()
+    );
+    let unusable: Vec<&String> = kps
+        .iter()
+        .chain(&welcomes)
+        .chain(&commits)
+        .filter(|id| pushed.contains(*id))
+        .collect();
+    assert!(
+        unusable.is_empty(),
+        "other members' KeyPackages and Welcomes, and Commits below the joiner's epoch, are \
+         not the joiner's backfill: {unusable:?}"
+    );
+    assert!(
+        history.iter().all(|id| pushed.contains(id)),
+        "the room's history still moves"
+    );
+}
+
+/// CIRISEdge#1029 F1 — **a Welcome placed after the join's backfill is a
+/// required row for its joiner.** In the field the backfill was offered at the
+/// join (01:39:58) and the Welcome placed two minutes later; it then reached
+/// the joiner only after the rows the hub's listing put ahead of it. Required,
+/// it is listed at the required `seq`, which the push carries first. Red
+/// before: the Welcome is listed (by the head) at its admission `seq`.
+#[tokio::test]
+async fn a_welcome_placed_after_the_backfill_is_required_for_its_joiner_1029() {
+    let backend = audience_backend().await;
+    room(&backend).await;
+    let history = said_in_room(&backend, 3).await;
+    let bridge = bridge(backend.clone());
+    offered(&bridge, &backend, &history[..1]).await;
+    carol_joins(&backend).await;
+    assert!(
+        offered(&bridge, &backend, &history)
+            .await
+            .iter()
+            .all(|o| *o),
+        "the backfill round"
+    );
+    let welcome = handshake_row(
+        &backend,
+        "person-alice",
+        crate::chat::WELCOME_DIMENSION,
+        Some(("person-carol", 4)),
+        2048,
+    )
+    .await;
+    let hash = hash_of(&backend, &welcome).await;
+    let refs = bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(JOINER))
+        .await;
+    let listed = refs
+        .iter()
+        .find(|r| r.envelope_hash == hash)
+        .expect("the Welcome is listed to its joiner");
+    assert_eq!(
+        listed.seq, REQUIRED_ROW_SEQ,
+        "the joiner's Welcome is a required row, ahead of every walked row"
+    );
+}
+
+/// The joiner's listing, `n` times, for the read counts below.
+async fn listings(bridge: &FederationDirectoryReplicationBridge, n: usize) {
+    for _ in 0..n {
+        let _ = bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(JOINER))
+            .await;
+    }
+}
+
+/// CIRISEdge#1029 F1 — **the Welcome read is bounded and costs a group
+/// nobody is joining nothing.** Each listing of a watched join reads the
+/// room's Welcomes once; once the joiner's is found it is read in
+/// `1 + WELCOME_FOUND_LISTINGS` listings and never again, a watch that never
+/// finds one ends after `WELCOME_WATCH_LISTINGS`, and a member that joined
+/// nothing (the baseline) is never read for. Counted on the targeted door
+/// alone after the join round (whose roster read uses the same door).
+#[tokio::test]
+async fn the_welcome_read_stops_once_found_or_spent_and_costs_a_settled_member_nothing_1029() {
+    const DOOR: &str = "list_targeted_by_dimension_prefix";
+    // A member since the baseline: no join, no read.
+    let backend = audience_backend().await;
+    room(&backend).await;
+    carol_joins(&backend).await;
+    let counting = CountingDirectory::new(Arc::clone(&backend) as Arc<dyn FederationDirectory>);
+    let settled = bridge(Arc::new(counting.clone()));
+    listings(&settled, 1).await;
+    counting.reset();
+    listings(&settled, 10).await;
+    assert_eq!(
+        counting.count(DOOR),
+        0,
+        "a member that joined nothing is read for nothing"
+    );
+
+    // A join whose Welcome is placed after the join round.
+    let backend = audience_backend().await;
+    room(&backend).await;
+    let counting = CountingDirectory::new(Arc::clone(&backend) as Arc<dyn FederationDirectory>);
+    let found = bridge(Arc::new(counting.clone()));
+    listings(&found, 1).await;
+    carol_joins(&backend).await;
+    listings(&found, 1).await;
+    handshake_row(
+        &backend,
+        "person-alice",
+        crate::chat::WELCOME_DIMENSION,
+        Some(("person-carol", 4)),
+        512,
+    )
+    .await;
+    counting.reset();
+    listings(&found, 10).await;
+    assert_eq!(
+        counting.count(DOOR),
+        1 + WELCOME_FOUND_LISTINGS as usize,
+        "found, then offered a bounded number of listings more, then never read again"
+    );
+
+    // A join whose Welcome never comes.
+    let backend = audience_backend().await;
+    room(&backend).await;
+    let counting = CountingDirectory::new(Arc::clone(&backend) as Arc<dyn FederationDirectory>);
+    let spent = bridge(Arc::new(counting.clone()));
+    listings(&spent, 1).await;
+    carol_joins(&backend).await;
+    listings(&spent, 1).await;
+    counting.reset();
+    listings(&spent, WELCOME_WATCH_LISTINGS as usize + 10).await;
+    assert_eq!(
+        counting.count(DOOR),
+        WELCOME_WATCH_LISTINGS as usize - 1,
+        "the watch's own listings and no more (the join round spent one)"
+    );
+}
+
+/// CIRISEdge#1029 F1 — **the Welcome read is credited to its own site** in
+/// persist's per-caller read counters (`crate::read_caller`), so a hub's join
+/// cost is visible apart from the group rows' and the history's. Real
+/// `SqliteBackend`; persist's counters are process-wide, so a delta. Red
+/// before: credited `edge.advertise.groups`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_welcome_read_is_credited_to_its_own_read_site_1029() {
+    let key = "list_targeted_by_dimension_prefix:edge.advertise.welcomes.reads";
+    let reads = || {
+        crate::observability::persist_reads_snapshot()
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    };
+    let backend = audience_backend().await;
+    room(&backend).await;
+    let bridge = bridge(backend.clone());
+    listings(&bridge, 1).await;
+    carol_joins(&backend).await;
+    let before = reads();
+    listings(&bridge, 2).await;
+    assert!(
+        reads() > before,
+        "the watched join's Welcome read is credited {key}"
+    );
 }

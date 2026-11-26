@@ -1,5 +1,7 @@
 # CALM — the ALM control frame (C3) — wire layout
 
+**Why this exists.** A phone's uplink cannot send a copy of its stream to every member of a group call, and edge has no central media server. Members forward streams for one another (application-layer multicast, ALM), and CALM is the small control frame they use to ask for, admit, shed and offer those streams.
+
 Source for the CC rc16 draft (CC 5.3.3.2.3 / 6.1.6, with `FSD/CIRIS_MESH.md`
 §4). Everything here is read from the code on branch `feat/onion-v44`;
 `file:line` points at it. Paths are under `src/`. Integers are big-endian.

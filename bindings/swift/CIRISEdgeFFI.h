@@ -305,6 +305,12 @@ RustBuffer uniffi_ciris_edge_fn_func_link_request(RustBuffer link_handle, RustBu
 void uniffi_ciris_edge_fn_func_link_teardown(RustBuffer link_id, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LOCAL_NAT_REPORT
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LOCAL_NAT_REPORT
+RustBuffer uniffi_ciris_edge_fn_func_local_nat_report(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_METRICS_SNAPSHOT
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_METRICS_SNAPSHOT
 RustBuffer uniffi_ciris_edge_fn_func_metrics_snapshot(RustCallStatus *_Nonnull out_status
@@ -863,6 +869,12 @@ uint16_t uniffi_ciris_edge_checksum_func_link_request(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_TEARDOWN
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_TEARDOWN
 uint16_t uniffi_ciris_edge_checksum_func_link_teardown(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LOCAL_NAT_REPORT
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LOCAL_NAT_REPORT
+uint16_t uniffi_ciris_edge_checksum_func_local_nat_report(void
     
 );
 #endif

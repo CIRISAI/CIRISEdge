@@ -664,6 +664,16 @@ At a CPU-bound hub (#930) the real number is lower.
 
 ### 6.4 The ruling (normative)
 
+> **Superseded for now (Eric 2026-11-21, the calls cut on 45.x):** no traffic on the canonical
+> at all while the mesh scales, call audio included. A serve seat never relays call media:
+> it offers no relay whatever its host asks (`relay_capable` forced off), refuses a relay
+> SUBSCRIBE (`relay_serve_seat` locally, `relay_class_refused` on the wire), and a receiver drops a
+> seat's OFFER for a stream the seat does not publish (`alm_offer_refused:serve_seat`). V2's audio
+> fallback and §6.5's canonical tier stay in the code behind one lever,
+> `av_call::CANONICAL_AV_FALLBACK`, default **off**. A member that cannot reach another directly
+> is heard through another member (`MediaPathRestored { via: peer_relay, through }`), or reads
+> `MediaPathFailed { relay: none_available | refused_by_policy }`.
+
 - **V1.** A canonical MUST NOT relay `video`, at any layer, including the base layer and BLINKING_DOT.
   *Why:* §6.2–6.3. One rule with no layer arithmetic is predictable and testable.
 - **V2 (RULED, Eric 2026-11-01).** A canonical MAY relay `audio` as a fallback. Audio reservations go through the same C2

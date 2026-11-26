@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
-use ciris_edge::mls::cohort_group::mint_cohort_key_material;
+use ciris_edge::mls::cohort_group::{mint_cohort_key_material, CohortGroups};
 use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
 use ciris_edge::replication::attestation_bind::{bind_attestation_envelope, AttestationColumns};
 use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
@@ -1838,4 +1838,191 @@ async fn a_refused_call_row_is_one_event_and_the_call_lives() {
         assert!(!matches!(e, CallEvent::RecordRefused { .. }), "fired twice");
     }
     assert_eq!(call_a.attendees().await, vec![a.key.key_id.clone()]);
+}
+
+/// 45.3 — the most a call may take to follow its room's group to a head
+/// another handle on the same store wrote: one watch tick (250 ms) to see the
+/// stored head move, plus the roll itself (a reload of the group from the
+/// store, a hybrid-signed stream key, the bindings to every leg). The roll's
+/// share is well under a second in a debug build; the margin is for a loaded
+/// host.
+const ROLL_BOUND: Duration = Duration::from_secs(3);
+
+/// 45.3 — the most every pair's legs may take to come up once the roll ran:
+/// the rolled node redials every member at the new epoch's addresses at once
+/// (racing a dial still in flight to an old one), and each member it reaches
+/// races a dial back on the inbound link (`RACE_ON_INBOUND`): two dials in a
+/// row, each a link, a transit KEX and a hello on loopback, with the margin
+/// of [`ROLL_BOUND`].
+const LEGS_AFTER_ROLL_BOUND: Duration = Duration::from_secs(10);
+
+/// Wait for `EpochRolled { to }` on `events`.
+async fn rolled_to(events: &mut mpsc::Receiver<CallEvent>, to: u64, budget: Duration) -> bool {
+    tokio::time::timeout(budget, async {
+        while let Some(e) = events.recv().await {
+            if let CallEvent::EpochRolled { to: t, .. } = e {
+                if t >= to {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// **45.3** — a call follows a commit that a SECOND handle on the same store
+/// applied. The call holds the group its registry loaded at join; the room's
+/// chat holds its own (the host's chat driver does). Before 45.3 the call's
+/// copy never saw the chat's commit: `epoch()` read the copy's own state, the
+/// call never rolled, and only a restart cleared it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_follows_a_commit_that_another_handle_on_the_same_store_applied() {
+    let _call = one_call().await;
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = Ident::new("node-x-call-e453a", 0x73).await;
+    let dir = directory_with(vec![key.record().await]).await;
+    let x = node(key, dir, tmp.path(), &[]).await;
+    let tag = "e453a";
+    let room = room_of(tag);
+    let shared_store = store("e453a-shared");
+    CohortGroup::create(shared_store.clone(), &room, &x.key.key_id, 16)
+        .await
+        .expect("found the room");
+    // Two registries over ONE store: the call's (the Edge's) and the chat's.
+    let call_side = CohortGroups::new(shared_store.clone(), &x.key.key_id)
+        .open_existing(&room)
+        .await
+        .expect("the call's registry opens the room")
+        .expect("the room is held");
+    let chat_side = CohortGroups::new(shared_store.clone(), &x.key.key_id)
+        .open_existing(&room)
+        .await
+        .expect("the chat's registry opens the room")
+        .expect("the room is held");
+    let none = Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
+    let mut call = join(&x, &call_side, tag, CallOptions::default(), none)
+        .await
+        .expect("X joins");
+    let mut events = call.events().expect("events");
+    let at_join = call.epoch().await.0;
+    // The chat commits; the call's handle is not the one that applied it.
+    let commit = chat_side.rotate().await.expect("the chat commits");
+    assert_eq!(commit.epoch(), at_join + 1, "the store's head moved by one");
+    assert!(
+        rolled_to(&mut events, at_join + 1, ROLL_BOUND).await,
+        "the call rolled to the stored head within {ROLL_BOUND:?}"
+    );
+    assert_eq!(call.epoch().await.0, at_join + 1, "the call is at the head");
+    assert_eq!(
+        call_side.epoch().await,
+        at_join + 1,
+        "the call's handle followed the store"
+    );
+}
+
+/// **45.3** — the field's join race, on three nodes: A adds C while B's chat
+/// has not yet applied it; B joins the call (at the old epoch), then A and C
+/// (at the new one); then B's chat applies the Add. B's call must roll to the
+/// new epoch and every pair's legs must come up. Before 45.3 B's call held a
+/// second copy of the room's group that never saw its chat's commit: it sat
+/// at the old epoch, dialled addresses nobody registered, and nobody could
+/// dial it.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_member_whose_chat_applies_an_add_after_it_joined_the_call_rolls_and_every_leg_comes_up()
+{
+    let _call = one_call().await;
+    let tag = "e453b";
+    // The mesh's own room is not used: this one is built so B's call and B's
+    // chat hold two handles on one store.
+    let (nodes, _unused, _tmp) = mesh(tag, 3).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let room = room_of(tag);
+    let group_a = CohortGroup::create(store("e453b-a"), &room, &a.key.key_id, 16)
+        .await
+        .expect("A founds the room");
+    let (material_b, kp_b) = mint_cohort_key_material(&b.key.key_id).expect("B's key material");
+    let add_b = group_a
+        .add_member(&b.key.key_id, kp_b)
+        .await
+        .expect("add B");
+    let store_b = store("e453b-b");
+    let chat_b = CohortGroup::join(
+        store_b.clone(),
+        &room,
+        material_b,
+        add_b.welcome().expect("B's Welcome"),
+        16,
+    )
+    .await
+    .expect("B's chat joins");
+    let call_group_b = CohortGroups::new(store_b.clone(), &b.key.key_id)
+        .open_existing(&room)
+        .await
+        .expect("B's call registry opens the room")
+        .expect("B holds the room");
+    let (material_c, kp_c) = mint_cohort_key_material(&c.key.key_id).expect("C's key material");
+    let add_c = group_a
+        .add_member(&c.key.key_id, kp_c)
+        .await
+        .expect("add C");
+    let group_c = CohortGroup::join(
+        store("e453b-c"),
+        &room,
+        material_c,
+        add_c.welcome().expect("C's Welcome"),
+        16,
+    )
+    .await
+    .expect("C joins");
+    let new_epoch = group_a.epoch().await;
+    let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
+    // B joins first, its chat still one commit behind.
+    let mut call_b = join(b, &call_group_b, tag, CallOptions::default(), none())
+        .await
+        .expect("B joins");
+    let mut events_b = call_b.events().expect("B's events");
+    assert_eq!(
+        call_b.epoch().await.0 + 1,
+        new_epoch,
+        "B joined one epoch behind"
+    );
+    let call_a = join(a, &group_a, tag, CallOptions::default(), none())
+        .await
+        .expect("A joins");
+    let call_c = join(c, &group_c, tag, CallOptions::default(), none())
+        .await
+        .expect("C joins");
+    // Now B's chat applies the Add (and persists the new head).
+    let _ = chat_b
+        .apply_remote_commit(add_c.commit())
+        .await
+        .expect("B's chat applies the Add");
+    let applied = tokio::time::Instant::now();
+    assert!(
+        rolled_to(&mut events_b, new_epoch, ROLL_BOUND).await,
+        "B's call rolled to epoch {new_epoch} within {ROLL_BOUND:?} (at {})",
+        call_b.epoch().await.0
+    );
+    let rolled = applied.elapsed();
+    let up = wait_until(LEGS_AFTER_ROLL_BOUND, || async {
+        [&call_a, &call_b, &call_c]
+            .iter()
+            .all(|call| call.legs().len() >= 2)
+    })
+    .await;
+    assert!(
+        up,
+        "every pair's legs up within {LEGS_AFTER_ROLL_BOUND:?} of the roll: A {:?} B {:?} C {:?}",
+        call_a.legs(),
+        call_b.legs(),
+        call_c.legs()
+    );
+    eprintln!(
+        "[e453b] rolled {rolled:?} after the commit; every leg up {:?} after it",
+        applied.elapsed()
+    );
 }

@@ -917,6 +917,17 @@ pub const AV_LINK_ARRIVED: &str = "av_link_arrived";
 pub const AV_INBOUND_DELIVERED: &str = "av_inbound_delivered";
 /// Dropped: the consumer is a full queue behind (the never-block policy).
 pub const AV_INBOUND_DROPPED_QUEUE_FULL: &str = "av_inbound_dropped_queue_full";
+/// 45.2.0 — of the A/V frames dropped at the sink, the ALM C3 control frames
+/// (an offer, an answer, a subscribe): delivered by the transport and lost
+/// before the call saw them.
+pub const AV_INBOUND_CONTROL_DROPPED: &str = "av_inbound_control_dropped";
+/// 45.2.0 — a received frame dropped because the host is not reading the
+/// call's frames (its queue toward the host is full): delivery to the host
+/// is lossy, the pumps behind it never wait.
+pub const AV_FRAME_DROPPED_HOST_NOT_READING: &str = "av_frame_dropped_host_not_reading";
+/// 45.2.0 — a call event dropped because the host is not reading the call's
+/// events (its queue toward the host is full); nothing waits on it.
+pub const AV_CALL_EVENT_DROPPED_HOST_NOT_READING: &str = "av_call_event_dropped_host_not_reading";
 /// Dropped: the link's peer did not pass the #393 attribution gate.
 pub const AV_INBOUND_DROPPED_UNATTRIBUTED: &str = "av_inbound_dropped_unattributed";
 /// Dropped: a peer-opened A/V link arrived and nobody took the arrivals
@@ -1085,12 +1096,76 @@ pub const ALM_OFFER_REFUSED_NOT_PUBLISHER: &str = "alm_offer_refused:not_publish
 /// the publisher's own first offers at a join: the next one, a second later,
 /// is checked again.
 pub const ALM_OFFER_REFUSED_UNBOUND: &str = "alm_offer_refused:unbound";
+/// [`ALM_OFFER_REFUSED`]: a serve seat offered a stream it does not publish
+/// (calls cut: a serve seat never relays call media, audio included).
+pub const ALM_OFFER_REFUSED_SERVE_SEAT: &str = "alm_offer_refused:serve_seat";
 /// ALM C2 — a subscribe admitted / refused at this node.
 pub const ALM_ADMIT: &str = "alm_admit";
 /// ALM C2 — a subscribe refused at this node (the token is counted too).
 pub const ALM_REFUSE: &str = "alm_refuse";
+/// ALM C2 — this serve seat refused a relay subscribe (calls cut: a serve
+/// seat never relays call media). The wire says `relay_class_refused`.
+pub const ALM_REFUSE_SERVE_SEAT: &str = "relay_serve_seat";
 /// ALM C2 — a subscriber shed by this node.
 pub const ALM_SHED: &str = "alm_shed";
+/// ALM C2 — a child shed because this node turned relaying off
+/// (`Call::set_relay(false)`). The wire says `relay_shed:upstream_lost`.
+pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
+/// G8 — this node's uplink stalled: its legs' Channels held messages
+/// unproved past `UPLINK_STALL_MS` on two legs or more. Counted on the rise.
+pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
+/// G8 — a periodic offer not sent on a leg whose oldest unproved Channel
+/// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
+/// queue behind the backlog and spend that link's retry budget.
+pub const ALM_OFFER_HELD_BACKLOG: &str = "alm_offer_held:backlog";
+/// RM5 (ReceiverMoves) — a direct child left this node's live stream: read
+/// as congestion (room = the children left, the probe backoff up one).
+pub const ALM_DEPARTURE_CONGESTION: &str = "alm_departure_congestion";
+/// RM2/RM3 (ReceiverMoves) — this node left a publisher whose media reached
+/// it late for a member relay, on that relay's admit.
+pub const ALM_LATE_MOVE: &str = "alm_late_move";
+/// RM4 (ReceiverMoves) — a late episode in which this node did not move: it
+/// is the lowest-ranked of the publisher's direct children (the one kept).
+pub const ALM_LATE_SPARED: &str = "alm_late_spared";
+/// RM6 (ReceiverMoves) — a late episode in which this node did not move:
+/// every other source it hears is late too (its own downlink).
+pub const ALM_LATE_OWN_DOWNLINK: &str = "alm_late_guarded:own_downlink";
+/// G8 — a chunk a settling leg had parked went out on the flusher's retry.
+pub const AV_CHUNK_PARKED_SENT: &str = "av_chunk_parked_sent";
+/// G8 — a parked chunk replaced by a newer one (it never left the process).
+pub const AV_CHUNK_PARKED_REPLACED: &str = "av_chunk_parked_replaced";
+/// G8 C — a call leg waiting out a failed dial's backoff dialled at once
+/// because the member's direct path came up.
+pub const AV_LEG_REDIAL_ON_DIRECT_PATH: &str = "av_leg_redial_on_direct_path";
+/// A verified chunk passed on to leviculum as evidence that its publisher's
+/// node is alive (the peer-evidence hold), on one A/V link to that node.
+pub const AV_PEER_EVIDENCE_NOTED: &str = "av_peer_evidence_noted";
+/// G8 — a periodic stream-key binding re-announce skipped on one leg: the
+/// uplink stall verdict held or the leg was backlogged.
+pub const AV_BINDING_REANNOUNCE_HELD: &str = "av_binding_reannounce_held";
+/// G8 serial redial — a leg redial deferred: this node's uplink stall
+/// verdict holds and the member is heard through a relay.
+pub const AV_LEG_REDIAL_DEFERRED: &str = "av_leg_redial_deferred";
+/// 45.2.0 — a send found this node's own leg to a member gone (the link no
+/// longer held): the leg is dropped from the call's legs so it is redialled.
+pub const AV_LEG_GONE_ON_SEND: &str = "av_leg_gone_on_send";
+/// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
+/// unshaped links only (Eric 2026-11-06).
+pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
+/// 45.2.0 — a live call ended because this node stopped carrying call media
+/// (it turned shaped-only or anonymous), `EndCause::MediaRefused`.
+pub const AV_CALL_ENDED_MEDIA_REFUSED: &str = "av_call_ended_media_refused";
+/// 45.3 — a call's watch found its room's group behind the store's head
+/// (another handle on the same store applied a commit) and reloaded it, so
+/// the call rolls to the stored epoch.
+pub const AV_CALL_ROOM_FOLLOWED_STORE: &str = "av_call_room_followed_store";
+/// 45.3 — a call's roll to its room's new epoch failed (the group, the owner
+/// bindings, the stream key or the DEK unreadable); retried every watch tick.
+pub const AV_CALL_ROLL_FAILED: &str = "av_call_roll_failed";
+/// 45.3 — a cached room-group handle could not follow the store's head when
+/// opened (a store fault, a snapshot that will not load): handed out as it
+/// was, counted here.
+pub const AV_CALL_ROOM_REFRESH_FAILED: &str = "av_call_room_refresh_failed";
 /// ALM — a chunk this node forwarded as an admitted media parent.
 pub const ALM_FORWARDED: &str = "alm_forwarded";
 /// ALM C4 — this node's primary parent for a stream changed.
@@ -1521,6 +1596,12 @@ pub const DIRECT_LINK_FAILED_INTERFACE_LOST: &str = "direct_link_failed_interfac
 pub const DIRECT_LINK_FAILED_PEER_FELL_BACK: &str = "direct_link_failed_peer_fell_back";
 /// A punched interface went down; its link is back on its relayed path.
 pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
+/// G8 — a direct path forgotten because its LINK closed (the punched
+/// interface went with it): the next dial proposes at once.
+pub const DIRECT_LINK_RELEASED_LINK_CLOSED: &str = "direct_link_released_link_closed";
+/// G8 C — at a direct path's release, a path request for the peer's
+/// announced destination went out (its route rode the punched interface).
+pub const DIRECT_LINK_RELEASED_PATH_REQUESTED: &str = "direct_link_released_path_requested";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
@@ -2204,6 +2285,10 @@ pub const LINK_STALL_CLOSED: &str = "link_stall_closed";
 /// A link judged dead on a punched interface was moved back onto its relayed
 /// path (leviculum#83 `retire_direct_link`) instead of closed.
 pub const LINK_STALL_RETIRED_DIRECT: &str = "link_stall_retired_direct";
+/// A stalled link was NOT acted on: its peer is demonstrably alive (verified
+/// media from it within the last seconds), so its acknowledgements are late
+/// behind a queue, not lost.
+pub const LINK_STALL_HELD_PEER_ALIVE: &str = "link_stall_held_peer_alive";
 
 // ─── v43 InvalidProof triage — `EdgeMetrics::peer_binding` labels ──────
 //
@@ -2876,6 +2961,8 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_FAILED_INTERFACE_LOST,
     DIRECT_LINK_FAILED_PEER_FELL_BACK,
     DIRECT_LINK_LOST,
+    DIRECT_LINK_RELEASED_LINK_CLOSED,
+    DIRECT_LINK_RELEASED_PATH_REQUESTED,
     DIRECT_LINK_LEG_FELL_BACK,
     DIRECT_LINK_OFF_PROPOSING_OFF,
     DIRECT_LINK_OFF_NO_FACILITATOR,
@@ -2892,6 +2979,9 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_LINK_ARRIVED,
     AV_INBOUND_DELIVERED,
     AV_INBOUND_DROPPED_QUEUE_FULL,
+    AV_INBOUND_CONTROL_DROPPED,
+    AV_FRAME_DROPPED_HOST_NOT_READING,
+    AV_CALL_EVENT_DROPPED_HOST_NOT_READING,
     AV_INBOUND_DROPPED_UNATTRIBUTED,
     AV_INBOUND_DROPPED_NO_CONSUMER,
     AV_INBOUND_DROPPED_ARRIVALS_FULL,
@@ -2950,9 +3040,30 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_OFFER_REFUSED,
     ALM_OFFER_REFUSED_NOT_PUBLISHER,
     ALM_OFFER_REFUSED_UNBOUND,
+    ALM_OFFER_REFUSED_SERVE_SEAT,
     ALM_ADMIT,
     ALM_REFUSE,
+    ALM_REFUSE_SERVE_SEAT,
     ALM_SHED,
+    ALM_RELAY_OFF_SHED,
+    ALM_UPLINK_STALL,
+    ALM_OFFER_HELD_BACKLOG,
+    ALM_DEPARTURE_CONGESTION,
+    ALM_LATE_MOVE,
+    ALM_LATE_SPARED,
+    ALM_LATE_OWN_DOWNLINK,
+    AV_CHUNK_PARKED_SENT,
+    AV_CHUNK_PARKED_REPLACED,
+    AV_LEG_REDIAL_ON_DIRECT_PATH,
+    AV_PEER_EVIDENCE_NOTED,
+    AV_BINDING_REANNOUNCE_HELD,
+    AV_LEG_REDIAL_DEFERRED,
+    AV_LEG_GONE_ON_SEND,
+    SHAPED_ONLY_NO_MEDIA,
+    AV_CALL_ENDED_MEDIA_REFUSED,
+    AV_CALL_ROOM_FOLLOWED_STORE,
+    AV_CALL_ROLL_FAILED,
+    AV_CALL_ROOM_REFRESH_FAILED,
     ALM_FORWARDED,
     ALM_PARENT_CHANGE,
     ALM_RELAY_TIER_ROSTER,
@@ -3146,6 +3257,7 @@ pub const LINK_STALL_LABELS: &[&str] = &[
     LINK_STALL_ZERO_LANDED_SEND,
     LINK_STALL_CLOSED,
     LINK_STALL_RETIRED_DIRECT,
+    LINK_STALL_HELD_PEER_ALIVE,
 ];
 /// Every `direct_link_upgrade_guarded` key.
 pub const UPGRADE_GUARDED_LABELS: &[&str] = &[UPGRADE_GUARDED_POOL, UPGRADE_GUARDED_SHIP];

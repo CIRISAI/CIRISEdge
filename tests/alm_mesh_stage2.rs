@@ -40,6 +40,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -339,7 +340,180 @@ async fn topo(
     dials: &[(usize, usize)],
     canonical: Option<usize>,
 ) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
+    topo_capped(tag, n, members, dials, canonical, None).await
+}
+
+/// A node's UPLINK as a shared bottleneck: every byte the node sends back
+/// down a TCP link another node dialled to it waits its turn in ONE FIFO
+/// drained at `bytes_per_s` (0: unlimited), with no queue limit — a
+/// bufferbloated home or cellular uplink. What others send to the node
+/// passes at once. Turned on after setup.
+struct CappedUplink {
+    bytes_per_s: AtomicU64,
+    next_free: tokio::sync::Mutex<tokio::time::Instant>,
+    /// The longest any byte has waited to leave (µs): the peak queue delay.
+    peak_us: AtomicU64,
+    /// ReceiverMoves (RM6) — a fixed delay (ms) on what OTHERS send this
+    /// node: a slow downlink. 0: none.
+    down_delay_ms: AtomicU64,
+}
+
+impl CappedUplink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bytes_per_s: AtomicU64::new(0),
+            next_free: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            peak_us: AtomicU64::new(0),
+            down_delay_ms: AtomicU64::new(0),
+        })
+    }
+
+    /// How long a byte handed over now waits to leave.
+    async fn queue_now(&self) -> Duration {
+        let next = *self.next_free.lock().await;
+        next.saturating_duration_since(tokio::time::Instant::now())
+    }
+
+    /// Delay everything others send this node by `ms` (its downlink).
+    fn delay_down_ms(&self, ms: u64) {
+        self.down_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// How long a byte handed over now waits to leave (ms), when the queue
+    /// is not being written this instant.
+    fn queue_ms(&self) -> Option<u64> {
+        let next = self.next_free.try_lock().ok()?;
+        Some(
+            u64::try_from(
+                next.saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+        )
+    }
+
+    /// The peak queue delay so far, and reset it.
+    fn take_peak(&self) -> Duration {
+        Duration::from_micros(self.peak_us.swap(0, Ordering::SeqCst))
+    }
+
+    fn cap_kbit(&self, kbit: u64) {
+        self.bytes_per_s.store(kbit * 1000 / 8, Ordering::SeqCst);
+    }
+
+    /// When `n` bytes handed over now leave the bottleneck.
+    async fn due(&self, n: usize) -> tokio::time::Instant {
+        let rate = self.bytes_per_s.load(Ordering::SeqCst);
+        let now = tokio::time::Instant::now();
+        if rate == 0 {
+            return now;
+        }
+        let mut next = self.next_free.lock().await;
+        let start = (*next).max(now);
+        let done = start + Duration::from_micros(n as u64 * 1_000_000 / rate);
+        *next = done;
+        let waited = u64::try_from(done.duration_since(now).as_micros()).unwrap_or(u64::MAX);
+        self.peak_us.fetch_max(waited, Ordering::SeqCst);
+        done
+    }
+}
+
+/// A pipe in front of `port`'s listener whose return direction (the node's
+/// sends) rides `uplink`. Returns the port to dial instead.
+async fn capped_listener(port: u16, uplink: Arc<CappedUplink>) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the capped pipe");
+    let front = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(node) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+                continue;
+            };
+            let _ = client.set_nodelay(true);
+            let _ = node.set_nodelay(true);
+            let (mut client_rx, mut client_tx) = client.into_split();
+            let (mut node_rx, mut node_tx) = node.into_split();
+            // The node's downlink: passes at once, or after the set delay.
+            let (dtx, mut drx) = mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            let down = Arc::clone(&uplink);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = client_rx.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    let d = down.down_delay_ms.load(Ordering::SeqCst);
+                    let due = tokio::time::Instant::now() + Duration::from_millis(d);
+                    if dtx.send((due, buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, bytes)) = drx.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if node_tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            let up = Arc::clone(&uplink);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = node_rx.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    // Paced in small pieces, as a link drains: one read of
+                    // a deep queue is many frames, and one due time for all
+                    // of them would deliver them as one burst.
+                    for piece in buf[..n].chunks(512) {
+                        let due = up.due(piece.len()).await;
+                        if tx.send((due, piece.to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, bytes)) = rx.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if client_tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    front
+}
+
+/// [`topo`], with node `capped.0`'s uplink a [`CappedUplink`]: every node that
+/// dials it reaches it through [`capped_listener`]. The capped node must dial
+/// nobody (its own outbound connections would bypass the cap).
+#[allow(clippy::too_many_lines)] // `topo`'s body plus the capped pipe
+async fn topo_capped(
+    tag: &str,
+    n: usize,
+    members: usize,
+    dials: &[(usize, usize)],
+    canonical: Option<usize>,
+    capped: Option<(usize, Arc<CappedUplink>)>,
+) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
     init_tracing();
+    if let Some((c, _)) = &capped {
+        assert!(
+            dials.iter().all(|(_, j)| j != c),
+            "the capped node dials nobody"
+        );
+    }
+    let mut capped_port: Option<u16> = None;
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut keys = Vec::new();
     for i in 0..n {
@@ -358,11 +532,19 @@ async fn topo(
     let mut nodes: Vec<Node> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
         let dir = directory_with(records.clone()).await;
-        let peers: Vec<u16> = dials
-            .iter()
-            .filter(|(_, j)| *j == i)
-            .map(|(a, _)| nodes[*a].port)
-            .collect();
+        let mut peers: Vec<u16> = Vec::new();
+        for (a, _) in dials.iter().filter(|(_, j)| *j == i) {
+            match &capped {
+                Some((c, uplink)) if c == a => {
+                    if capped_port.is_none() {
+                        capped_port =
+                            Some(capped_listener(nodes[*a].port, Arc::clone(uplink)).await);
+                    }
+                    peers.push(capped_port.expect("the capped pipe"));
+                }
+                _ => peers.push(nodes[*a].port),
+            }
+        }
         nodes.push(
             node(
                 key,
@@ -1054,6 +1236,76 @@ async fn a_signed_leave_says_why_and_a_killed_node_is_lost_after_the_bound() {
     );
 }
 
+/// **Lost, old-build shape** (45.3): C's call task dies with C's node still
+/// up, still answering on the call's address and routing nothing (a build
+/// before 45.3 dropped a call so; an old peer still does). A redials C after
+/// its leg closes; the dial lands on a node with no live call, which closes
+/// the link, so A holds no leg to C and reads it `Lost` within the bound.
+/// Before 45.3 the router dropped the arrival and left the link up: A held a
+/// leg to nowhere and never read C lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_node_that_answers_but_routes_no_call_is_read_lost_within_the_bound() {
+    use ciris_edge::transport::av_call::{LeaveCause, ATTENDEE_LOST_AFTER};
+    let _call = one_call().await;
+    let tag = "alm2-lost-oldbuild";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, c) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[1], tag, CallOptions::default(), None).await;
+    for x in [&ca, &cc] {
+        wait_legs(x, 1).await;
+        wait_bound(x, 1).await;
+    }
+    let mut events = ca.events().expect("A's events");
+    for seq in 0..10u64 {
+        cc.publish(Frame::opaque(body("c", seq)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let c_stream = cc.stream();
+    // C's legs go, and its call with them; its node stays up on the address.
+    cc.close_leg_for_test(&a.key.key_id).await;
+    let leg = ca.leg_link_for_test(&c.key.key_id);
+    cc.drop_keeping_the_wire_for_test();
+    if let Some(l) = leg {
+        let _ = a.transport.link_teardown(&l).await;
+    }
+    let killed = tokio::time::Instant::now();
+    // The bound: ATTENDEE_LOST_AFTER of no leg and silence, plus a redial
+    // cycle (a dial, the far end's close) and the watch tick.
+    let bound = ATTENDEE_LOST_AFTER + Duration::from_secs(10);
+    let mut seq = 100u64;
+    let lost = tokio::time::timeout(bound, async {
+        loop {
+            let _ = ca.publish(Frame::opaque(body("a", seq))).await;
+            seq += 1;
+            while let Ok(e) = events.try_recv() {
+                if let CallEvent::AttendeeLeft {
+                    key_id,
+                    stream,
+                    cause,
+                    ..
+                } = e
+                {
+                    if key_id == c.key.key_id {
+                        return (stream, cause, killed.elapsed());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("A reads C lost within {bound:?}: legs {:?}", ca.legs()));
+    assert_eq!((lost.0, lost.1), (c_stream, LeaveCause::Lost));
+    assert!(
+        lost.2 >= ATTENDEE_LOST_AFTER,
+        "not before the bound: {:?}",
+        lost.2
+    );
+}
+
 /// **Removed** (v45): the room's MLS group drops C's key; A's call rolls
 /// and reads `AttendeeLeft { C, Removed }`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1736,6 +1988,31 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     // on a layer A is steadily getting.
     let b_stream = cb.stream();
     let view = wait_view_settled(&ca, b_stream).await;
+    // Both ends of a loss gap must lie in one receive view to count. The
+    // frames above may have come before A's first admission (its ADMIT is a
+    // new view): three clean frames handed out in the settled view anchor
+    // the gap's left end in it (45.3; the ADMIT's landing after frame 30 was
+    // a timing accident that once happened to fall the other way).
+    let anchor: Vec<Vec<u8>> = (90..93u64).map(|n| video(n, 3_000).bytes).collect();
+    for n in 90..93u64 {
+        cb.publish(video(n, 3_000)).await.expect("P-frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let mut anchored = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while anchored < anchor.len() {
+            match frames.recv().await {
+                Some(f) if f.publisher == b.key.key_id && anchor.contains(&f.bytes) => {
+                    anchored += 1;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    })
+    .await;
+    assert_eq!(anchored, anchor.len(), "the anchor frames arrive whole");
+    assert_eq!(ca.layer_view(b_stream), view, "in the settled view");
     cb.withhold_from_for_test(&a.key.key_id, 7);
     let mut lossy = Vec::new();
     for n in 100..130u64 {
@@ -1824,7 +2101,13 @@ async fn a_keyframe_reaches_a_loaded_receiver_whole() {
     let mut cb = join_loaded(b, &groups[1], tag, phone, None).await;
     wait_legs(&ca, 1).await;
     wait_legs(&cb, 1).await;
-    wait_bound(&ca, 1).await;
+    // Both of B's bindings, v1 AND v2: the v2 carries the framing and goes
+    // only after the CAPS exchange, later than v1. Publishing on v1 alone
+    // raced it: the keyframe's chunks waited FRAMING_HOLD for a framing the
+    // loaded receiver had not verified yet and were dropped as unknown under
+    // a busy host (45.3; failed on v45.2.0 too). This witness is about the
+    // data plane holding the burst, not about binding timing.
+    wait_bound(&ca, 2).await;
     let mut frames = ca.frames().expect("A's frames");
     a.transport.refresh_metrics();
     let shed_before = av(&a.metrics, "av_datagram_shed_sink");
@@ -3080,4 +3363,2500 @@ async fn a_member_claiming_depth_zero_is_not_the_publisher() {
         "{:?}",
         c.metrics.av_plane()
     );
+}
+
+/// **Calls cut — a relay turns off mid-call** (`Call::set_relay(false)`):
+/// members `A` and `E` both relay; `B` and `C` reach each other only through
+/// them (each a TCP client of A and E; `T` the canonical, no member). C hears
+/// B through one of them, X. X turns relaying off: it sheds C make-before-
+/// break, C re-parents to the other relay Y and keeps hearing B, the event
+/// at C names Y, and X reports `RelayStatus { relaying: false }` and, once
+/// its drain passes, forwards to nobody.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_relay_that_turns_off_hands_its_children_to_another_relay() {
+    let _call = one_call().await;
+    let tag = "alm2-setrelay";
+    // 0 = A, 1 = E (relays), 2 = B, 3 = C (the room's four); 4 = T.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+    )
+    .await;
+    let (a, e, b, c, t) = (&nodes[0], &nodes[1], &nodes[2], &nodes[3], &nodes[4]);
+    let ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let ce = join_loaded(e, &groups[1], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(b, &groups[2], tag, relay_opts(), None).await;
+    let mut cc = join_loaded(c, &groups[3], tag, relay_opts(), None).await;
+    let mut c_events = cc.events().expect("C's events");
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!cc.legs().contains(&b.key.key_id), "C has no leg to B");
+
+    let relays = [a.key.key_id.clone(), e.key.key_id.clone()];
+    let on_a_relay =
+        || async { primary_for(&cc, cb.stream()).is_some_and(|p| relays.contains(&p)) };
+    assert!(
+        wait_until(Duration::from_secs(90), on_a_relay).await,
+        "C hears B through A or E: {:?}",
+        cc.alm_parents()
+    );
+    let x = primary_for(&cc, cb.stream()).expect("a parent");
+    let (cx, y) = if x == a.key.key_id {
+        (&ca, e.key.key_id.clone())
+    } else {
+        (&ce, a.key.key_id.clone())
+    };
+    assert_ne!(x, t.key.key_id);
+    let (relaying, kids) = cx.relay_status();
+    assert!(relaying && kids >= 1, "X relays: {:?}", cx.relay_status());
+
+    // X turns relaying off.
+    cx.set_relay(false).await;
+    assert!(!cx.relay_status().0);
+    let moved = wait_until(Duration::from_secs(30), || async {
+        primary_for(&cc, cb.stream()).as_deref() == Some(y.as_str())
+    })
+    .await;
+    assert!(
+        moved,
+        "C re-parents to the other relay: {:?}; X's log {:?}",
+        cc.alm_parents(),
+        cx.alm_log()
+    );
+    // C still hears B, now through Y.
+    let mut rx_c = cc.frames().expect("C's frames");
+    let mut heard = 0;
+    for seq in 0..40 {
+        cb.publish(Frame::opaque(body("b", seq)))
+            .await
+            .expect("B publishes");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(f)) = tokio::time::timeout_at(deadline, rx_c.recv()).await {
+        if f.publisher == b.key.key_id {
+            heard += 1;
+            if heard == 40 {
+                break;
+            }
+        }
+    }
+    assert!(heard >= 36, "C keeps hearing B through Y: {heard} of 40");
+    // X forwards to nobody once its drain passes, and said so.
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            cx.relay_status() == (false, 0)
+        })
+        .await,
+        "X's children are gone: {:?}",
+        cx.relay_status()
+    );
+    assert!(
+        av(
+            if x == a.key.key_id {
+                &a.metrics
+            } else {
+                &e.metrics
+            },
+            "relay_shed:relay_off"
+        ) >= 1
+    );
+    // C was told the path moved through Y.
+    let mut through = Vec::new();
+    while let Ok(ev) = c_events.try_recv() {
+        if let ciris_edge::transport::av_call::CallEvent::MediaPathRestored {
+            member,
+            via,
+            through: t,
+        } = ev
+        {
+            if member == b.key.key_id {
+                assert_eq!(via, ciris_edge::transport::media_path::PathKind::PeerRelay);
+                through.push(t);
+            }
+        }
+    }
+    assert_eq!(
+        through.last().cloned().flatten().as_deref(),
+        Some(y.as_str()),
+        "the last path event for B names Y: {through:?}"
+    );
+    drop(cc);
+    drop(cb);
+    drop(ce);
+    drop(ca);
+}
+
+/// **Calls cut — a serve seat that IS a room member never relays**, audio
+/// included, even joined with `relay: true`: members `A` (relays), `S` (a
+/// serve seat in every node's canonical set, its own included), `B` and `C`
+/// (each a TCP client of A and S only, so they reach each other only through
+/// one of them). B and C hear each other through A, never S; S reports
+/// `relaying: false` and forwards to nobody, and nobody takes it as a parent.
+// The seat set lives on the node's Edge (`_edge`).
+#[allow(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::used_underscore_binding
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_serve_seat_in_the_room_never_relays() {
+    let _call = one_call().await;
+    let tag = "alm2-seat";
+    // 0 = A, 1 = S (the seat), 2 = B, 3 = C; 4 = T.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+    )
+    .await;
+    let (a, seat, b, c) = (&nodes[0], &nodes[1], &nodes[2], &nodes[3]);
+    for n in &nodes {
+        n._edge
+            .recognised_seats()
+            .write()
+            .expect("the seat set")
+            .insert(seat.key.key_id.clone());
+    }
+    let _ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let cs = join_loaded(seat, &groups[1], tag, relay_opts(), None).await;
+    let cb = join_loaded(b, &groups[2], tag, relay_opts(), None).await;
+    let cc = join_loaded(c, &groups[3], tag, relay_opts(), None).await;
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    assert_eq!(cs.relay_status(), (false, 0), "a seat never relays");
+    let through_a = wait_until(Duration::from_secs(90), || async {
+        primary_for(&cc, cb.stream()).as_deref() == Some(a.key.key_id.as_str())
+            && primary_for(&cb, cc.stream()).as_deref() == Some(a.key.key_id.as_str())
+    })
+    .await;
+    assert!(
+        through_a,
+        "B and C hear each other through A: C {:?} / B {:?}",
+        cc.alm_parents(),
+        cb.alm_parents()
+    );
+    // Long enough for several offer rounds: S is never a parent of anything
+    // it does not publish, and relays nothing.
+    for _ in 0..20 {
+        for call in [&cb, &cc] {
+            for p in call.alm_parents() {
+                if p.publisher.as_deref() == Some(seat.key.key_id.as_str()) {
+                    continue;
+                }
+                for parent in [p.primary.as_deref(), p.standby.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert_ne!(parent, seat.key.key_id, "the seat is a media parent: {p:?}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(cs.relay_status(), (false, 0));
+    // Asked outright, the seat refuses: B sends it a relay SUBSCRIBE for C's
+    // stream (as a stale or misbehaving member would).
+    let sub = encode(
+        cc.stream(),
+        &ControlMsg::Subscribe(SubscribeRequest {
+            subscriber: b.key.key_id.clone(),
+            role: Role::Primary,
+            forward_capable: false,
+            layers: None,
+        }),
+    );
+    cb.send_c3_for_test(&seat.key.key_id, sub).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            av(&seat.metrics, "relay_serve_seat") >= 1
+        })
+        .await,
+        "the seat refuses a relay SUBSCRIBE by name: {:?}",
+        seat.metrics.av_plane()
+    );
+    assert!(cs.relayed_to().is_empty(), "{:?}", cs.relayed_to());
+    assert_eq!(cs.alm_counts().forwarded, 0);
+}
+
+/// Publish 600 B frames at 30 Hz from `cp` for `secs`, from `seq0`.
+async fn publish_capped_for(cp: &mut Call, secs: u64, seq0: u64) -> u64 {
+    publish_timed_for(cp, secs, seq0).await.0
+}
+
+/// Every frame each of `listeners` hears from `publisher`, counted as it
+/// arrives (a call's frame queue holds 256: read only at the end, a count is
+/// capped there).
+struct FrameCounts {
+    counts: Vec<Arc<AtomicU64>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl FrameCounts {
+    fn read(&self) -> Vec<u64> {
+        self.counts
+            .iter()
+            .map(|c| c.load(Ordering::SeqCst))
+            .collect()
+    }
+}
+
+impl Drop for FrameCounts {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+fn count_frames_from(listeners: &mut [Call], publisher: &str) -> FrameCounts {
+    let mut counts = Vec::new();
+    let mut tasks = Vec::new();
+    for l in listeners.iter_mut() {
+        let mut rx = l.frames().expect("frames");
+        let c = Arc::new(AtomicU64::new(0));
+        let n = Arc::clone(&c);
+        let from = publisher.to_owned();
+        tasks.push(tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if f.publisher == from {
+                    n.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }));
+        counts.push(c);
+    }
+    FrameCounts { counts, tasks }
+}
+
+/// One frame at the 30 Hz these witnesses publish at.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// How long each `publish()` call took: `(max, p95, p50)`.
+// p95/p50 are read only through the Debug line in `publish_timed_for`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct PublishLatency {
+    max: Duration,
+    p95: Duration,
+    p50: Duration,
+}
+
+/// [`publish_capped_for`], timing every `publish()` call (the host's capture
+/// loop waits on it).
+async fn publish_timed_for(cp: &mut Call, secs: u64, seq0: u64) -> (u64, PublishLatency) {
+    let size = cp.chunk_plaintext_budget().unwrap_or(240).min(600);
+    let mut seq = seq0;
+    let mut took: Vec<Duration> = Vec::new();
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < end {
+        let mut b = body("p", seq);
+        b.resize(size, b'.');
+        let t = tokio::time::Instant::now();
+        let _ = cp.publish(Frame::opaque(b)).await;
+        took.push(t.elapsed());
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    took.sort();
+    let at = |q: usize| {
+        took.get((took.len() * q / 100).min(took.len().saturating_sub(1)))
+            .copied()
+    };
+    let lat = PublishLatency {
+        max: took.last().copied().unwrap_or_default(),
+        p95: at(95).unwrap_or_default(),
+        p50: at(50).unwrap_or_default(),
+    };
+    eprintln!("[G8] publish latency over {} calls: {lat:?}", took.len());
+    (seq, lat)
+}
+
+/// Every link `m` saw closed by Channel retry exhaustion, either side
+/// (A/V legs included: they are not identified, so `peer_activity` misses
+/// them).
+fn channel_exhausted(m: &EdgeMetrics) -> u64 {
+    closed_by(m, "channel_exhausted")
+}
+
+/// Every link `m` saw closed with `cause`, inbound and outbound.
+fn closed_by(m: &EdgeMetrics, cause: &str) -> u64 {
+    m.inbound_link_closed_by_reason()
+        .get(cause)
+        .copied()
+        .unwrap_or(0)
+        + m.outbound_link_closed_by_reason()
+            .get(cause)
+            .copied()
+            .unwrap_or(0)
+}
+
+/// Every link `m` saw torn down by something other than this node or its
+/// peer choosing to (a retry exhaustion, a timeout, staleness).
+fn torn_down(m: &EdgeMetrics) -> u64 {
+    ["channel_exhausted", "timeout", "stale"]
+        .iter()
+        .map(|c| closed_by(m, c))
+        .sum()
+}
+
+/// **Every pair has both legs within the setup bound, and keeps them,
+/// uncapped** (rxmove's come-back trace): in the room of
+/// [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`] with
+/// no cap, every member holds its own leg to every other member within
+/// `SETUP_BOUND` of the last join, and the call's legs agree with what its
+/// publisher can send on, for the whole stretch. Without the fix the early
+/// joiners (P first) had no leg to the later ones for ~6 s: each dial began
+/// before that member's address stood and sat out the 5 s no-path establish
+/// timeout and a backoff, while P's ADMITs rode the members' paced in-links.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn every_pair_keeps_both_legs_uncapped() {
+    /// One dial backoff floor (`DIAL_BACKOFF_MIN`, 1 s): once the last
+    /// member has joined, every member it reaches dials back at once, with
+    /// no backoff and no 5 s no-path establish timeout waited out (6.4 s
+    /// without the fix). A setup over 1 s is a bug to find, not a bound to
+    /// move (the lead's ruling, 2026-11-25: the 2 s this carried was set
+    /// after seeing results up to 0.82 s).
+    const SETUP_BOUND: Duration = Duration::from_secs(1);
+    let _call = one_call().await;
+    let tag = "alm2-legs";
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        None,
+    )
+    .await;
+    let mut cp = join_loaded(&nodes[0], &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    let ids: Vec<String> = nodes[..4].iter().map(|n| n.key.key_id.clone()).collect();
+    // Setup: from the last join until every node holds a leg to every other
+    // member, in the call and in its dispatcher alike.
+    let joined = tokio::time::Instant::now();
+    let mut setup = None;
+    let mut timeline: Vec<(u128, Vec<(usize, usize)>)> = Vec::new();
+    while joined.elapsed() < Duration::from_secs(30) {
+        let calls: Vec<&Call> = std::iter::once(&cp).chain(listeners.iter()).collect();
+        let mut row = Vec::new();
+        for c in &calls {
+            row.push((c.legs().len(), c.dispatcher_legs_for_test().await.len()));
+        }
+        if timeline.last().is_none_or(|l| l.1 != row) {
+            timeline.push((joined.elapsed().as_millis(), row.clone()));
+        }
+        if row.iter().all(|r| *r == (3, 3)) {
+            setup = Some(joined.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    eprintln!("[LEGS] setup {setup:?}; timeline {timeline:?}");
+    // The bound from mechanism: once the last member has joined, every
+    // member it reaches dials back at once, with no wait on a no-path
+    // establish timeout begun before that member's address stood.
+    assert!(
+        setup.is_some_and(|d| d <= SETUP_BOUND),
+        "every pair has both legs within {SETUP_BOUND:?} of the last join: {setup:?}; timeline {timeline:?}"
+    );
+    let mut failed: Vec<String> = Vec::new();
+    let c3_failed = |nodes: &[Node]| -> Vec<u64> {
+        nodes
+            .iter()
+            .map(|n| av(&n.metrics, "alm_c3_send_failed"))
+            .collect()
+    };
+    let c3_before = c3_failed(&nodes);
+    let mut seq = 0;
+    for second in 0..20u64 {
+        seq = publish_timed_for(&mut cp, 1, seq).await.0;
+        let calls: Vec<&Call> = std::iter::once(&cp).chain(listeners.iter()).collect();
+        for (i, c) in calls.iter().enumerate() {
+            let mut want: Vec<String> = ids.iter().filter(|m| **m != ids[i]).cloned().collect();
+            want.sort();
+            let (legs, held) = (c.legs(), c.dispatcher_legs_for_test().await);
+            if legs != want || held != want {
+                failed.push(format!(
+                    "t+{second}s node {i}: legs {} of 3, dispatcher {} of 3 (agree: {})",
+                    legs.len(),
+                    held.len(),
+                    legs == held
+                ));
+            }
+        }
+    }
+    // Uncapped, no C3 frame is ever given up on: a period's offers to one
+    // member are paced onto its link, not refused by its pacing gate.
+    let c3_after = c3_failed(&nodes);
+    let c3_lost: Vec<u64> = c3_after
+        .iter()
+        .zip(&c3_before)
+        .map(|(a, b)| a.saturating_sub(*b))
+        .collect();
+    eprintln!("[LEGS] C3 frames given up on, per node, over 20 s: {c3_lost:?}");
+    if c3_lost.iter().any(|n| *n > 0) {
+        failed.push(format!("C3 frames given up on, per node: {c3_lost:?}"));
+    }
+    assert!(
+        failed.is_empty(),
+        "every pair keeps both legs: {failed:?}; legs gone on send {:?}",
+        nodes
+            .iter()
+            .map(|n| av(&n.metrics, "av_leg_gone_on_send"))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// **A listener whose pump falls behind still takes in every control
+/// frame** (come-back, 45.2.0): a node's inbound A/V queue per link holds
+/// 256 frames and drops the newest when full, and C3 frames (offers,
+/// admits, refusals) rode the same queue as media, so a listener that fell
+/// behind a media flood lost its answers while the transport had delivered
+/// them (admits sent 67, taken in 42 in one come-back run). Here R's pump is
+/// held 12 s while three members publish: its queues overflow with media
+/// (the precondition, asserted), and every control frame sent to it in that
+/// time must still be taken in once it drains: none is among the frames the
+/// sink drops (`av_inbound_control_dropped`), and at least 90 % of the rate
+/// it took them in before the hold is taken in over the hold and the drain.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_listener_whose_pump_falls_behind_still_takes_every_control_frame() {
+    const HOLD: Duration = Duration::from_secs(12);
+    const DRAIN_S: u64 = 4;
+    let _call = one_call().await;
+    let tag = "alm2-c3flood";
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        None,
+    )
+    .await;
+    let mut calls = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        calls.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    for c in &calls {
+        wait_legs(c, 3).await;
+    }
+    // Settle, then R's rate of control frames taken in, unheld.
+    let mut seq = publish_three(&mut calls, 4, 0).await;
+    let c0 = calls[0].alm_counts().c3_received;
+    seq = publish_three(&mut calls, 4, seq).await;
+    let c1 = calls[0].alm_counts().c3_received;
+    #[allow(clippy::cast_precision_loss)]
+    let rate = (c1 - c0) as f64 / 4.0;
+    let dropped_before = av(&nodes[0].metrics, "av_inbound_dropped_queue_full");
+    calls[0].stall_inbound_for_test(HOLD);
+    seq = publish_three(&mut calls, HOLD.as_secs(), seq).await;
+    let _ = publish_three(&mut calls, DRAIN_S, seq).await;
+    let c2 = calls[0].alm_counts().c3_received;
+    let dropped = av(&nodes[0].metrics, "av_inbound_dropped_queue_full") - dropped_before;
+    let control_dropped = av(&nodes[0].metrics, "av_inbound_control_dropped");
+    #[allow(clippy::cast_precision_loss)]
+    let want = 0.9 * rate * (HOLD.as_secs() + DRAIN_S) as f64;
+    eprintln!(
+        "[C3FLOOD] rate {rate:.1}/s unheld; taken in over hold+drain {}; want >= {want:.0}; media dropped at R's queues {dropped}; control frames among them {control_dropped}",
+        c2 - c1
+    );
+    assert!(
+        dropped > 0,
+        "the precondition: R's queues overflowed ({dropped} dropped)"
+    );
+    assert_eq!(
+        control_dropped, 0,
+        "no control frame is shed with the media: {control_dropped} of the {dropped} dropped were C3"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let got = (c2 - c1) as f64;
+    assert!(
+        got >= want,
+        "every control frame is taken in: {got} taken in over the hold and drain, {want:.0} owed at {rate:.1}/s"
+    );
+    drop(calls);
+}
+
+/// **A member whose host never reads its frames keeps its place in the
+/// tree** (45.2.0): delivery to the host is lossy, and no pump waits on it.
+/// The other three publish and read; R's host never calls `frames()` (a
+/// backgrounded app, a paused decoder). Once R's queues toward its host
+/// fill, R must still take in control (its C3 count keeps rising every
+/// second), keep a parent for every stream (never without one for more than
+/// 1.5 s), and count what it dropped for its host. Mutation (2ba6adb): the
+/// pumps awaited the full heard queue, R took in no C3 frame from then on,
+/// and its parents and children were left to time out.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_whose_host_never_reads_frames_keeps_its_place() {
+    const RUN_S: u64 = 90;
+    const PARENTLESS_MAX: Duration = Duration::from_millis(1500);
+    let _call = one_call().await;
+    let tag = "alm2-noread";
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        None,
+    )
+    .await;
+    let mut calls = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        calls.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    for c in &calls {
+        wait_legs(c, 3).await;
+    }
+    // The publishers' hosts read; R's (calls[0]) never does.
+    let _read = count_frames_from(&mut calls[1..], &nodes[1].key.key_id);
+    let streams: Vec<_> = (1..=3usize).map(|i| calls[i].stream()).collect();
+    let mut seq = publish_three(&mut calls, 3, 0).await;
+    let mut failed: Vec<String> = Vec::new();
+    let mut parentless_since: Option<(usize, tokio::time::Instant)> = None;
+    let mut last_c3 = calls[0].alm_counts().c3_received;
+    let failover = || {
+        calls[0].alm_log_count(
+            ciris_edge::transport::realtime_av_alm::controller::DecisionKind::Failover,
+        )
+    };
+    let failovers_before = failover();
+    let sink_dropped_before = av(&nodes[0].metrics, "av_inbound_dropped_queue_full");
+    let start = tokio::time::Instant::now();
+    for sec in 0..RUN_S {
+        seq = publish_three(&mut calls, 1, seq).await;
+        let c3 = calls[0].alm_counts().c3_received;
+        if sec >= 2 && c3 == last_c3 {
+            failed.push(format!(
+                "t+{sec}s: R took in no control frame this second ({c3})"
+            ));
+        }
+        last_c3 = c3;
+        let missing = streams
+            .iter()
+            .position(|st| primary_for(&calls[0], *st).is_none());
+        match (missing, parentless_since) {
+            (Some(i), None) => parentless_since = Some((i, tokio::time::Instant::now())),
+            (Some(_), Some((i, t))) if t.elapsed() > PARENTLESS_MAX => {
+                failed.push(format!(
+                    "t+{sec}s: R without a parent for stream {i} for {:?}",
+                    t.elapsed()
+                ));
+                parentless_since = None;
+            }
+            (None, _) => parentless_since = None,
+            _ => {}
+        }
+    }
+    let dropped = av(&nodes[0].metrics, "av_frame_dropped_host_not_reading");
+    // Its parents keep delivering to it: a pump parked on the host stops
+    // metering its parent's chunks, and the parent reads as silent.
+    let failovers = calls[0]
+        .alm_log_count(ciris_edge::transport::realtime_av_alm::controller::DecisionKind::Failover)
+        - failovers_before;
+    // Its pumps keep reading its links: a pump parked on the host leaves
+    // its link's queue to fill, and the transport's sink drops at it.
+    let sink_dropped = av(&nodes[0].metrics, "av_inbound_dropped_queue_full") - sink_dropped_before;
+    if sink_dropped > 0 {
+        failed.push(format!(
+            "R's links' queues overflowed ({sink_dropped} dropped at the sink): its pumps stopped reading"
+        ));
+    }
+    if failovers > 0 {
+        failed.push(format!(
+            "R failed over {failovers} times with nothing wrong upstream"
+        ));
+    }
+    eprintln!(
+        "[NOREAD] {RUN_S} s from {:?}: R dropped {dropped} for its host; C3 taken in {last_c3}; R failovers {failovers}; R sink drops {sink_dropped}; R reorder {:?}; failures {failed:?}",
+        start.elapsed(),
+        calls[0].reorder_counts()
+    );
+    assert!(
+        failed.is_empty(),
+        "R keeps its place while its host reads nothing: {failed:?}"
+    );
+    assert!(
+        dropped > 0,
+        "the precondition: R's queues toward its host filled ({dropped} dropped)"
+    );
+    drop(calls);
+}
+
+/// **A member whose host reads nothing still relays to its child**
+/// (45.2.0): R's host never takes the call's frames NOR its events from the
+/// moment it joins; P and C cannot reach each other, so C hears P only
+/// through R (the roster-relay shape). C's hearing of P must be what a
+/// reading relay gives: every second carries P's frames to C and C hears
+/// at least 90 % of what P publishes. Mutation (2ba6adb): R's pumps parked
+/// on its unread queues and C heard nothing from P from then on.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_whose_host_reads_nothing_still_relays_to_its_child() {
+    // Past R's host-bound queues (256 frames + 1024 heard) at ~30 frames/s.
+    const RUN_S: u64 = 90;
+    let _call = one_call().await;
+    let tag = "alm2-noreadrelay";
+    // 0 = R (relays, its host reads nothing), 1 = P, 2 = C; 3 = T. P and C
+    // dial R; T dials everyone. P and C share nothing.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        3,
+        &[(0, 1), (0, 2), (0, 3), (1, 3), (2, 3)],
+        Some(3),
+    )
+    .await;
+    let (r, p) = (&nodes[0], &nodes[1]);
+    // R: frames() and events() never taken.
+    let cr = join_loaded(r, &groups[0], tag, relay_opts(), None).await;
+    let mut cp = join_loaded(p, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = vec![join_loaded(&nodes[2], &groups[2], tag, CallOptions::default(), None).await];
+    wait_legs(&cr, 2).await;
+    wait_legs(&cp, 1).await;
+    wait_legs(&cc[0], 1).await;
+    let heard = count_frames_from(&mut cc, &p.key.key_id);
+    let converged = wait_until(Duration::from_secs(90), || async {
+        primary_for(&cc[0], cp.stream()).as_deref() == Some(r.key.key_id.as_str())
+    })
+    .await;
+    assert!(converged, "the premise: C hears P through R");
+    let mut seq = 0;
+    let mut published = 0u64;
+    let mut empty_seconds: Vec<u64> = Vec::new();
+    let start_heard = heard.read()[0];
+    let mut last = start_heard;
+    for sec in 0..RUN_S {
+        let (s2, _) = publish_timed_for(&mut cp, 1, seq).await;
+        published += s2 - seq;
+        seq = s2;
+        let now = heard.read()[0];
+        if sec >= 2 && now == last {
+            empty_seconds.push(sec);
+        }
+        last = now;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let got = heard.read()[0] - start_heard;
+    let r_host_frames = av(&r.metrics, "av_frame_dropped_host_not_reading");
+    let r_host_events = av(&r.metrics, "av_call_event_dropped_host_not_reading");
+    let r_sink = av(&r.metrics, "av_inbound_dropped_queue_full");
+    eprintln!(
+        "[NOREADRELAY] C heard {got} of {published} of P through R; seconds with nothing {empty_seconds:?}; \
+         R dropped for its host {r_host_frames} frames, {r_host_events} events; R sink drops {r_sink}"
+    );
+    assert!(
+        r_host_frames > 0,
+        "the precondition: R's host queues filled"
+    );
+    assert!(
+        empty_seconds.is_empty(),
+        "C heard P every second: {empty_seconds:?}"
+    );
+    assert!(
+        got * 10 >= published * 9,
+        "C hears P through R: {got} of {published}"
+    );
+    drop(cc);
+    drop(cr);
+}
+
+/// **G8 — a publisher whose uplink is capped below its fan-out** (the
+/// server's av_mesh cell, on loopback, with no tc): `P` publishes
+/// 600 B at 30 Hz to `A`, `B` and `C`, who reach each other directly, every
+/// member relaying (the host's member default). `P`'s uplink is then capped
+/// at 250 kbit/s with an unbounded queue: about one copy of its stream on
+/// the wire, a third of its fan-out.
+///
+/// What the design does (`docs/AV_ALM_DESIGN.md` §5.1, C2): `P` sheds to one
+/// child make-before-break, the other two take that child as their relay,
+/// and everyone keeps hearing `P` at about the one-copy rate. What must not
+/// happen (CIRISEdge 45.1.9 matrix, leviculum#113): every link of `P`
+/// torn down by Channel retry exhaustion within ~2 s of the cap.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
+    let _call = one_call().await;
+    let tag = "alm2-capped";
+    let uplink = CappedUplink::new();
+    // 0 = P (capped, dials nobody), 1..=3 = A, B, C (dial P and each other);
+    // 4 = T (the canonical shape, dials everyone but P).
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    // Counted as they arrive: each call's frame queue holds 256, and a
+    // count read only at the end is capped there.
+    let heard_of = count_frames_from(&mut listeners, &p.key.key_id);
+    // Baseline: the full mesh carries P.
+    let (seq, base_lat) = publish_timed_for(&mut cp, 5, 0).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let base = heard_of.read();
+    assert!(
+        base.iter().all(|n| *n * 10 >= seq * 9),
+        "baseline: {base:?} of {seq}"
+    );
+
+    // The cap: one copy of P's stream on the wire and a third to spare (the
+    // server's cell, 250 kbit/s against ~190 kbit/s a copy, scaled to this
+    // leg's frame: the frame plus ~170 B of chunk, signature, seal and link
+    // framing, 30 a second), so three copies are ~2.3x what it carries.
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    let exhausted_before: u64 = nodes.iter().map(|n| channel_exhausted(&n.metrics)).sum();
+    let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    // Each link's close is logged on target `ciris_edge::link_close` (debug)
+    // with its node, direction, plane, peer and reason; this line is the
+    // origin its times are read from, and the names map key ids to roles.
+    tracing::info!(
+        target: "ciris_edge::link_close",
+        names = ?nodes
+            .iter()
+            .zip(["P", "A", "B", "C", "T"])
+            .map(|(n, r)| (r, n.key.key_id.clone()))
+            .collect::<Vec<_>>(),
+        "G8 cap on"
+    );
+    // When the first link is torn down after the cap, on P and on its peers
+    // (the matrix: every node, 1.6-2.2 s after cap_on).
+    let cap_on = tokio::time::Instant::now();
+    let first_torn: Arc<std::sync::Mutex<Vec<Option<Duration>>>> =
+        Arc::new(std::sync::Mutex::new(vec![None; nodes.len()]));
+    let sampler = {
+        let ms: Vec<EdgeMetrics> = nodes.iter().map(|n| n.metrics.clone()).collect();
+        let base: Vec<u64> = ms.iter().map(torn_down).collect();
+        let first = Arc::clone(&first_torn);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut f = first.lock().expect("first");
+                for (i, m) in ms.iter().enumerate() {
+                    if f[i].is_none() && torn_down(m) > base[i] {
+                        f[i] = Some(cap_on.elapsed());
+                    }
+                }
+            }
+        })
+    };
+    let capped_from = seq;
+    let _ = uplink.take_peak();
+    let (seq, capped_lat) = publish_timed_for(&mut cp, 30, seq).await;
+    sampler.abort();
+    let peak = uplink.take_peak();
+    let sent = seq - capped_from;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let heard: Vec<u64> = heard_of
+        .read()
+        .iter()
+        .zip(&base)
+        .map(|(n, b)| n - b)
+        .collect();
+    let exhausted: u64 = nodes
+        .iter()
+        .map(|n| channel_exhausted(&n.metrics))
+        .sum::<u64>()
+        - exhausted_before;
+    let torn: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum::<u64>() - torn_before;
+    let parents: Vec<Option<String>> = listeners
+        .iter()
+        .map(|l| primary_for(l, cp.stream()))
+        .collect();
+    let direct = parents
+        .iter()
+        .filter(|x| x.as_deref() == Some(p.key.key_id.as_str()))
+        .count();
+    let context = format!(
+        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; peak queue {peak:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
+         ChannelExhausted {exhausted}; torn {torn}; first teardown after the cap (P, A, B, C, T) {:?}; P legs {:?}",
+        cp.alm_own_children(),
+        cp.alm_counts(),
+        first_torn.lock().expect("first").clone(),
+        cp.legs()
+    );
+    // Every criterion is judged and every failure named, so a red run says
+    // what each fix buys (G8: A and C in edge, leviculum#113).
+    let mut failed: Vec<String> = Vec::new();
+    if exhausted != 0 {
+        failed.push(format!("links torn down by retry exhaustion: {exhausted}"));
+    }
+    if torn != 0 {
+        failed.push(format!("links torn down (exhausted/timeout/stale): {torn}"));
+    }
+    if direct != 1 {
+        failed.push(format!("P's direct children: {direct}, want 1"));
+    }
+    // E2: a publisher with any subscriber keeps at least one PRIMARY (never
+    // only standbys).
+    if !cp
+        .alm_own_children()
+        .iter()
+        .any(|(_, r)| *r == ciris_edge::transport::realtime_av_alm::controller::Role::Primary)
+    {
+        failed.push(format!(
+            "P has no primary child: {:?}",
+            cp.alm_own_children()
+        ));
+    }
+    if parents.iter().any(Option::is_none) {
+        failed.push("a listener has no parent".to_owned());
+    }
+    // The host's capture loop waits on publish(): one call must never cost
+    // it a frame, capped or not (G8: 45-60 ms a call, and seconds when a
+    // leg redialled, with sends retried under the publisher lock).
+    for (phase, lat) in [("uncapped", base_lat), ("capped", capped_lat)] {
+        if lat.max >= FRAME_INTERVAL {
+            failed.push(format!(
+                "publish() {phase}: {lat:?}, over one frame interval"
+            ));
+        }
+    }
+    for (i, n) in heard.iter().enumerate() {
+        // About the one-copy rate: the uplink carries one copy, so each
+        // listener hears most of what P published once it settled.
+        if *n * 10 < sent * 7 {
+            failed.push(format!("listener {i} heard {n} of {sent}"));
+        }
+    }
+    eprintln!("[G8] capped publisher: {context}; failed {failed:?}");
+    assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(listeners);
+    drop(cp);
+}
+
+/// **G8 slow start — a call that STARTS on a capped uplink.** The same
+/// room and cap as [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`]
+/// (one copy of `P`'s stream and a third to spare), but capped before the
+/// call's first chunk: `P` starts at one direct child into its unmeasured
+/// uplink, the others hear it through that child, and a step up that the
+/// uplink cannot carry is taken back by the stall verdict before any link's
+/// retry budget is spent. No link dies; every listener has a parent and
+/// hears most of what `P` published.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "needs staggered leg setup: on this 127 kbit uplink the setup alone (link, PQC transit KEX, hello, ~10 binding parts per leg, all legs at once) queues ~2 s before media; measured 1-2 of 3 legs up in 30 s and links torn down at 3.3-9.6 s during setup"]
+async fn a_call_that_starts_on_a_capped_uplink_keeps_every_link() {
+    let _call = one_call().await;
+    let tag = "alm2-capstart";
+    let uplink = CappedUplink::new();
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    // Capped before any leg is up or any chunk flows (the same scale as the
+    // capped witness: a 600 B frame's copy plus ~170 B of framing, 30/s).
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    let exhausted_before: u64 = nodes.iter().map(|n| channel_exhausted(&n.metrics)).sum();
+    let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
+    tracing::info!(
+        target: "ciris_edge::link_close",
+        names = ?nodes
+            .iter()
+            .zip(["P", "A", "B", "C", "T"])
+            .map(|(n, r)| (r, n.key.key_id.clone()))
+            .collect::<Vec<_>>(),
+        "G8 cap on"
+    );
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    let heard_of = count_frames_from(&mut listeners, &p.key.key_id);
+    let _ = uplink.take_peak();
+    let (sent, lat) = publish_timed_for(&mut cp, 20, 0).await;
+    let peak = uplink.take_peak();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let heard = heard_of.read();
+    let exhausted: u64 = nodes
+        .iter()
+        .map(|n| channel_exhausted(&n.metrics))
+        .sum::<u64>()
+        - exhausted_before;
+    let torn: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum::<u64>() - torn_before;
+    let parents: Vec<Option<String>> = listeners
+        .iter()
+        .map(|l| primary_for(l, cp.stream()))
+        .collect();
+    let direct = parents
+        .iter()
+        .filter(|x| x.as_deref() == Some(p.key.key_id.as_str()))
+        .count();
+    let context = format!(
+        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; peak queue {peak:?}; parents {parents:?}; \
+         P children {:?}; P counts {:?}; ChannelExhausted {exhausted}; torn {torn}",
+        cp.alm_own_children(),
+        (cp.alm_counts(), av(&p.metrics, "alm_uplink_stall")),
+    );
+    let mut failed: Vec<String> = Vec::new();
+    if torn != 0 || exhausted != 0 {
+        failed.push(format!(
+            "links torn down: {torn} ({exhausted} by retry exhaustion)"
+        ));
+    }
+    if direct != 1 {
+        failed.push(format!("P's direct children: {direct}, want 1"));
+    }
+    if parents.iter().any(Option::is_none) {
+        failed.push("a listener has no parent".to_owned());
+    }
+    if lat.max >= FRAME_INTERVAL {
+        failed.push(format!("publish(): {lat:?}, over one frame interval"));
+    }
+    for (i, n) in heard.iter().enumerate() {
+        if *n * 10 < sent * 7 {
+            failed.push(format!("listener {i} heard {n} of {sent}"));
+        }
+    }
+    eprintln!("[G8] capped from the start: {context}; failed {failed:?}");
+    assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(listeners);
+    drop(cp);
+}
+
+/// **G8 — the kept child of a capped publisher is lost mid-cap** (the
+/// model's T1/S3 case): the capped witness's room and cap; 12 s into the cap
+/// P's leg to its one direct child is torn down. Then: every listener has a
+/// parent again and P has a primary within [`KEPT_CHILD_RECOVER_BOUND`], no
+/// other link is torn down, and the queue the redial and re-parenting add
+/// stays bounded (serial redial: one leg setup in flight).
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_capped_publishers_kept_child_lost_mid_cap_is_recovered() {
+    let _call = one_call().await;
+    let tag = "alm2-capkill";
+    let uplink = CappedUplink::new();
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    let heard_of = count_frames_from(&mut listeners, &p.key.key_id);
+    let seq = publish_capped_for(&mut cp, 3, 0).await;
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    tracing::info!(
+        target: "ciris_edge::link_close",
+        names = ?nodes
+            .iter()
+            .zip(["P", "A", "B", "C", "T"])
+            .map(|(n, r)| (r, n.key.key_id.clone()))
+            .collect::<Vec<_>>(),
+        "G8 cap on"
+    );
+    let stream = cp.stream();
+    let p_key = p.key.key_id.clone();
+    let ctl = async {
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let kept = listeners
+            .iter()
+            .position(|l| primary_for(l, stream).as_deref() == Some(p_key.as_str()));
+        let _ = uplink.take_peak();
+        let queue_at_kill = uplink.queue_now().await;
+        let killed_at = tokio::time::Instant::now();
+        if let Some(i) = kept {
+            let key = nodes[i + 1].key.key_id.clone();
+            for (peer, l, _, _) in p.transport.av_dialed_links_for_test() {
+                if peer == key {
+                    let _ = p.transport.link_teardown(&l).await;
+                }
+            }
+        }
+        let mut back = None;
+        // Recovery is judged only once the torn child has noticed (its
+        // parent is no longer P); before that the old state reads healthy.
+        let mut noticed = false;
+        let role_of = |k: &Option<String>| {
+            k.as_deref().map_or("none".to_owned(), |k| {
+                nodes
+                    .iter()
+                    .zip(["P", "A", "B", "C", "T"])
+                    .find(|(n, _)| n.key.key_id == k)
+                    .map_or("?".to_owned(), |(_, r)| (*r).to_owned())
+            })
+        };
+        let mut last: Vec<Option<String>> = vec![None; listeners.len()];
+        while killed_at.elapsed() < Duration::from_secs(13) {
+            let parents: Vec<Option<String>> =
+                listeners.iter().map(|l| primary_for(l, stream)).collect();
+            for (i, p_now) in parents.iter().enumerate() {
+                if *p_now != last[i] {
+                    eprintln!(
+                        "[G8KT] +{:.2}s listener {} parent {} -> {}",
+                        killed_at.elapsed().as_secs_f64(),
+                        ["A", "B", "C"][i],
+                        role_of(&last[i]),
+                        role_of(p_now)
+                    );
+                    last[i] = p_now.clone();
+                }
+            }
+            if let Some(i) = kept {
+                noticed |= parents[i].as_deref() != Some(p_key.as_str());
+            }
+            let p_has_primary = parents.iter().any(|x| x.as_deref() == Some(p_key.as_str()));
+            if noticed && parents.iter().all(Option::is_some) && p_has_primary && back.is_none() {
+                back = Some(killed_at.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        (kept, back, uplink.take_peak(), queue_at_kill)
+    };
+    let ((sent, _lat), (kept, back, peak_after, queue_at_kill)) =
+        tokio::join!(publish_timed_for(&mut cp, 25, seq), ctl);
+    let torn: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum::<u64>() - torn_before;
+    let heard = heard_of.read();
+    let parents: Vec<Option<String>> = listeners.iter().map(|l| primary_for(l, stream)).collect();
+    let context = format!(
+        "kept child {kept:?}; back after {back:?}; peak queue after the kill {peak_after:?}; \
+         torn {torn}; parents {parents:?}; P children {:?}; heard {heard:?} of {sent}",
+        cp.alm_own_children()
+    );
+    let mut failed: Vec<String> = Vec::new();
+    if kept.is_none() {
+        failed.push("no listener had P as its primary 12 s into the cap".to_owned());
+    }
+    // The mechanism's bound: the torn leg's close reaches the child through
+    // P's queue, then the re-subscribe's ADMIT crosses it again: two queue
+    // crossings + one offer period + one watch tick.
+    let bound = queue_at_kill * 2 + Duration::from_secs(1) + Duration::from_millis(250);
+    eprintln!("[G8K] queue at the kill {queue_at_kill:?}; recovery bound {bound:?}");
+    if back.is_none_or(|b| b > bound) {
+        failed.push(format!("not recovered within {bound:?}"));
+    }
+    if torn != 0 {
+        failed.push(format!("links torn down besides the forced one: {torn}"));
+    }
+    // What was queued at the kill plus ONE leg's setup (link, PQC transit
+    // KEX, hello, bindings: ~1 s at the cap): serial redial adds no more.
+    let peak_bound = queue_at_kill + KEPT_CHILD_SETUP_QUEUE;
+    if peak_after > peak_bound {
+        failed.push(format!(
+            "peak queue after the kill {peak_after:?} over {peak_bound:?}"
+        ));
+    }
+    eprintln!("[G8K] kept child lost mid-cap: {context}; failed {failed:?}");
+    eprintln!("[G8KL] P alm_log: {:?}", cp.alm_log().2);
+    for (i, l) in listeners.iter().enumerate() {
+        eprintln!("[G8KL] {} alm_log: {:?}", ["A", "B", "C"][i], l.alm_log().2);
+    }
+    assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(listeners);
+    drop(cp);
+}
+
+/// G8 — what one leg's setup (link, PQC transit KEX, hello, bindings) adds
+/// to the queue at the cap: serial redial allows one in flight.
+const KEPT_CHILD_SETUP_QUEUE: Duration = Duration::from_secs(1);
+
+/// **45.2.0 — no calls on a shaped-only node** (Eric 2026-11-06: live A/V
+/// rides unshaped links only). Node `S` sets `require_shaped_links`:
+/// - its call start and join are refused `ShapedOnly`
+///   (`shaped_only_no_media`), before anything starts;
+/// - an A/V link another member dials to it is refused on ITS side (the
+///   accepting door, not only the proposing one);
+/// - a call among the others is unaffected: A, B and C hear each other.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_shaped_only_node_neither_joins_nor_accepts_call_media() {
+    let _call = one_call().await;
+    let tag = "alm2-shaped";
+    // 0..=2 = A, B, C; 3 = S (shaped-only). Full mesh, no canonical.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        4,
+        &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)],
+        None,
+    )
+    .await;
+    let (a, s) = (&nodes[0], &nodes[3]);
+    let mut policy = s.transport.shaping_policy();
+    policy.require_shaped_links = true;
+    let _ = s.transport.set_shaping_policy(policy).await;
+
+    // Start and join are refused by name.
+    let refused = Call::join(
+        &room_of(tag),
+        &s.key.key_id,
+        CallDeps {
+            room_group: groups[3].clone(),
+            roster: Arc::new(Roster(true)),
+            owners: Arc::clone(&s.dir) as Arc<dyn ciris_edge::transport::av_call::CallOwners>,
+            transport: Arc::clone(&s.transport),
+            lifecycle: Arc::clone(&s.lifecycle),
+            registrar: Arc::new(CountingRegistrar::default()),
+            events: None,
+            metrics: Some(s.metrics.clone()),
+            record: None,
+            signer: s.key.signer(),
+            verifier: Arc::clone(&s.dir) as Arc<dyn StreamKeyVerifier>,
+            load: None,
+        },
+        relay_opts(),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(ciris_edge::transport::av_call::CallError::ShapedOnly)
+        ),
+        "a shaped-only node's join is refused: {:?}",
+        refused.as_ref().err()
+    );
+    assert!(av(&s.metrics, "shaped_only_no_media") >= 1);
+
+    // The accepting door: S holds an A/V address (as a node that joined
+    // before turning shaped-only would), A dials it, S refuses the arrival.
+    let stream =
+        ciris_edge::transport::realtime_av::StreamId(sha2::Sha256::digest(b"g8-shaped").into());
+    let group = ciris_edge::av_addressing::stream_group_id(stream);
+    let scope = ciris_edge::cohort_scope::CohortScope::Cohort {
+        cohort_id: room_of(tag),
+    };
+    for n in [a, s] {
+        n.lifecycle
+            .joined(
+                &scope,
+                &group,
+                1,
+                &[0x5d; 32],
+                &[a.key.key_id.as_str(), s.key.key_id.as_str()],
+            )
+            .expect("install the stream's group");
+    }
+    let mut s_arrivals = s.transport.take_av_arrivals().expect("S's arrivals");
+    let address = a
+        .lifecycle
+        .table()
+        .send_address(&scope, &group, &s.key.key_id)
+        .expect("S's address");
+    let dialled = a.transport.open_av_link(&s.key.key_id, &address).await;
+    if dialled.is_ok() {
+        let arrival = tokio::time::timeout(Duration::from_secs(20), s_arrivals.recv())
+            .await
+            .expect("the arrival reaches S")
+            .expect("arrivals open");
+        let accepted = s.transport.accept_av_arrival(arrival).await;
+        assert!(
+            accepted
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("shaped_only_no_media")),
+            "S refuses the A/V arrival by name: {:?}",
+            accepted.as_ref().err()
+        );
+    }
+    let before = av(&s.metrics, "shaped_only_no_media");
+    assert!(before >= 2, "the accept door counted too: {before}");
+
+    // A call among the others is unaffected.
+    let mut ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(&nodes[1], &groups[1], tag, relay_opts(), None).await;
+    let cc = join_loaded(&nodes[2], &groups[2], tag, relay_opts(), None).await;
+    for call in [&ca, &cb, &cc] {
+        assert!(
+            wait_until(Duration::from_secs(30), || async {
+                call.legs().iter().filter(|m| **m != s.key.key_id).count() >= 2
+            })
+            .await,
+            "the others' legs come up: {:?}",
+            call.legs()
+        );
+        assert!(
+            !call.legs().contains(&s.key.key_id),
+            "no leg to the shaped-only node: {:?}",
+            call.legs()
+        );
+    }
+    let mut rx = ca.frames().expect("A's frames");
+    for seq in 0..20 {
+        cb.publish(Frame::opaque(body("b", seq)))
+            .await
+            .expect("B publishes");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let mut heard = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(f)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if f.publisher == nodes[1].key.key_id {
+            heard += 1;
+            if heard == 20 {
+                break;
+            }
+        }
+    }
+    assert_eq!(heard, 20, "A hears B: the others' call runs");
+}
+
+/// **45.2.0 — a member that turns shaped-only MID-call ends its call**
+/// (`EndCause::MediaRefused`, `shaped_only_no_media`): its legs are torn
+/// down at once, so it sends no more unshaped media, and the others carry on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_turning_shaped_only_mid_call_ends_its_call() {
+    let _call = one_call().await;
+    let tag = "alm2-midshaped";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let ca = join_loaded(&nodes[0], &groups[0], tag, relay_opts(), None).await;
+    let cb = join_loaded(&nodes[1], &groups[1], tag, relay_opts(), None).await;
+    let cc = join_loaded(&nodes[2], &groups[2], tag, relay_opts(), None).await;
+    for call in [&ca, &cb, &cc] {
+        wait_legs(call, 2).await;
+    }
+    let c = &nodes[2];
+    let mut policy = c.transport.shaping_policy();
+    policy.require_shaped_links = true;
+    let _ = c.transport.set_shaping_policy(policy).await;
+    let ended = wait_until(Duration::from_secs(5), || async {
+        matches!(
+            cc.state(),
+            ciris_edge::transport::av_call::CallState::Ended(
+                ciris_edge::transport::av_call::EndCause::MediaRefused {
+                    token: "shaped_only_no_media"
+                }
+            )
+        )
+    })
+    .await;
+    assert!(ended, "C's call ends by name: {:?}", cc.state());
+    assert!(
+        cc.legs().is_empty(),
+        "C's legs are torn down: {:?}",
+        cc.legs()
+    );
+    assert_eq!(av(&c.metrics, "av_call_ended_media_refused"), 1);
+    // The others lose their legs to C and keep their own.
+    for call in [&ca, &cb] {
+        assert!(
+            wait_until(Duration::from_secs(20), || async {
+                !call.legs().contains(&c.key.key_id) && call.legs().len() == 1
+            })
+            .await,
+            "the others carry on without C: {:?}",
+            call.legs()
+        );
+    }
+}
+
+/// **45.2.0 — path events concern attendees only**: a room member who never
+/// joins the call produces no `media_path_failed` or `media_path_restored` on
+/// anyone, past the relay wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_who_never_joins_produces_no_path_event() {
+    let _call = one_call().await;
+    let tag = "alm2-absent";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let mut ca = join_loaded(&nodes[0], &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(&nodes[1], &groups[1], tag, relay_opts(), None).await;
+    let mut events = [
+        ca.events().expect("A's events"),
+        cb.events().expect("B's events"),
+    ];
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    tokio::time::sleep(ciris_edge::transport::av_call::RELAY_WAIT * 2).await;
+    let absent = &nodes[2].key.key_id;
+    for (who, rx) in ["A", "B"].iter().zip(events.iter_mut()) {
+        while let Ok(e) = rx.try_recv() {
+            let about = match &e {
+                CallEvent::MediaPathFailed { member, .. }
+                | CallEvent::MediaPathRestored { member, .. } => Some(member),
+                _ => None,
+            };
+            assert_ne!(
+                about,
+                Some(absent),
+                "{who} raised a path event for a non-attendee: {e:?}"
+            );
+        }
+    }
+    drop((ca, cb));
+}
+
+// ── ReceiverMoves (docs/design/call_congestion, rows RM2–RM7) ─────────────
+
+/// RM4 — `member`'s rank on `stream`, as edge computes it.
+fn rank_of(stream: ciris_edge::transport::realtime_av::StreamId, member: &str) -> (u64, String) {
+    (
+        ciris_edge::transport::realtime_av_alm::controller::hash_rank(
+            &stream.0,
+            &member.to_owned(),
+        ),
+        member.to_owned(),
+    )
+}
+
+/// One look at the room while `P` publishes: when (since the cap), `P`'s
+/// uplink queue (ms), and each listener's primary for `P`'s stream.
+#[derive(Debug, Clone)]
+struct Look {
+    at: Duration,
+    queue_ms: Option<u64>,
+    parents: Vec<Option<String>>,
+    /// `P`'s own-stream children: (primaries, every child it feeds).
+    own: (usize, usize),
+}
+
+/// Publish `P`'s 30 Hz stream for `secs` and look at the room every third
+/// frame (~100 ms). Returns the next seq.
+async fn publish_looking(
+    cp: &mut Call,
+    listeners: &[Call],
+    uplink: &CappedUplink,
+    origin: tokio::time::Instant,
+    secs: u64,
+    seq0: u64,
+    looks: &mut Vec<Look>,
+) -> u64 {
+    let size = cp.chunk_plaintext_budget().unwrap_or(240).min(600);
+    let stream = cp.stream();
+    let mut seq = seq0;
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < end {
+        let mut b = body("p", seq);
+        b.resize(size, b'.');
+        let _ = cp.publish(Frame::opaque(b)).await;
+        if seq.is_multiple_of(3) {
+            looks.push(Look {
+                at: origin.elapsed(),
+                queue_ms: uplink.queue_ms(),
+                parents: listeners.iter().map(|l| primary_for(l, stream)).collect(),
+                own: {
+                    let kids = cp.alm_own_children();
+                    (
+                        kids.iter()
+                            .filter(|(_, r)| {
+                                *r == ciris_edge::transport::realtime_av_alm::controller::Role::Primary
+                            })
+                            .count(),
+                        kids.len(),
+                    )
+                },
+            });
+        }
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    seq
+}
+
+/// **ReceiverMoves — a capped publisher's children move themselves, and come
+/// back once the cap lifts.** The room and cap of
+/// [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`] (one
+/// copy of `P`'s stream and a third to spare, three children), held 20 s and
+/// lifted. Judged on what each listener chose, looked at every ~100 ms:
+/// 1. RM2/RM3: every child but the lowest-ranked (RM4) is on a member relay
+///    within 1 s of its media turning late (`P`'s queue past 300 ms, plus the
+///    300 ms that media takes to arrive), and stays there while the cap holds;
+/// 2. exactly one direct child (the lowest-ranked) for the rest of the cap;
+/// 3. no listener is ever without a parent (make-before-break);
+/// 4. E1: once the children have moved, `P` feeds one child of its stream
+///    while the cap holds (no fed standby); E2: `P` keeps a primary while
+///    anyone subscribes;
+/// 5. RM7: after the lift every child is direct again within the stated
+///    bound, with at most two primary changes each (out and back): no
+///    oscillation.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_capped_publishers_children_move_themselves_and_come_back() {
+    /// RM7's bound after the lift: the ceiling's staleness (60 s) + the
+    /// dwell (10 s) + a window and the probe backoff.
+    const RETURN_BOUND: Duration = Duration::from_secs(85);
+    let _call = one_call().await;
+    let tag = "alm2-rxmove";
+    let uplink = CappedUplink::new();
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let pid = p.key.key_id.clone();
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    // Every listener's frames are read as they arrive, as a host does: a
+    // call whose frames nobody reads fills its queues (256, then 1024 heard)
+    // and its links' pumps wait on them, C3 included, so the witness judged
+    // a harness that had stopped listening.
+    let _drained = count_frames_from(&mut listeners, &pid);
+    let stream = cp.stream();
+    let names: Vec<String> = nodes[1..4].iter().map(|n| n.key.key_id.clone()).collect();
+    let kept = (0..3)
+        .min_by_key(|i| rank_of(stream, &names[*i]))
+        .expect("three");
+    // Baseline: the probe widens to the full mesh.
+    let origin = tokio::time::Instant::now();
+    let mut looks = Vec::new();
+    let all_direct = |l: &Look| l.parents.iter().all(|x| x.as_deref() == Some(pid.as_str()));
+    let mut seq = 0;
+    // Slow start: the third child is relayed first and moves to P once the
+    // probe has room and its dwell has passed.
+    for _ in 0..20 {
+        seq = publish_looking(&mut cp, &listeners, &uplink, origin, 2, seq, &mut looks).await;
+        if looks.last().is_some_and(all_direct) {
+            break;
+        }
+    }
+    // Settled a little longer: offers and the standbys catch up.
+    seq = publish_looking(&mut cp, &listeners, &uplink, origin, 3, seq, &mut looks).await;
+    assert!(
+        looks.last().is_some_and(all_direct),
+        "baseline: the full mesh carries P: {:?}; looks {:?}; P children {:?}; logs: P {}\n A {}\n B {}\n C {}",
+        looks.last(),
+        looks
+            .iter()
+            .step_by(10)
+            .map(|l| (l.at.as_millis(), l.parents.clone()))
+            .collect::<Vec<_>>(),
+        cp.alm_own_children(),
+        cp.alm_log().2,
+        listeners[0].alm_log().2,
+        listeners[1].alm_log().2,
+        listeners[2].alm_log().2,
+    );
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    let torn_before: Vec<u64> = nodes.iter().map(|n| torn_down(&n.metrics)).collect();
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    let cap_on = tokio::time::Instant::now();
+    let mut capped = Vec::new();
+    seq = publish_looking(&mut cp, &listeners, &uplink, cap_on, 20, seq, &mut capped).await;
+    uplink.cap_kbit(0);
+    let lift = cap_on.elapsed();
+    let mut lifted = Vec::new();
+    let _ = publish_looking(
+        &mut cp,
+        &listeners,
+        &uplink,
+        cap_on,
+        RETURN_BOUND.as_secs() + 10,
+        seq,
+        &mut lifted,
+    )
+    .await;
+
+    let mut failed: Vec<String> = Vec::new();
+    let late_at = capped
+        .iter()
+        .find(|l| l.queue_ms.is_some_and(|q| q >= 300))
+        .map(|l| l.at);
+    let Some(late_at) = late_at else {
+        panic!("the cap never queued P's uplink 300 ms: {capped:?}");
+    };
+    // Media queued 300 ms reaches the listeners 300 ms later.
+    let deadline = late_at + Duration::from_millis(300) + Duration::from_secs(1);
+    let relayed = |x: &Option<String>| x.as_deref().is_some_and(|x| x != pid.as_str());
+    for i in (0..3).filter(|i| *i != kept) {
+        let moved = capped.iter().find(|l| relayed(&l.parents[i])).map(|l| l.at);
+        match moved {
+            Some(at) if at <= deadline => {}
+            other => failed.push(format!(
+                "listener {i} on a relay at {other:?}, deadline {deadline:?} (late at {late_at:?})"
+            )),
+        }
+    }
+    let settled: Vec<&Look> = capped.iter().filter(|l| l.at > deadline).collect();
+    for l in &settled {
+        let direct: Vec<usize> = (0..3)
+            .filter(|i| l.parents[*i].as_deref() == Some(pid.as_str()))
+            .collect();
+        if direct != vec![kept] {
+            failed.push(format!(
+                "at {:?} P's direct children {direct:?}, want only the lowest-ranked {kept}",
+                l.at
+            ));
+            break;
+        }
+    }
+    // E1 (RM3): once the children have moved, P feeds one copy of its
+    // stream while the cap holds: no child kept as a (fed) standby.
+    if let Some(l) = settled.iter().find(|l| l.own.1 > 1) {
+        failed.push(format!(
+            "E1: at {:?} P feeds {} children of its stream ({} primary)",
+            l.at, l.own.1, l.own.0
+        ));
+    }
+    // E2: P keeps a primary while anyone subscribes.
+    if let Some(l) = capped
+        .iter()
+        .chain(&lifted)
+        .find(|l| l.own.1 > 0 && l.own.0 == 0)
+    {
+        failed.push(format!(
+            "E2: at {:?} P has {} subscribers and no primary",
+            l.at, l.own.1
+        ));
+    }
+    for l in capped.iter().chain(&lifted) {
+        if l.parents.iter().any(Option::is_none) {
+            failed.push(format!(
+                "a listener without a parent at {:?}: {:?}",
+                l.at, l.parents
+            ));
+            break;
+        }
+    }
+    let back = lifted
+        .iter()
+        .find(|l| all_direct(l))
+        .map(|l| l.at.checked_sub(lift).unwrap());
+    match back {
+        Some(b) if b <= RETURN_BOUND => {}
+        other => failed.push(format!(
+            "all direct again {other:?} after the lift (bound {RETURN_BOUND:?})"
+        )),
+    }
+    if let Some(l) = lifted.last() {
+        if !all_direct(l) {
+            failed.push(format!("not all direct at the end: {:?}", l.parents));
+        }
+    }
+    for i in 0..3 {
+        let changes = capped
+            .iter()
+            .chain(&lifted)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| w[0].parents[i] != w[1].parents[i])
+            .count();
+        let most = if i == kept { 0 } else { 2 };
+        if changes > most {
+            failed.push(format!(
+                "listener {i}: {changes} primary changes (at most {most})"
+            ));
+        }
+    }
+    let torn: Vec<u64> = nodes
+        .iter()
+        .zip(&torn_before)
+        .map(|(n, b)| torn_down(&n.metrics) - b)
+        .collect();
+    let first_none = capped
+        .iter()
+        .chain(&lifted)
+        .find(|l| l.parents.iter().any(Option::is_none))
+        .map(|l| l.at);
+    let context = format!(
+        "links torn per node (P, A, B, C, T) {torn:?}; first parentless look {first_none:?}; \
+         offers held for backlog per node {:?}; \
+         kept {kept}; late at {late_at:?}; lift at {lift:?}; back after {back:?}; P children {:?}; \
+         P counts {:?}; P labels: stall {} departure {}; listeners' late moves {:?}; capped looks {:?}",
+        nodes
+            .iter()
+            .map(|n| {
+                (
+                    av(&n.metrics, "alm_offer_held:backlog"),
+                    av(&n.metrics, "alm_c3_send_failed"),
+                    av(&n.metrics, "alm_c3_sent"),
+                    av(&n.metrics, "alm_c3_received"),
+                )
+            })
+            .collect::<Vec<_>>(),
+        cp.alm_own_children(),
+        cp.alm_counts(),
+        av(&p.metrics, "alm_uplink_stall"),
+        av(&p.metrics, "alm_departure_congestion"),
+        nodes[1..4]
+            .iter()
+            .map(|n| (av(&n.metrics, "alm_late_move"), av(&n.metrics, "alm_late_spared")))
+            .collect::<Vec<_>>(),
+        capped
+            .iter()
+            .step_by(5)
+            .take(30)
+            .map(|l| (l.at.as_millis(), l.queue_ms, l.parents.iter().map(|x| x.as_deref() == Some(pid.as_str())).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
+    );
+    eprintln!("[RM] capped then lifted: {context}; failed {failed:?}");
+    if !failed.is_empty() {
+        // What each node decided, and the looks around the first failure.
+        let around = first_none.unwrap_or(lift);
+        let near: Vec<_> = capped
+            .iter()
+            .chain(&lifted)
+            .filter(|l| {
+                l.at + Duration::from_secs(6) >= around && l.at <= around + Duration::from_secs(2)
+            })
+            .map(|l| (l.at.as_millis(), l.queue_ms, l.own, l.parents.clone()))
+            .collect();
+        eprintln!("[RM] looks around {around:?}: {near:?}");
+        eprintln!("[RM] P log:\n{}", cp.alm_log().2);
+        for (i, l) in listeners.iter().enumerate() {
+            eprintln!("[RM] listener {i} log:\n{}", l.alm_log().2);
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(listeners);
+    drop(cp);
+}
+
+/// Calls 1, 2 and 3 each publish 30 Hz for `secs`.
+async fn publish_three(calls: &mut [Call], secs: u64, seq0: u64) -> u64 {
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let mut seq = seq0;
+    while tokio::time::Instant::now() < end {
+        for who in 1..=3usize {
+            let size = calls[who].chunk_plaintext_budget().unwrap_or(240).min(600);
+            let mut b = body(["r", "p", "q", "s"][who], seq);
+            b.resize(size, b'.');
+            let _ = calls[who].publish(Frame::opaque(b)).await;
+        }
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    seq
+}
+
+/// **RM6 — a receiver whose own downlink is slow does not move.** Three
+/// members publish (`P` and two others); `R`'s downlink then delays everything sent
+/// to it by 400 ms. `P`'s stream reads late at `R`, and so do the others': the
+/// lateness is `R`'s own, a relay would not help, and `R` stays a direct
+/// child of `P` (the own-downlink guard is counted). The guard is read
+/// before the rank spare (RM6 before RM4), so the witness holds whatever
+/// `R`'s rank: no outcome depends on the random stream ids.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_receiver_whose_own_downlink_is_slow_does_not_move() {
+    let _call = one_call().await;
+    let tag = "alm2-rxslow";
+    let downlink = CappedUplink::new();
+    // 0 = R (slow downlink, dials nobody), 1..=3 members, 4 = T.
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&downlink))),
+    )
+    .await;
+    let r = &nodes[0];
+    let mut calls = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        calls.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    for c in &calls {
+        wait_legs(c, 3).await;
+    }
+    // Every member but R publishes. P: any of them that has R as a direct
+    // child. No rank enters: the own-downlink guard is read before the
+    // spare (RM6 before RM4), so it runs whichever child P keeps.
+    let mut seq = 0;
+    let mut chosen = None;
+    for _ in 0..30 {
+        seq = publish_three(&mut calls, 3, seq).await;
+        chosen = (1..=3usize).find(|&p| {
+            primary_for(&calls[0], calls[p].stream()).as_deref()
+                == Some(nodes[p].key.key_id.as_str())
+        });
+        if chosen.is_some() {
+            break;
+        }
+    }
+    let Some(p) = chosen else {
+        // Who each publisher feeds directly, with each child's rank (and
+        // R's), so a miss says whether the tree or the ranks were wrong.
+        let seen: Vec<String> = (1..=3usize)
+            .map(|p| {
+                let st = calls[p].stream();
+                let pid = nodes[p].key.key_id.as_str();
+                let kids: Vec<String> = (0..=3usize)
+                    .filter(|i| *i != p)
+                    .map(|i| {
+                        format!(
+                            "{i}:{}@{}",
+                            primary_for(&calls[i], st).map_or("none".to_owned(), |x| if x == pid {
+                                "direct".to_owned()
+                            } else {
+                                x[..6].to_owned()
+                            }),
+                            rank_of(st, &nodes[i].key.key_id).0
+                        )
+                    })
+                    .collect();
+                format!("P{p}: {kids:?}")
+            })
+            .collect();
+        panic!("R is a direct child of some publisher within 90 s: {seen:?}");
+    };
+    let pid = nodes[p].key.key_id.clone();
+    let pstream = calls[p].stream();
+    let guarded_before = av(&r.metrics, "alm_late_guarded:own_downlink");
+    let moves_before = av(&r.metrics, "alm_late_move");
+    downlink.delay_down_ms(400);
+    let mut left = None;
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        seq = publish_three(&mut calls, 1, seq).await;
+        let now = primary_for(&calls[0], pstream);
+        if now.as_deref() != Some(pid.as_str()) {
+            left = Some((start.elapsed(), now));
+            break;
+        }
+    }
+    let guarded = av(&r.metrics, "alm_late_guarded:own_downlink") - guarded_before;
+    let moves = av(&r.metrics, "alm_late_move") - moves_before;
+    let context = format!(
+        "P = node {p}: R left P {left:?}; guarded {guarded}; late moves {moves}; spared {}; \
+         R failovers {}; R stale {} expired-late {} datagram-late {}",
+        av(&r.metrics, "alm_late_spared"),
+        av(&r.metrics, "alm_failover"),
+        av(&r.metrics, "av_frame_stale_dropped"),
+        av(&r.metrics, "av_frame_expired_late"),
+        av(&r.metrics, "av_datagram_late"),
+    );
+    eprintln!("[RM6] slow downlink: {context}");
+    if left.is_some() {
+        eprintln!("[RM6] R log:\n{}", calls[0].alm_log().2);
+        eprintln!("[RM6] P log:\n{}", calls[p].alm_log().2);
+    }
+    // The row's must-never: no LATE move (RM6). A failover by silence is
+    // another mechanism and is reported in the context, not judged here.
+    assert_eq!(moves, 0, "R made a late move: {context}");
+    assert!(
+        guarded >= 1,
+        "the guard never ran (R was not late?): {context}"
+    );
+    drop(calls);
+}
+
+// ── Calls cut — a room where nobody relays (phones on metered data) ──────
+
+/// The longest a (listener, publisher) pair may go between consecutive
+/// chunks in an uncapped room where nobody relays. The design's intent is no
+/// gap beyond the cadence (the slow-start bridge exists so a refused member's
+/// move costs it nothing); the uncapped witness
+/// [`every_pair_keeps_both_legs_uncapped`] states no per-pair gap tolerance,
+/// so this is the 1 s the calls cut asks for.
+const NO_RELAY_GAP_BOUND: Duration = Duration::from_secs(1);
+
+/// The uncapped room of [`every_pair_keeps_both_legs_uncapped`]: four members
+/// reaching each other directly, node 4 the canonical shape.
+const NO_RELAY_DIALS: [(usize, usize); 10] = [
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (1, 2),
+    (1, 3),
+    (2, 3),
+    (0, 4),
+    (1, 4),
+    (2, 4),
+    (3, 4),
+];
+
+/// What one listener heard, per stream, as it arrived.
+type Arrivals = Arc<
+    std::sync::Mutex<
+        Vec<(
+            ciris_edge::transport::realtime_av::StreamId,
+            tokio::time::Instant,
+        )>,
+    >,
+>;
+
+/// One look at the room: each listener's primary for each publisher's
+/// stream (a role label), and each publisher's own-stream children
+/// (primaries, all).
+#[derive(Debug, Clone, PartialEq)]
+struct NoRelayLook {
+    parents: Vec<Vec<Option<String>>>,
+    kids: Vec<(usize, usize)>,
+}
+
+/// A four-member room in which every member joins with relay OFF and
+/// publishes 30 Hz from its own start (`t0`), each listener's arrivals
+/// recorded per stream as they come.
+struct NoRelayRoom {
+    tag: &'static str,
+    nodes: Arc<Vec<Node>>,
+    groups: Arc<Vec<CohortGroup>>,
+    /// `N0`..`N3` for the members, `T` for the canonical, by key id.
+    names: Vec<(String, String)>,
+    origin: tokio::time::Instant,
+    calls: Vec<Option<Call>>,
+    joining: Vec<Option<tokio::task::JoinHandle<Call>>>,
+    join_started: Vec<Option<tokio::time::Instant>>,
+    joined: Vec<Option<tokio::time::Instant>>,
+    /// Where a member's pair clocks start (and from when it publishes).
+    t0: Vec<Option<tokio::time::Instant>>,
+    /// Publish on install (a late joiner talks from its join).
+    publish_on_join: bool,
+    sends: Vec<Vec<tokio::time::Instant>>,
+    seq: u64,
+    arrivals: Vec<Arrivals>,
+    events: Vec<Option<mpsc::Receiver<CallEvent>>>,
+    /// (ms since origin, on node, event).
+    path_events: Vec<(u128, usize, String)>,
+    /// (ms since origin, look), only when it changed.
+    looks: Vec<(u128, NoRelayLook)>,
+    /// [listener][publisher]: first time the listener's primary was the
+    /// publisher itself.
+    first_direct: Vec<Vec<Option<tokio::time::Instant>>>,
+    /// [publisher][child]: first time the child held a PRIMARY on the
+    /// publisher's own stream.
+    first_child: Vec<Vec<Option<tokio::time::Instant>>>,
+    /// Every (ms, listener, publisher, parent) where a listener's primary
+    /// for a publisher's stream was another member.
+    member_parents: Vec<(u128, usize, usize, String)>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for NoRelayRoom {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+        for j in self.joining.iter().flatten() {
+            j.abort();
+        }
+    }
+}
+
+impl NoRelayRoom {
+    fn new(
+        tag: &'static str,
+        nodes: Vec<Node>,
+        groups: Vec<CohortGroup>,
+        publish_on_join: bool,
+    ) -> Self {
+        let names = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    n.key.key_id.clone(),
+                    if i < 4 {
+                        format!("N{i}")
+                    } else {
+                        "T".to_owned()
+                    },
+                )
+            })
+            .collect();
+        Self {
+            tag,
+            nodes: Arc::new(nodes),
+            groups: Arc::new(groups),
+            names,
+            origin: tokio::time::Instant::now(),
+            calls: (0..4).map(|_| None).collect(),
+            joining: (0..4).map(|_| None).collect(),
+            join_started: vec![None; 4],
+            joined: vec![None; 4],
+            t0: vec![None; 4],
+            publish_on_join,
+            sends: vec![Vec::new(); 4],
+            seq: 0,
+            arrivals: (0..4)
+                .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
+                .collect(),
+            events: (0..4).map(|_| None).collect(),
+            path_events: Vec::new(),
+            looks: Vec::new(),
+            first_direct: vec![vec![None; 4]; 4],
+            first_child: vec![vec![None; 4]; 4],
+            member_parents: Vec::new(),
+            tasks: Vec::new(),
+        }
+    }
+
+    fn ms(&self, t: tokio::time::Instant) -> u128 {
+        t.saturating_duration_since(self.origin).as_millis()
+    }
+
+    fn name(&self, key_id: &str) -> String {
+        self.names.iter().find(|(k, _)| k == key_id).map_or_else(
+            || key_id[..8.min(key_id.len())].to_owned(),
+            |(_, n)| n.clone(),
+        )
+    }
+
+    /// Join member `i` with relay OFF, in the background.
+    fn start_join(&mut self, i: usize) {
+        self.join_started[i] = Some(tokio::time::Instant::now());
+        let (nodes, groups, tag) = (Arc::clone(&self.nodes), Arc::clone(&self.groups), self.tag);
+        self.joining[i] = Some(tokio::spawn(async move {
+            join_loaded(
+                &nodes[i],
+                &groups[i],
+                tag,
+                CallOptions {
+                    relay: false,
+                    ..CallOptions::default()
+                },
+                None,
+            )
+            .await
+        }));
+    }
+
+    async fn poll_joins(&mut self) {
+        for i in 0..4 {
+            if self.joining[i]
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                let mut call = self.joining[i]
+                    .take()
+                    .expect("finished")
+                    .await
+                    .expect("join task");
+                let mut rx = call.frames().expect("frames");
+                let arr = Arc::clone(&self.arrivals[i]);
+                self.tasks.push(tokio::spawn(async move {
+                    while let Some(f) = rx.recv().await {
+                        arr.lock()
+                            .expect("arrivals")
+                            .push((f.stream, tokio::time::Instant::now()));
+                    }
+                }));
+                self.events[i] = call.events();
+                self.calls[i] = Some(call);
+                self.joined[i] = Some(tokio::time::Instant::now());
+                if self.publish_on_join {
+                    self.t0[i] = self.join_started[i];
+                }
+            }
+        }
+    }
+
+    fn all_joined(&self) -> bool {
+        self.calls.iter().all(Option::is_some)
+    }
+
+    // l and p index several per-member tables at once.
+    #[allow(clippy::needless_range_loop)]
+    fn look(&mut self) {
+        let now = tokio::time::Instant::now();
+        let streams: Vec<Option<ciris_edge::transport::realtime_av::StreamId>> = self
+            .calls
+            .iter()
+            .map(|c| c.as_ref().map(Call::stream))
+            .collect();
+        let mut parents = vec![vec![None; 4]; 4];
+        for l in 0..4 {
+            let Some(cl) = &self.calls[l] else { continue };
+            for p in (0..4).filter(|p| *p != l) {
+                let Some(s) = streams[p] else { continue };
+                let Some(x) = primary_for(cl, s) else {
+                    continue;
+                };
+                if x == self.names[p].0 {
+                    self.first_direct[l][p].get_or_insert(now);
+                } else {
+                    self.member_parents
+                        .push((self.ms(now), l, p, self.name(&x)));
+                }
+                parents[l][p] = Some(self.name(&x));
+            }
+        }
+        let mut kids = vec![(0, 0); 4];
+        for p in 0..4 {
+            let Some(cp) = &self.calls[p] else { continue };
+            let own = cp.alm_own_children();
+            kids[p] = (
+                own.iter().filter(|(_, r)| *r == Role::Primary).count(),
+                own.len(),
+            );
+            for (c, r) in &own {
+                if *r == Role::Primary {
+                    if let Some(ci) = self.names[..4].iter().position(|(k, _)| k == c) {
+                        self.first_child[p][ci].get_or_insert(now);
+                    }
+                }
+            }
+        }
+        let look = NoRelayLook { parents, kids };
+        if self.looks.last().is_none_or(|(_, l)| *l != look) {
+            self.looks.push((self.ms(now), look));
+        }
+        let at = self.ms(now);
+        for i in 0..4 {
+            let Some(rx) = self.events[i].as_mut() else {
+                continue;
+            };
+            while let Ok(e) = rx.try_recv() {
+                let line = match &e {
+                    CallEvent::MediaPathFailed {
+                        member,
+                        cause,
+                        detail,
+                        ..
+                    } => Some(format!("MediaPathFailed {member} {cause:?} {detail:?}")),
+                    CallEvent::MediaPathRestored { member, via, .. } => {
+                        Some(format!("MediaPathRestored {member} {via:?}"))
+                    }
+                    _ => None,
+                };
+                if let Some(line) = line {
+                    let named = self
+                        .names
+                        .iter()
+                        .fold(line, |s, (k, n)| s.replace(k.as_str(), n));
+                    self.path_events.push((at, i, named));
+                }
+            }
+        }
+    }
+
+    /// Without publishing: look and take joins until `done` or `budget`.
+    async fn settle(&mut self, budget: Duration, done: impl Fn(&Self) -> bool) -> bool {
+        let end = tokio::time::Instant::now() + budget;
+        loop {
+            self.poll_joins().await;
+            self.look();
+            if done(self) {
+                return true;
+            }
+            if tokio::time::Instant::now() > end {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Every publishing member sends one frame; a look every third.
+    async fn tick(&mut self) {
+        for i in 0..4 {
+            if self.t0[i].is_none() {
+                continue;
+            }
+            let Some(c) = self.calls[i].as_mut() else {
+                continue;
+            };
+            let size = c.chunk_plaintext_budget().unwrap_or(240).min(600);
+            let mut b = body(["a", "b", "c", "d"][i], self.seq);
+            b.resize(size, b'.');
+            let _ = c.publish(Frame::opaque(b)).await;
+            self.sends[i].push(tokio::time::Instant::now());
+        }
+        if self.seq.is_multiple_of(3) {
+            self.look();
+        }
+        self.seq += 1;
+        tokio::time::sleep(FRAME_INTERVAL).await;
+    }
+
+    async fn run_for(&mut self, d: Duration) {
+        let end = tokio::time::Instant::now() + d;
+        while tokio::time::Instant::now() < end {
+            self.poll_joins().await;
+            self.tick().await;
+        }
+    }
+
+    /// Run until member `i` has joined, then `d` more.
+    async fn run_past_join(&mut self, i: usize, d: Duration) {
+        let budget = tokio::time::Instant::now() + Duration::from_mins(1);
+        while self.calls[i].is_none() {
+            assert!(
+                tokio::time::Instant::now() < budget,
+                "member {i} joins within 60 s"
+            );
+            self.poll_joins().await;
+            self.tick().await;
+        }
+        self.run_for(d).await;
+    }
+
+    /// The per-pair table and every failure, the publishing having ended at
+    /// `end`.
+    #[allow(clippy::too_many_lines)]
+    fn judge(&self, end: tokio::time::Instant) -> (String, Vec<String>) {
+        let mut out = String::new();
+        let mut failed = Vec::new();
+        let ms = |t: Option<tokio::time::Instant>| t.map(|t| self.ms(t));
+        let _ = writeln!(
+            out,
+            "joins (ms since origin) started {:?} done {:?}; pair clocks t0 {:?}; publishing ended {}",
+            self.join_started.iter().map(|t| ms(*t)).collect::<Vec<_>>(),
+            self.joined.iter().map(|t| ms(*t)).collect::<Vec<_>>(),
+            self.t0.iter().map(|t| ms(*t)).collect::<Vec<_>>(),
+            self.ms(end),
+        );
+        out.push_str(
+            "pair L<-P: first chunk (ms from max(t0 L, t0 P)) | longest gap ms (at ms) | tail ms | heard/sent | first direct (ms from ref) | parents seen\n",
+        );
+        for l in 0..4 {
+            let arr = self.arrivals[l].lock().expect("arrivals").clone();
+            for p in (0..4).filter(|p| *p != l) {
+                let (Some(tl), Some(tp)) = (self.t0[l], self.t0[p]) else {
+                    failed.push(format!("N{l}<-N{p}: a member never started"));
+                    continue;
+                };
+                let r = tl.max(tp);
+                let Some(stream) = self.calls[p].as_ref().map(Call::stream) else {
+                    continue;
+                };
+                let heard: Vec<tokio::time::Instant> = arr
+                    .iter()
+                    .filter(|(s, t)| *s == stream && *t >= r)
+                    .map(|(_, t)| *t)
+                    .collect();
+                let sent = self.sends[p].iter().filter(|t| **t >= r).count();
+                let first = heard.first().map(|t| t.duration_since(r));
+                let (gap, gap_at) = heard
+                    .windows(2)
+                    .map(|w| (w[1].duration_since(w[0]), w[1]))
+                    .max_by_key(|(g, _)| *g)
+                    .map_or((Duration::ZERO, None), |(g, at)| (g, Some(at)));
+                let tail = heard
+                    .last()
+                    .map_or(Duration::ZERO, |t| end.saturating_duration_since(*t));
+                let direct = self.first_direct[l][p].map(|t| {
+                    if t >= r {
+                        t.duration_since(r).as_millis().to_string()
+                    } else {
+                        format!("-{}", r.duration_since(t).as_millis())
+                    }
+                });
+                let mut seen: Vec<Option<String>> = Vec::new();
+                for (_, lk) in &self.looks {
+                    if seen.last() != Some(&lk.parents[l][p]) {
+                        seen.push(lk.parents[l][p].clone());
+                    }
+                }
+                let _ = writeln!(
+            out,
+                    "  N{l}<-N{p}: first {:?} | gap {} (at {:?}) | tail {} | {}/{} | direct {:?} | {:?}",
+                    first.map(|d| d.as_millis()),
+                    gap.as_millis(),
+                    gap_at.map(|t| self.ms(t)),
+                    tail.as_millis(),
+                    heard.len(),
+                    sent,
+                    direct,
+                    seen,
+                );
+                if heard.is_empty() {
+                    failed.push(format!("N{l} never heard N{p}"));
+                }
+                if gap > NO_RELAY_GAP_BOUND {
+                    failed.push(format!(
+                        "N{l}<-N{p}: gap {} ms at {:?} ms, bound {} ms",
+                        gap.as_millis(),
+                        gap_at.map(|t| self.ms(t)),
+                        NO_RELAY_GAP_BOUND.as_millis()
+                    ));
+                }
+                if tail > NO_RELAY_GAP_BOUND {
+                    failed.push(format!(
+                        "N{l}<-N{p}: nothing for the last {} ms",
+                        tail.as_millis()
+                    ));
+                }
+            }
+        }
+        out.push_str("children admitted as PRIMARY on each publisher's own stream (ms since origin, in admission order; the 3rd is the one slow start refused):\n");
+        for p in 0..4 {
+            let mut kids: Vec<(u128, usize)> = (0..4)
+                .filter_map(|c| self.first_child[p][c].map(|t| (self.ms(t), c)))
+                .collect();
+            kids.sort_unstable();
+            let rel: Vec<String> = kids
+                .iter()
+                .map(|(t, c)| {
+                    // From the later of the pair's two starts (the pair's
+                    // own clock): the time it took to become direct.
+                    let since = self.t0[*c].zip(self.t0[p]).map(|(a, b)| {
+                        i128::try_from(*t).unwrap() - i128::try_from(self.ms(a.max(b))).unwrap()
+                    });
+                    format!("N{c}@{t} (+{since:?} from the pair's start)")
+                })
+                .collect();
+            let _ = writeln!(out, "  N{p}: {rel:?}");
+        }
+        out.push_str("looks (ms since origin; parents[listener][publisher]; own (primaries, all) per publisher), on change:\n");
+        for (t, lk) in &self.looks {
+            let _ = writeln!(out, "  {t}: kids {:?} parents {:?}", lk.kids, lk.parents);
+        }
+        let _ = writeln!(out, "path events: {:?}", self.path_events);
+        for (t, i, e) in &self.path_events {
+            if e.starts_with("MediaPathFailed") {
+                failed.push(format!("N{i} at {t} ms: {e}"));
+            }
+        }
+        if let Some(first) = self.member_parents.first() {
+            failed.push(format!(
+                "a listener's parent was a member (nobody relays): first {first:?}, {} looks",
+                self.member_parents.len()
+            ));
+        }
+        (out, failed)
+    }
+
+    fn logs(&self) -> String {
+        let mut s = String::new();
+        for (i, c) in self.calls.iter().enumerate() {
+            if let Some(c) = c {
+                let tail = self
+                    .names
+                    .iter()
+                    .fold(c.alm_log().2, |s, (k, n)| s.replace(k.as_str(), n));
+                let _ = writeln!(s, "[NR] N{i} log:\n{tail}");
+            }
+        }
+        s
+    }
+}
+
+/// **Calls cut — a room where nobody relays hears every publisher
+/// directly** (the server's metered-phone case: every member passes
+/// `relay: false`). Four members, uncapped, all publishing 30 Hz for 25 s.
+/// Slow start gives each publisher two direct children into its unmeasured
+/// uplink and refuses the third for capacity; with no relay anywhere, that
+/// member hears the publisher only through the slow-start bridge until the
+/// probe widens and admits it. Judged per (listener, publisher) pair: heard,
+/// no gap past [`NO_RELAY_GAP_BOUND`], no `MediaPathFailed` anywhere, and no
+/// member ever a parent.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_room_where_nobody_relays_hears_every_publisher_directly() {
+    let _call = one_call().await;
+    let tag = "alm2-norelay";
+    let (nodes, groups, _tmp) = topo(tag, 5, 4, &NO_RELAY_DIALS, Some(4)).await;
+    let mut room = NoRelayRoom::new(tag, nodes, groups, false);
+    for i in 0..4 {
+        room.start_join(i);
+    }
+    let up = room
+        .settle(Duration::from_mins(1), |r| {
+            r.all_joined() && r.calls.iter().flatten().all(|c| c.legs().len() >= 3)
+        })
+        .await;
+    assert!(up, "every member joins and holds 3 legs: {}", room.logs());
+    let start = tokio::time::Instant::now();
+    for i in 0..4 {
+        room.t0[i] = Some(start);
+    }
+    room.run_for(Duration::from_secs(25)).await;
+    let end = tokio::time::Instant::now();
+    // Late arrivals of what was sent before `end`.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (table, failed) = room.judge(end);
+    eprintln!("[NR] nobody relays, all at once:\n{table}failed {failed:?}");
+    if !failed.is_empty() {
+        eprintln!("{}", room.logs());
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+/// **Calls cut — late joiners in a room where nobody relays hear everyone**:
+/// two members streaming for 6 s; the third joins, the fourth 6 s later,
+/// every member with relay OFF, each publishing from its join. The fourth
+/// is each first publisher's third child, the one slow start refuses into
+/// an unmeasured uplink. Per pair, counted from the later of the two
+/// members' starts: heard, no gap past [`NO_RELAY_GAP_BOUND`], no
+/// `MediaPathFailed`.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn late_joiners_in_a_room_where_nobody_relays_hear_everyone() {
+    let _call = one_call().await;
+    let tag = "alm2-norelay-late";
+    let (nodes, groups, _tmp) = topo(tag, 5, 4, &NO_RELAY_DIALS, Some(4)).await;
+    let mut room = NoRelayRoom::new(tag, nodes, groups, true);
+    room.start_join(0);
+    room.start_join(1);
+    let up = room
+        .settle(Duration::from_mins(1), |r| {
+            r.calls[..2]
+                .iter()
+                .all(|c| c.as_ref().is_some_and(|c| !c.legs().is_empty()))
+        })
+        .await;
+    assert!(up, "the first two join and hold a leg: {}", room.logs());
+    // The first two start streaming together, once they hold their leg.
+    let start = tokio::time::Instant::now();
+    room.t0[0] = Some(start);
+    room.t0[1] = Some(start);
+    room.run_for(Duration::from_secs(6)).await;
+    room.start_join(2);
+    room.run_for(Duration::from_secs(6)).await;
+    room.start_join(3);
+    room.run_past_join(3, Duration::from_secs(20)).await;
+    let end = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (table, failed) = room.judge(end);
+    eprintln!("[NR] nobody relays, late joiners:\n{table}failed {failed:?}");
+    if !failed.is_empty() {
+        eprintln!("{}", room.logs());
+    }
+    assert!(failed.is_empty(), "{failed:?}");
 }

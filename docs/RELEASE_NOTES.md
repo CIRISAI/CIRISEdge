@@ -1,5 +1,96 @@
 # CIRISEdge Release Notes
 
+# v45.2.1 — a call follows its room, and every build lane compiles
+
+**2026-11-25.** **PATCH.** Pins unchanged: persist v61.4.4, CIRISVerify v22.2.4, leviculum
+v0.34.0+ciris.4. No migration, no wire change. Detail in CHANGELOG.md.
+
+- **A call follows its room's group.** A member who joined a call a moment before their app
+  applied a membership change (someone was just added or removed) sat one step behind the others
+  for good: the call's addresses come from the group's epoch, so it dialled addresses nobody
+  listened on, and only restarting the app cleared it. Six nodes joining at once did not form a
+  call in two minutes. A call now reads the stored group every 250 ms and rolls to it (measured
+  under a quarter of a second), then redials every member; a failed roll is counted
+  (`av_call_roll_failed`) and logged, never swallowed.
+- **A publisher whose only direct listener is gone takes the next one back, even while it
+  relays for others.** The rule for that case was switched off by any other commitment on the
+  uplink, a relayed standby for another member included, so about one time in four the member
+  that should have been taken back was refused for some 30 s. Relay work no longer blocks it;
+  the publisher's own other streams still keep their room.
+- **A member who drops out is read as lost.** An app that dropped a call without leaving kept
+  answering on the call's address, and since 45.2.0 its peers redialled it and held that link for
+  good, so it was never reported lost. A dropped call now leaves its addresses and closes its
+  links, and a link that arrives for a call a node is not in is closed, not left open. To be read
+  as having LEFT, an app still calls `leave_with`.
+- **A room that cannot be refreshed still opens** from the handle already held (counted and
+  logged), where it would have refused every open.
+- **Every build lane compiles.** v45.2.0's own CI failed four lanes: a feature gate had come off
+  the leviculum link module, so a build without the Reticulum transport did not compile. Builds
+  that enable it (CIRISServer's) were not affected.
+- Calls remain supported for up to four members; six and more are the work of 45.3.
+- **Known, and measured on this release: through a capped uplink, media arrives late.** With one
+  member's whole uplink capped at 250 kbit/s in a four-member call, every link stays up and about
+  84 % of that member's frames are delivered, but half of them more than 6 s after they were sent
+  and one in twenty more than 11 s after (the server's matrix on 9a810d2; the kernel queued about
+  11 s and dropped nothing). Edge queues media it cannot send where it should drop what is already
+  stale, and a receiver judges a frame's age from when it arrived, not from when it was sent.
+  Uncapped calls are unaffected (1 to 2 ms). Pacing with control first, and age judged end to
+  end, are the first work of 45.3.
+
+# v45.2.0 — group calls on member relays
+
+**2026-11-25.** **MINOR.** Pins: persist v61.4.4 by tag (`ciris-persist==61.4.4`, commit 5ef264f3),
+CIRISVerify v22.2.4, leviculum **v0.34.0+ciris.4** (was v0.34.0+ciris.3). No migration. Call
+control gains frames and events; nodes on 45.1.x keep working in calls as before. The host-facing
+call and relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`. Detail in CHANGELOG.md.
+
+- **A call's members forward for one another.** Every call runs the tree controller: a publisher
+  starts with two direct children and widens as its uplink shows room, members beyond that hear it
+  through a member relay, and servers never relay call media, audio included. Each host decides
+  whether its member relays (`CallOptions::relay`); a room where nobody relays still hears every
+  publisher directly, with no gap.
+- **A weak uplink sheds, and recovers.** A stalled uplink keeps one direct child and the rest are
+  relayed (heard about 90 % through a 90 s cap). A kept child that is lost mid-cap is replaced in
+  about 5 s. When the cap lifts the publisher re-opens by probing, one child every 10 s once its
+  uplink has drained, and every member is back direct in about 35 s (it was more than 70 s). Under
+  a cap that stays, its probes get rarer (up to 32 s apart).
+- **Receivers move themselves.** A receiver whose media arrives 300 ms late moves to a relay; one
+  whose own downlink is the slow part does not.
+- **Nothing in a call waits on the host.** A member whose app stops reading frames (backgrounded,
+  a busy UI) keeps answering control, keeps its parent and keeps relaying; what its host missed is
+  counted (`av_frame_dropped_host_not_reading`). A control frame the transport delivered is never
+  shed with media.
+- **A slow acknowledgement is not a dead link.** Under a capped uplink the one child a publisher
+  still fed saw its sends go unacknowledged for three seconds and retired its direct path to the
+  publisher, cutting everyone behind it off for up to 14 s. A link whose peer is plainly alive
+  (its media arrived within 2 s) is now kept, and still ends at 30 s if the peer truly stopped
+  acknowledging (`link_stall_held_peer_alive`).
+- **A publisher sheds a child only on a congestion verdict**, never because another stream it
+  relays admitted someone; and a child it shed does not ask it straight back.
+- **Direct links:** leviculum v0.34.0+ciris.4 brings port prediction, many-socket punches, a
+  second observer and nomination with a shared secret; its Channel keeps a link through a queue
+  (per-attempt receipts, a learned timeout held to the stale bound, RACK loss detection, pacing
+  from the path's minimum round trip, a path move judged by the old path's round trip).
+- **`README.md` says why each piece exists**, in plain words, with the Constitution, CEWP and the
+  kernel linked.
+- **Changed with leviculum v0.34.0+ciris.4:** a device answers a direct-connection request only by
+  probing a helper server (facilitator) of its own, never one the other side names. A device with
+  none named, or with proposing switched off by its operator (which resolves none), no longer
+  accepts direct connections.
+- **Supported size: calls of up to four members.** Measured on the server's capped-uplink matrix
+  (one member's whole uplink capped for 90 s, one run per cell): at four members every bar passes
+  at 250 and 300 kbit/s (no link torn down, no gap, 85 % and 96 % heard through the cap, everyone
+  back direct within about 30 s of the lift). At six members a capped uplink still tears links
+  down and about 81 % is heard at 300 kbit/s, and one six-member call did not form when everyone
+  joined in the same instant. Hosts should limit a call to four members on 45.2.0; six and more
+  are the work of 45.2.1.
+- **Known, for 45.2.1:** call events to a host that is not reading are dropped past 64 (now
+  counted, `av_call_event_dropped_host_not_reading`, and logged once per call); pair-preserving
+  delivery follows. Two members that lose the same relay can promote each other for one round
+  before admission refuses the second. When an uplink is capped, the first ten seconds lose about
+  half of that publisher's media while the shed and the relays settle; after that about 90 % is
+  heard.
+
 # v45.1.10 — where the bytes go, who the links are, and Python leaves the release
 
 **2026-11-22.** **PATCH.** Pins: persist v61.4.4 by tag (`ciris-persist==61.4.4`, commit 5ef264f3),

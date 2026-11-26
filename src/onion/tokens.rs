@@ -61,3 +61,8 @@ pub const SMALL_SET_PER_LAYER: usize = 10;
 /// A call or a stream on a node whose Anonymous Tier is active: a peer in
 /// anonymous mode is confined to the row plane.
 pub const ANONYMOUS_NO_MEDIA: &str = "onion_anonymous_no_media";
+/// CIRISEdge#1028 — a direct-link upgrade, proposed or accepted, on a node
+/// whose Anonymous Tier is active: either hands the peer (and the
+/// facilitator) this node's address, and an anonymous identity holds only
+/// layer and rendezvous links (CC 5.4.6).
+pub const ANONYMOUS_NO_DIRECT: &str = "onion_anonymous_no_direct";

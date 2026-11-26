@@ -121,6 +121,11 @@ pub mod av_spine;
 #[cfg(feature = "_reticulum-module")]
 pub mod direct_path;
 
+/// v45.1 — why a call's media path failed: the `MediaPathFailed` event's
+/// types, the NAT report, and the one place the cause is decided. Pure, so
+/// it builds without a transport (the UniFFI surface reads its types).
+pub mod media_path;
+
 /// Application-Layer Multicast (ALM) — mesh-tree video built on the
 /// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
 /// CIRISEdge#128 MDC). Pure-Rust, signed [`realtime_av_alm::RelayCapacity`]
@@ -860,6 +865,17 @@ pub trait Transport: Send + Sync + 'static {
     /// v44 — the node's service ladder, for a transport whose own tick folds
     /// edge's signals and applies the tier. Called once by `EdgeBuilder::build`.
     fn attach_load_ladder(&self, _ladder: std::sync::Arc<crate::load_ladder::SharedLadder>) {}
+
+    /// 45.2.0 — the node's live serve-seat (canonical) set, for a transport
+    /// that carries calls: a serve seat never relays call media, and a seat's
+    /// relay offers are dropped. Called by `EdgeBuilder::build` on EVERY
+    /// registered transport, whichever builder method registered it, so the
+    /// rule never depends on the registration path. No-op by default.
+    fn attach_serve_seats(
+        &self,
+        _seats: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    ) {
+    }
 
     /// CC 5.4.3 referrals — each node this transport homes on after a refusal
     /// at a bound, so the replication runtime can round with it. `None`: this

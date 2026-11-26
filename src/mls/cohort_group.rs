@@ -1909,101 +1909,190 @@ impl CohortGroup {
         community_id: &str,
         retained_epochs: u64,
     ) -> Result<Option<Self>, CohortGroupError> {
-        let Some(head_raw) = store.group_state_get(community_id, HEAD_SLOT).await? else {
-            return Ok(None);
-        };
-        let epoch = decode_head(&head_raw)?;
-        let Some(blob) = store.group_state_get(community_id, epoch).await? else {
-            return Err(CohortGroupError::HeadDangling(epoch));
-        };
-        let map = decode_snapshot(&blob)?;
-
-        let provider = Arc::new(LibcruxProvider::default());
-        restore_storage(provider.storage(), map);
-
-        let group_id = cohort_group_id(community_id);
-        let group = MlsGroup::load(provider.storage(), &group_id)
-            .map_err(|e| CohortGroupError::ApplyFailed(format!("MlsGroup::load: {e:?}")))?
-            .ok_or_else(|| CohortGroupError::GroupMissing(community_id.to_string()))?;
-
-        // The own-leaf signature key is the lookup key for the stored
-        // SignatureKeyPair. It came out of the same snapshot, so if
-        // the group loaded but the signer did not, the snapshot is
-        // internally inconsistent — fatal, not degraded.
-        let own_sig_pub = group
-            .own_leaf_node()
-            .ok_or_else(|| CohortGroupError::SignerMissing(community_id.to_string()))?
-            .signature_key()
-            .as_slice()
-            .to_vec();
-        let signer =
-            SignatureKeyPair::read(provider.storage(), &own_sig_pub, SignatureScheme::ED25519)
-                .ok_or_else(|| CohortGroupError::SignerMissing(community_id.to_string()))?;
-        // The own key id is the credential this node stamped at create /
-        // join — read back from the same snapshot, so a reload names
-        // itself the way its peers do.
-        let own_key_id = group
-            .own_leaf_node()
-            .ok_or_else(|| CohortGroupError::SignerMissing(community_id.to_string()))?
-            .credential()
-            .serialized_content()
-            .to_vec();
-        let own_key_id = String::from_utf8(own_key_id)
-            .map_err(|e| CohortGroupError::SnapshotMalformed(format!("own credential: {e}")))?;
-        let mut ledger: EpochLedger = match store.group_state_get(community_id, LEDGER_SLOT).await?
-        {
-            Some(blob) => serde_json::from_slice(&blob)
-                .map_err(|e| CohortGroupError::LedgerMalformed(format!("decode: {e}")))?,
-            None => EpochLedger::default(),
-        };
-        // CIRISEdge#697 — never hand the host a Commit its own group does not
-        // hold: a crash between the ledger write and the head move leaves an
-        // outbox entry for an epoch the head never reached.
-        let dropped = ledger.outbox.split_off(&(epoch + 1));
-        if !dropped.is_empty() {
-            tracing::warn!(
-                community_id,
-                head = epoch,
-                dropped = ?dropped.keys().collect::<Vec<_>>(),
-                "cohort MLS outbox held commits above the durable head (a crash between the \
-                 ledger write and the head move); dropped — the group will re-commit \
-                 (history: CIRISEdge#697)"
-            );
-        }
-        let member_joins = if let Some(joins) = store.member_joins_get(community_id).await? {
-            joins
-        } else {
-            // CIRISEdge#695 review — a group persisted before the join map
-            // existed: backfill every current member by what its instant
-            // is USED for (FSD §4.3 "Upgrade backfill"), and persist it.
-            let joins = backfill_member_joins(&group, &own_key_id, &ledger, now_ms());
-            if let Err(e) = store.member_joins_put(community_id, &joins).await {
-                tracing::warn!(
-                    community_id,
-                    error = %e,
-                    "backfilled member-join map could not be written; kept in memory, the \
-                     next commit persists it (history: CIRISEdge#695)"
-                );
-            }
-            joins
-        };
-        Ok(Some(Self {
-            community_id: Arc::from(community_id),
-            inner: Arc::new(Mutex::new(CohortGroupInner {
-                community_id: community_id.to_string(),
-                provider,
-                signer,
-                group,
-                store,
-                retained_epochs: retained_epochs.max(1),
-                held_commits: BTreeMap::new(),
-                own_key_id,
-                ledger,
-                member_joins,
-            })),
-        }))
+        Ok(load_inner(store, community_id, retained_epochs)
+            .await?
+            .map(|inner| Self {
+                community_id: Arc::from(community_id),
+                inner: Arc::new(Mutex::new(inner)),
+            }))
     }
 
+    /// 45.3 — the epoch the store's head pointer names for this group: one
+    /// small KV read (the 9-byte head slot), no snapshot load. `None` when
+    /// the store holds no state for it.
+    ///
+    /// # Errors
+    /// A store fault or a malformed head.
+    pub async fn stored_epoch(&self) -> Result<Option<u64>, CohortGroupError> {
+        let store = self.inner.lock().await.store.clone();
+        stored_head(&store, &self.community_id).await
+    }
+
+    /// 45.3 — follow the store: when its head pointer names a LATER epoch
+    /// than this handle holds (another handle on the same store applied a
+    /// commit: the host's chat driver holds its own), reload this handle's
+    /// state from the store in place, so every clone of it — a call's
+    /// among them — reads the new epoch. Returns `(from, to)` when it
+    /// reloaded, `None` when the handle was already at (or past) the head.
+    ///
+    /// Never moves a handle BACK: a head below this handle's epoch is left
+    /// alone (this handle's own persist moves the head before it reports an
+    /// epoch, so that is a writer that lost a race, not a newer state).
+    /// Commits held for a later epoch survive the reload.
+    ///
+    /// The check is one KV read of the head slot; the reload is
+    /// [`Self::load`]'s, under this handle's writer lock.
+    ///
+    /// # Errors
+    /// A store fault, a malformed head, or a reload that fails as
+    /// [`Self::load`] fails; the handle is left as it was.
+    pub async fn refresh_from_store(&self) -> Result<Option<(u64, u64)>, CohortGroupError> {
+        let mut inner = self.inner.lock().await;
+        let have = inner.epoch();
+        let Some(head) = stored_head(&inner.store, &self.community_id).await? else {
+            return Ok(None);
+        };
+        if head <= have {
+            return Ok(None);
+        }
+        let Some(mut fresh) = load_inner(
+            inner.store.clone(),
+            &self.community_id,
+            inner.retained_epochs,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let to = fresh.epoch();
+        if to <= have {
+            return Ok(None);
+        }
+        let waiting = std::mem::take(&mut inner.held_commits);
+        fresh.held_commits = waiting.into_iter().filter(|(e, _)| *e >= to).collect();
+        *inner = fresh;
+        drop(inner);
+        tracing::info!(
+            community_id = %self.community_id,
+            from = have,
+            to,
+            "cohort group: another handle on this store moved the room's head; reloaded \
+             this handle to it (45.3)"
+        );
+        Ok(Some((have, to)))
+    }
+}
+
+/// The epoch the head pointer names, or `None` when the store holds no
+/// state for `community_id`.
+async fn stored_head(
+    store: &ScopeStateProvider,
+    community_id: &str,
+) -> Result<Option<u64>, CohortGroupError> {
+    match store.group_state_get(community_id, HEAD_SLOT).await? {
+        Some(raw) => Ok(Some(decode_head(&raw)?)),
+        None => Ok(None),
+    }
+}
+
+/// [`CohortGroup::load`]'s state, before it becomes a handle (45.3: the
+/// in-place reload of [`CohortGroup::refresh_from_store`] reads it too).
+async fn load_inner(
+    store: ScopeStateProvider,
+    community_id: &str,
+    retained_epochs: u64,
+) -> Result<Option<CohortGroupInner>, CohortGroupError> {
+    let Some(head_raw) = store.group_state_get(community_id, HEAD_SLOT).await? else {
+        return Ok(None);
+    };
+    let epoch = decode_head(&head_raw)?;
+    let Some(blob) = store.group_state_get(community_id, epoch).await? else {
+        return Err(CohortGroupError::HeadDangling(epoch));
+    };
+    let map = decode_snapshot(&blob)?;
+
+    let provider = Arc::new(LibcruxProvider::default());
+    restore_storage(provider.storage(), map);
+
+    let group_id = cohort_group_id(community_id);
+    let group = MlsGroup::load(provider.storage(), &group_id)
+        .map_err(|e| CohortGroupError::ApplyFailed(format!("MlsGroup::load: {e:?}")))?
+        .ok_or_else(|| CohortGroupError::GroupMissing(community_id.to_string()))?;
+
+    // The own-leaf signature key is the lookup key for the stored
+    // SignatureKeyPair. It came out of the same snapshot, so if
+    // the group loaded but the signer did not, the snapshot is
+    // internally inconsistent — fatal, not degraded.
+    let own_sig_pub = group
+        .own_leaf_node()
+        .ok_or_else(|| CohortGroupError::SignerMissing(community_id.to_string()))?
+        .signature_key()
+        .as_slice()
+        .to_vec();
+    let signer = SignatureKeyPair::read(provider.storage(), &own_sig_pub, SignatureScheme::ED25519)
+        .ok_or_else(|| CohortGroupError::SignerMissing(community_id.to_string()))?;
+    // The own key id is the credential this node stamped at create /
+    // join — read back from the same snapshot, so a reload names
+    // itself the way its peers do.
+    let own_key_id = group
+        .own_leaf_node()
+        .ok_or_else(|| CohortGroupError::SignerMissing(community_id.to_string()))?
+        .credential()
+        .serialized_content()
+        .to_vec();
+    let own_key_id = String::from_utf8(own_key_id)
+        .map_err(|e| CohortGroupError::SnapshotMalformed(format!("own credential: {e}")))?;
+    let mut ledger: EpochLedger = match store.group_state_get(community_id, LEDGER_SLOT).await? {
+        Some(blob) => serde_json::from_slice(&blob)
+            .map_err(|e| CohortGroupError::LedgerMalformed(format!("decode: {e}")))?,
+        None => EpochLedger::default(),
+    };
+    // CIRISEdge#697 — never hand the host a Commit its own group does not
+    // hold: a crash between the ledger write and the head move leaves an
+    // outbox entry for an epoch the head never reached.
+    let dropped = ledger.outbox.split_off(&(epoch + 1));
+    if !dropped.is_empty() {
+        tracing::warn!(
+            community_id,
+            head = epoch,
+            dropped = ?dropped.keys().collect::<Vec<_>>(),
+            "cohort MLS outbox held commits above the durable head (a crash between the \
+             ledger write and the head move); dropped — the group will re-commit \
+             (history: CIRISEdge#697)"
+        );
+    }
+    let member_joins = if let Some(joins) = store.member_joins_get(community_id).await? {
+        joins
+    } else {
+        // CIRISEdge#695 review — a group persisted before the join map
+        // existed: backfill every current member by what its instant
+        // is USED for (FSD §4.3 "Upgrade backfill"), and persist it.
+        let joins = backfill_member_joins(&group, &own_key_id, &ledger, now_ms());
+        if let Err(e) = store.member_joins_put(community_id, &joins).await {
+            tracing::warn!(
+                community_id,
+                error = %e,
+                "backfilled member-join map could not be written; kept in memory, the \
+                 next commit persists it (history: CIRISEdge#695)"
+            );
+        }
+        joins
+    };
+    Ok(Some(CohortGroupInner {
+        community_id: community_id.to_string(),
+        provider,
+        signer,
+        group,
+        store,
+        retained_epochs: retained_epochs.max(1),
+        held_commits: BTreeMap::new(),
+        own_key_id,
+        ledger,
+        member_joins,
+    }))
+}
+
+impl CohortGroup {
     /// The group's current epoch.
     pub async fn epoch(&self) -> u64 {
         self.inner.lock().await.epoch()
@@ -2652,7 +2741,17 @@ pub struct CohortGroups {
     own_key_id: String,
     retained_epochs: u64,
     live: Mutex<HashMap<String, CohortGroup>>,
+    /// 45.3 — where a cached handle's failed refresh is counted
+    /// ([`Self::attach_metrics`]; the Edge attaches its own).
+    metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// 45.3 — the last refresh failure logged per room, and when: one line
+    /// per cause, again every [`REFRESH_FAILURE_RELOG`] while it stands.
+    refresh_failures: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
 }
+
+/// 45.3 — how often one unchanged refresh failure of a cached room handle is
+/// logged again while it persists (it is counted every time).
+const REFRESH_FAILURE_RELOG: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl std::fmt::Debug for CohortGroups {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2688,6 +2787,54 @@ impl CohortGroups {
             own_key_id: own_key_id.into(),
             retained_epochs: retained_epochs.max(1),
             live: Mutex::new(HashMap::new()),
+            metrics: std::sync::OnceLock::new(),
+            refresh_failures: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 45.3 — count this registry's refresh failures in `metrics`
+    /// (`av_plane` `av_call_room_refresh_failed`). The first attach wins; the
+    /// Edge attaches its own when it is handed the registry.
+    pub fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    /// 45.3 — refresh a CACHED handle before it is handed out. A failure
+    /// (a store fault, a head whose snapshot is missing or will not load)
+    /// leaves the handle as it was and is NOT the caller's error: the cached
+    /// handle still works, and refusing it made every open of the room fail
+    /// (boot readdress skipped it, `join_call` failed). It is counted and
+    /// logged once per cause; the call's watch, which calls
+    /// [`CohortGroup::refresh_from_store`] itself, still sees the error.
+    async fn refresh_cached(&self, community_id: &str, handle: &CohortGroup) {
+        let Err(e) = handle.refresh_from_store().await else {
+            return;
+        };
+        if let Some(m) = self.metrics.get() {
+            m.inc_av_plane(crate::observability::AV_CALL_ROOM_REFRESH_FAILED);
+        }
+        let cause = e.to_string();
+        let now = std::time::Instant::now();
+        let log = {
+            let mut seen = self
+                .refresh_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let repeat = seen.get(community_id).is_some_and(|(c, at)| {
+                *c == cause && now.duration_since(*at) < REFRESH_FAILURE_RELOG
+            });
+            if !repeat {
+                seen.insert(community_id.to_owned(), (cause.clone(), now));
+            }
+            !repeat
+        };
+        if log {
+            tracing::warn!(
+                community_id,
+                error = %cause,
+                "cohort group: the cached handle could not follow the store's head; handed \
+                 out as it is (45.3)"
+            );
         }
     }
 
@@ -2700,6 +2847,11 @@ impl CohortGroups {
     ) -> Result<Option<CohortGroup>, CohortGroupError> {
         let mut live = self.live.lock().await;
         if let Some(existing) = live.get(community_id) {
+            // 45.3 — a cached handle never answers behind the store's head:
+            // another handle on the same store (the host's chat driver holds
+            // its own) may have applied a commit since this one loaded. A
+            // refresh that fails still hands out the cached handle.
+            self.refresh_cached(community_id, existing).await;
             return Ok(Some(existing.clone()));
         }
         let Some(handle) =
@@ -2721,6 +2873,9 @@ impl CohortGroups {
     pub async fn open(&self, community_id: &str) -> Result<CohortGroup, CohortGroupError> {
         let mut live = self.live.lock().await;
         if let Some(existing) = live.get(community_id) {
+            // 45.3 — as in `open_existing`: never a handle behind the head,
+            // and so never a commit built on an epoch the store left.
+            self.refresh_cached(community_id, existing).await;
             return Ok(existing.clone());
         }
         let handle = match CohortGroup::load(self.store.clone(), community_id, self.retained_epochs)
@@ -4590,6 +4745,96 @@ mod tests {
             a.destination_secret().await.unwrap().as_bytes(),
             b.destination_secret().await.unwrap().as_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn a_cached_handle_follows_a_head_another_registry_on_the_store_moved() {
+        // 45.3 — two registries over one store (the Edge's and the host's
+        // chat driver's): a commit through one must be what the other's
+        // cached handle, and every clone of it, reads next.
+        let store = open_store();
+        let edge = CohortGroups::with_retention(store.clone(), "node-a", 8);
+        let chat = CohortGroups::with_retention(store.clone(), "node-a", 8);
+        let held = edge.open("c-follow").await.unwrap();
+        let other = chat.open_existing("c-follow").await.unwrap().unwrap();
+        let _ = other.rotate().await.unwrap();
+        assert_eq!(held.stored_epoch().await.unwrap(), Some(1));
+        assert_eq!(held.epoch().await, 0, "a clone reads its own state");
+        assert_eq!(held.refresh_from_store().await.unwrap(), Some((0, 1)));
+        assert_eq!(held.epoch().await, 1);
+        assert_eq!(
+            *held.destination_secret().await.unwrap().as_bytes(),
+            *other.destination_secret().await.unwrap().as_bytes(),
+            "the reload is the other handle's epoch, byte for byte"
+        );
+        assert_eq!(
+            held.refresh_from_store().await.unwrap(),
+            None,
+            "at the head"
+        );
+        // The registry's cache lookups reload too, in place.
+        let _ = other.rotate().await.unwrap();
+        let again = edge.open_existing("c-follow").await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&again.inner, &held.inner), "one handle still");
+        assert_eq!(held.epoch().await, 2);
+        let _ = other.rotate().await.unwrap();
+        assert_eq!(edge.open("c-follow").await.unwrap().epoch().await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_cached_handle_whose_refresh_fails_is_still_handed_out_and_counted() {
+        // 45.3 review — a head naming a snapshot that will not load: every
+        // open of the room used to fail although the cached handle worked.
+        let store = open_store();
+        let groups = CohortGroups::with_retention(store.clone(), "node-a", 8);
+        let metrics = crate::observability::EdgeMetrics::default();
+        groups.attach_metrics(metrics.clone());
+        let held = groups.open("c-broken").await.unwrap();
+        store
+            .group_state_put("c-broken", 5, b"not a snapshot")
+            .await
+            .unwrap();
+        store
+            .group_state_put("c-broken", HEAD_SLOT, &encode_head(5))
+            .await
+            .unwrap();
+        assert!(
+            held.refresh_from_store().await.is_err(),
+            "asked directly: the error"
+        );
+        let failed = || {
+            metrics
+                .av_plane
+                .read()
+                .get(crate::observability::AV_CALL_ROOM_REFRESH_FAILED)
+                .copied()
+                .unwrap_or(0)
+        };
+        let again = groups.open_existing("c-broken").await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&again.inner, &held.inner), "the cached handle");
+        assert_eq!(again.epoch().await, 0, "as it was");
+        assert_eq!(failed(), 1, "counted");
+        let _ = groups.open("c-broken").await.unwrap();
+        assert_eq!(failed(), 2, "counted every time");
+    }
+
+    #[tokio::test]
+    async fn a_handle_ahead_of_the_stored_head_is_never_moved_back() {
+        // 45.3 — the reload only goes forward: a handle that committed past
+        // the head another writer left behind keeps its own state.
+        let store = open_store();
+        let g = CohortGroups::with_retention(store.clone(), "node-a", 8)
+            .open("c-ahead")
+            .await
+            .unwrap();
+        let _ = g.rotate().await.unwrap();
+        let _ = g.rotate().await.unwrap();
+        store
+            .group_state_put("c-ahead", HEAD_SLOT, &encode_head(1))
+            .await
+            .unwrap();
+        assert_eq!(g.refresh_from_store().await.unwrap(), None);
+        assert_eq!(g.epoch().await, 2);
     }
 }
 

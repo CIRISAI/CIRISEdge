@@ -46,7 +46,7 @@ use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
 use ciris_edge::telemetry::call_legs::{CALL_BITRATE, CALL_PATH};
 use ciris_edge::transport::av_call::{
-    Call, CallDeps, CallError, CallOptions, Frame, ReceivedFrame, RoomRoster,
+    Call, CallDeps, CallError, CallEvent, CallOptions, Frame, ReceivedFrame, RoomRoster,
 };
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{StreamDekRegistrar, UnwiredRegistrar};
@@ -241,6 +241,9 @@ async fn try_transport_node(
         config.reticulum.default_ar_target = announce_rate_target;
         builder = builder.config(config);
     }
+    // `DirectLinkSettings` is #[non_exhaustive]: from its default.
+    let mut facilitator = leviculum_std::direct_link::DirectLinkSettings::default();
+    facilitator.facilitator_port = Some(facilitator_port);
     let mut node = builder
         .enable_transport(true)
         .add_interface_config(leviculum_std::config::InterfaceConfig {
@@ -251,10 +254,7 @@ async fn try_transport_node(
             ingress_control: Some(ingress),
             ..Default::default()
         })
-        .direct_link(leviculum_std::direct_link::DirectLinkSettings {
-            facilitator_port: Some(facilitator_port),
-            ..Default::default()
-        })
+        .direct_link(facilitator)
         .storage_path(storage.path().to_path_buf())
         .build()
         .await
@@ -397,7 +397,7 @@ struct Pair {
 
 /// `T`, then `A` and `B` as its clients, each holding the other's signed
 /// route and knowing the other through `T`; plus the room's MLS group over
-/// both. `facilitated` gives `A` `T`'s facilitator; `B` is on the default.
+/// both. `facilitated` gives `A` and `B` `T`'s facilitator; only `A` proposes.
 async fn pair(tag: &str, facilitated: bool) -> Pair {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -420,7 +420,20 @@ async fn pair(tag: &str, facilitated: bool) -> Pair {
         &b_dir,
         &tmp.path().join("b"),
         t_port,
-        DirectLinksConfig::default(),
+        // B names the facilitator too but does not propose: since leviculum
+        // v0.34.0+ciris.4 a node answers a proposal only by probing a
+        // facilitator of its OWN (it no longer probes one a peer names), so a
+        // member with none refuses. Not proposing keeps A the one proposer
+        // these tests are written around.
+        DirectLinksConfig {
+            proposing: if facilitated {
+                ciris_edge::transport::direct_path::Proposing::Off
+            } else {
+                ciris_edge::transport::direct_path::Proposing::On
+            },
+            facilitator: facilitated.then(|| format!("127.0.0.1:{f_port}")),
+            ..DirectLinksConfig::default()
+        },
     )
     .await;
     for (from, from_key, to) in [(&a_dir, &a.key, &b_dir), (&b_dir, &b.key, &a_dir)] {
@@ -1047,6 +1060,219 @@ async fn a_room_call_behind_t_without_a_facilitator_has_no_leg() {
     ));
 }
 
+/// Every call event `call` fires, collected as they come (the events channel
+/// is bounded, so it is drained from the start).
+fn collect_events(call: &mut Call) -> Arc<std::sync::Mutex<Vec<CallEvent>>> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut rx = call.events().expect("the call's events");
+    let into = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Some(e) = rx.recv().await {
+            into.lock().expect("events").push(e);
+        }
+    });
+    seen
+}
+
+fn path_events(seen: &std::sync::Mutex<Vec<CallEvent>>) -> Vec<CallEvent> {
+    seen.lock()
+        .expect("events")
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                CallEvent::MediaPathFailed { .. } | CallEvent::MediaPathRestored { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// **v45.1 — a failed media path says why, once, and is answered when the
+/// path comes up.** `A` and `B` have `T`'s facilitator, only `A` proposes, and `B` refuses
+/// every direct-link request (the test seam: REJECT `POLICY`). So:
+///
+/// - `A`'s leg to `B` proposes, `B` refuses, the dial across `T` cannot
+///   stand: `A` fires exactly one `MediaPathFailed { member: B, cause:
+///   refused_by_peer_policy, retryable: false, detail: peer_reject_policy,
+///   relay: none_available }` (`T` is not in the call), its `tried` the reflexive
+///   punch refused, its NAT `unknown` (this leviculum pin measures nothing)
+///   and no peer report (no carrier on this pin).
+/// - `B`'s leg to `A` cannot propose (its proposing is off): one
+///   `MediaPathFailed { member: A, cause: other, detail: proposing_off }`.
+/// - `A` dials `B` again through its backoff, and fires nothing more.
+/// - `B` then allows the path: `A`'s next proposal (on a fresh identity link,
+///   past leviculum's per-link cooldown) brings it direct, the legs come up,
+///   and each side fires one `MediaPathRestored` over `direct_reflexive`.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_failed_media_path_says_why_once_and_is_restored() {
+    use ciris_edge::transport::media_path::{
+        MediaPathCause, NatEvidence, NatMapping, PathDetail, PathKind, PathOutcome, RelayStanding,
+    };
+    let mut p = pair("mpf", true).await;
+    let (a_id, b_id) = (p.a.key.key_id.clone(), p.b.key.key_id.clone());
+    p.b.transport.set_refuse_direct_for_test(true);
+    let mut call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    let mut call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let seen_a = collect_events(&mut call_a);
+    let seen_b = collect_events(&mut call_b);
+
+    // A's proposal is refused, on the identity link it rode.
+    let refused_link = loop {
+        let e = tokio::time::timeout(Duration::from_mins(1), p.a.events.recv())
+            .await
+            .expect("A's proposal ends")
+            .expect("direct-path events");
+        if let DirectPathEvent::Failed {
+            link_id,
+            reason,
+            proposed: true,
+            ..
+        } = e
+        {
+            assert_eq!(reason, "direct_link_failed_rejected");
+            break link_id;
+        }
+    };
+    let failed = |seen: &std::sync::Mutex<Vec<CallEvent>>| {
+        path_events(seen)
+            .into_iter()
+            .filter(|e| matches!(e, CallEvent::MediaPathFailed { .. }))
+            .count()
+    };
+    assert!(
+        wait_until(Duration::from_mins(1), || async {
+            failed(&seen_a) >= 1 && failed(&seen_b) >= 1
+        })
+        .await,
+        "each side says why: A {:?}, B {:?}",
+        path_events(&seen_a),
+        path_events(&seen_b)
+    );
+    match &path_events(&seen_a)[..] {
+        [CallEvent::MediaPathFailed {
+            member,
+            cause,
+            retryable,
+            retry_after_s,
+            detail,
+            tried,
+            local_nat,
+            peer_nat,
+            relay,
+        }] => {
+            assert_eq!(member, &b_id);
+            assert_eq!(*cause, MediaPathCause::RefusedByPeerPolicy);
+            assert!(!retryable);
+            assert_eq!(*retry_after_s, None);
+            assert_eq!(*detail, Some(PathDetail::PeerRejectPolicy));
+            // `T` is a transport and the facilitator, not in the room or the
+            // call: nobody could relay, so `none_available` (the frozen doc).
+            // `refused_by_policy` is only for a serve seat IN the call whose
+            // offer was dropped (an older seat that still offers; since
+            // 45.2.0 a seat never offers): the alm unit tests feed one.
+            assert_eq!(*relay, RelayStanding::NoneAvailable);
+            assert_eq!(tried.len(), 1, "{tried:?}");
+            assert_eq!(tried[0].kind, PathKind::DirectReflexive);
+            assert_eq!(tried[0].outcome, PathOutcome::RefusedByPeer);
+            assert!(tried[0].attempts >= 1);
+            assert_eq!(local_nat.mapping, NatMapping::Unknown);
+            assert_eq!(local_nat.evidence, NatEvidence::None);
+            assert_eq!(peer_nat, &None);
+        }
+        other => panic!("A: one MediaPathFailed for B: {other:?}"),
+    }
+    match &path_events(&seen_b)[..] {
+        [CallEvent::MediaPathFailed {
+            member,
+            cause,
+            retryable,
+            detail,
+            tried,
+            relay,
+            ..
+        }] => {
+            assert_eq!(member, &a_id);
+            // B names a facilitator (it must, to answer) and does not
+            // propose: its own leg to A has no path it may start, and says
+            // so as the operator's switch, not as a missing facilitator.
+            assert_eq!(*cause, MediaPathCause::Other);
+            assert_eq!(*detail, Some(PathDetail::ProposingOff));
+            assert_eq!(*relay, RelayStanding::NoneAvailable);
+            eprintln!("[MPF] B's failure: retryable {retryable}, tried {tried:?}");
+        }
+        other => panic!("B: one MediaPathFailed for A: {other:?}"),
+    }
+    assert!(
+        p.a.transport.local_nat_report().is_none(),
+        "nothing measured on this pin"
+    );
+
+    // Retries through the backoff fire nothing more.
+    let skipped = dl(&p.a.metrics, "direct_link_skipped_backoff");
+    assert!(
+        wait_until(Duration::from_mins(1), || async {
+            dl(&p.a.metrics, "direct_link_skipped_backoff") >= skipped + 2
+        })
+        .await,
+        "A dials B again through its backoff"
+    );
+    assert_eq!(failed(&seen_a), 1, "{:?}", path_events(&seen_a));
+    assert_eq!(failed(&seen_b), 1, "{:?}", path_events(&seen_b));
+
+    // B allows the path; A's next dial proposes on a fresh identity link.
+    p.b.transport.set_refuse_direct_for_test(false);
+    let _ = p.a.transport.link_teardown(&refused_link).await;
+    p.a.transport.clear_direct_backoff_for_test(&b_id);
+    let restored = |seen: &std::sync::Mutex<Vec<CallEvent>>| {
+        path_events(seen)
+            .into_iter()
+            .filter(|e| matches!(e, CallEvent::MediaPathRestored { .. }))
+            .count()
+    };
+    assert!(
+        wait_until(Duration::from_mins(2), || async {
+            restored(&seen_a) >= 1 && restored(&seen_b) >= 1
+        })
+        .await,
+        "the path comes up and each side says so: A {:?}, B {:?}, A's legs {:?}",
+        path_events(&seen_a),
+        path_events(&seen_b),
+        call_a.legs()
+    );
+    // Each side's restore fires when the FIRST leg between them is up (B's
+    // on A's leg arriving); B's own leg follows: its dial in flight started
+    // with no path and fails "no route" (~4 s), then redials at once because
+    // the path came up meanwhile (G8 C), so one failed dial plus one dial.
+    // Before, it waited out a full backoff with the path up (12.6 s).
+    let legs_from = tokio::time::Instant::now();
+    let both = wait_until(Duration::from_secs(8), || async {
+        !call_a.legs().is_empty() && !call_b.legs().is_empty()
+    })
+    .await;
+    eprintln!(
+        "[MPF] both legs up after the restore: {both} in {:?}",
+        legs_from.elapsed()
+    );
+    assert!(
+        both,
+        "both legs up: A {:?}, B {:?}",
+        call_a.legs(),
+        call_b.legs()
+    );
+    for (seen, peer) in [(&seen_a, &b_id), (&seen_b, &a_id)] {
+        match &path_events(seen)[..] {
+            [CallEvent::MediaPathFailed { member: f, .. }, CallEvent::MediaPathRestored { member, via, .. }] =>
+            {
+                assert_eq!((f, member), (peer, peer));
+                assert_eq!(*via, PathKind::DirectReflexive);
+            }
+            other => panic!("one failure, then one restore: {other:?}"),
+        }
+    }
+}
+
 /// **E4, the other order** — A's dial proposes to B before B's call is
 /// installed, so B is asked while it shares nothing with A. B's host holds the
 /// request for that standing instead of refusing it; B joins, and the link
@@ -1422,5 +1648,514 @@ async fn fresh_interface_burst_measure() {
         "[BURST] end {:?}: {:?}",
         start.elapsed(),
         t.transport_stats()
+    );
+}
+
+// ─── calls cut: a member that cannot punch is heard through another member ──
+
+struct Trio {
+    t: ReticulumNode,
+    sides: Vec<Side>,
+    room: String,
+    groups: Vec<CohortGroup>,
+    _tmp: tempfile::TempDir,
+}
+
+/// `T` (the canonical's role: transport on, a facilitator), then `A`, `B`
+/// and `C`, each a TCP client of `T` and of nothing else, each proposing
+/// direct links through `T`'s facilitator as a server-composed node does; a
+/// room over all three. `A` and `B` refuse each other's direct-link request
+/// (REJECT `POLICY`), so their punch never succeeds: the pair a random
+/// symmetric NAT and a strict one make. `C` punches to both.
+#[allow(clippy::too_many_lines)] // three sides, their routes and the room
+async fn trio(tag: &str) -> Trio {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (t, t_port, f_port) = transport_node().await;
+    let direct = || DirectLinksConfig {
+        facilitator: Some(format!("127.0.0.1:{f_port}")),
+        ..DirectLinksConfig::default()
+    };
+    let mut keys = Vec::new();
+    for (i, name) in ["a", "b", "c"].iter().enumerate() {
+        keys.push(
+            Ident::new(
+                &format!("node-{name}-trio-{tag}"),
+                0x60 + u8::try_from(i).unwrap(),
+            )
+            .await,
+        );
+    }
+    let mut records = Vec::new();
+    for k in &keys {
+        records.push(k.record().await);
+    }
+    let mut sides = Vec::new();
+    for (i, key) in keys.into_iter().enumerate() {
+        let dir = directory_with(records.clone()).await;
+        sides.push(
+            side(
+                key,
+                &dir,
+                &tmp.path().join(format!("n{i}")),
+                t_port,
+                direct(),
+            )
+            .await,
+        );
+    }
+    for from in &sides {
+        let routes = from
+            .dir
+            .list_signed_transport_destinations_for(&from.key.key_id)
+            .await
+            .expect("list routes");
+        for to in &sides {
+            if to.key.key_id != from.key.key_id {
+                for r in &routes {
+                    FederationDirectory::put_signed_transport_destination(&*to.dir, r)
+                        .await
+                        .expect("seed the route");
+                }
+            }
+        }
+    }
+    let known = wait_until(Duration::from_mins(1), || async {
+        for a in &sides {
+            for b in &sides {
+                if a.key.key_id != b.key.key_id && !a.transport.seek_peer(&b.key.key_id).await {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+    .await;
+    assert!(known, "every member reaches every other through T");
+    // The pair that cannot punch.
+    sides[0]
+        .transport
+        .refuse_direct_from_for_test(&sides[1].key.key_id);
+    sides[1]
+        .transport
+        .refuse_direct_from_for_test(&sides[0].key.key_id);
+
+    let room = format!("room-call-trio-{tag}");
+    let first = CohortGroup::create(store(&format!("{tag}-0")), &room, &sides[0].key.key_id, 16)
+        .await
+        .expect("A founds the room");
+    let mut groups = vec![first];
+    for (i, sd) in sides.iter().enumerate().skip(1) {
+        let (material, kp) = mint_cohort_key_material(&sd.key.key_id).expect("key material");
+        let add = groups[0]
+            .add_member(&sd.key.key_id, kp)
+            .await
+            .expect("add the member");
+        for g in groups.iter().skip(1) {
+            let _ = g
+                .apply_remote_commit(add.commit())
+                .await
+                .expect("apply the Add");
+        }
+        groups.push(
+            CohortGroup::join(
+                store(&format!("{tag}-{i}")),
+                &room,
+                material,
+                add.welcome().expect("a Welcome"),
+                16,
+            )
+            .await
+            .expect("join from the Welcome"),
+        );
+    }
+    Trio {
+        t,
+        sides,
+        room,
+        groups,
+        _tmp: tmp,
+    }
+}
+
+/// The host's defaults for a member node (CIRISServer: relay on for members,
+/// off for canonicals).
+fn member_opts() -> CallOptions {
+    CallOptions {
+        relay: true,
+        ..CallOptions::default()
+    }
+}
+
+// The options are moved into the call.
+#[allow(clippy::large_types_passed_by_value)]
+async fn join_as(side: &Side, group: &CohortGroup, room: &str, opts: CallOptions) -> Call {
+    Call::join(
+        room,
+        &side.key.key_id,
+        CallDeps {
+            room_group: group.clone(),
+            roster: Arc::new(Roster),
+            owners: Arc::clone(&side.dir) as Arc<dyn ciris_edge::transport::av_call::CallOwners>,
+            transport: Arc::clone(&side.transport),
+            lifecycle: Arc::clone(&side.lifecycle),
+            registrar: Arc::new(UnwiredRegistrar) as Arc<dyn StreamDekRegistrar>,
+            events: None,
+            metrics: Some(side.metrics.clone()),
+            record: None,
+            signer: side.key.signer(),
+            verifier: Arc::clone(&side.dir) as Arc<dyn StreamKeyVerifier>,
+            load: None,
+        },
+        opts,
+    )
+    .await
+    .expect("join")
+}
+
+fn primary_for(
+    call: &Call,
+    stream: ciris_edge::transport::realtime_av::StreamId,
+) -> Option<String> {
+    call.alm_parents()
+        .into_iter()
+        .find(|p| p.stream == stream)
+        .and_then(|p| p.primary)
+}
+
+/// How many distinct frames of `from` arrive at `rx`, up to `n`, within 20 s.
+async fn heard_from(rx: &mut mpsc::Receiver<ReceivedFrame>, from: &str, n: u64) -> usize {
+    let mut got = std::collections::BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while got.len() < usize::try_from(n).unwrap() {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(f)) if f.publisher == from => {
+                got.insert(f.bytes);
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    got.len()
+}
+
+/// Bytes `T`'s interfaces carried, both ways: everything that crossed it.
+fn t_bytes(t: &ReticulumNode) -> u64 {
+    t.interface_stats()
+        .iter()
+        .map(|i| i.rx_bytes + i.tx_bytes)
+        .sum()
+}
+
+/// **The calls-cut acceptance witness** (Eric 2026-11-21: "if anyone in that
+/// room had a hard NAT, they should use the other peers as relays"). A and B
+/// cannot punch to each other; C punches to both. Every member is on the
+/// host's member default (relay on). A hears B's media, and B hears A's,
+/// THROUGH C: each chooses C as the parent of the other's stream, says so on
+/// `MediaPathRestored { via: peer_relay, through: C }` with no standing
+/// `MediaPathFailed`, and C counts what it forwarded. No call leg crosses T,
+/// and T carries signalling only: what crossed it during the media is a small
+/// fraction of what the media moved.
+// a, b, c, p: the members and the fixture, as the docs name them.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_that_cannot_punch_is_heard_through_another_member() {
+    let p = Box::pin(trio("relay")).await;
+    let (a, b, c) = (&p.sides[0], &p.sides[1], &p.sides[2]);
+    let mut ca = join_as(a, &p.groups[0], &p.room, member_opts()).await;
+    let mut cb = join_as(b, &p.groups[1], &p.room, member_opts()).await;
+    let cc = join_as(c, &p.groups[2], &p.room, member_opts()).await;
+    let mut a_frames = ca.frames().expect("A's frames");
+    let mut b_frames = cb.frames().expect("B's frames");
+    let mut a_events = ca.events().expect("A's events");
+
+    // C's legs come up over punched interfaces; A and B never reach each other.
+    let legs_up = wait_until(Duration::from_mins(2), || async {
+        ca.legs().contains(&c.key.key_id)
+            && cb.legs().contains(&c.key.key_id)
+            && cc.legs().len() >= 2
+    })
+    .await;
+    assert!(
+        legs_up,
+        "C's legs: A {:?}, B {:?}, C {:?}",
+        ca.legs(),
+        cb.legs(),
+        cc.legs()
+    );
+    assert!(!ca.legs().contains(&b.key.key_id), "A has no leg to B");
+    assert!(!cb.legs().contains(&a.key.key_id), "B has no leg to A");
+
+    // The mesh carries them: each takes C as the other's parent.
+    let relayed = wait_until(Duration::from_mins(1), || async {
+        primary_for(&ca, cb.stream()).as_deref() == Some(c.key.key_id.as_str())
+            && primary_for(&cb, ca.stream()).as_deref() == Some(c.key.key_id.as_str())
+    })
+    .await;
+    assert!(
+        relayed,
+        "A's parents {:?}; B's parents {:?}; C's log {:?}",
+        ca.alm_parents(),
+        cb.alm_parents(),
+        cc.alm_log()
+    );
+
+    // Media both ways, through C, while T is watched.
+    let t_before = t_bytes(&p.t);
+    let n = 60u64;
+    let mut sent_bytes = 0u64;
+    for seq in 0..n {
+        for (call, who) in [(&mut ca, "a"), (&mut cb, "b")] {
+            let mut frame = body(who, seq);
+            frame.resize(600, b'.');
+            sent_bytes += frame.len() as u64;
+            let _ = call.publish(Frame::opaque(frame)).await.expect("publish");
+        }
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let at_a = heard_from(&mut a_frames, &b.key.key_id, n).await;
+    let at_b = heard_from(&mut b_frames, &a.key.key_id, n).await;
+    let t_after = t_bytes(&p.t);
+    assert_eq!(
+        (at_a, at_b),
+        (usize::try_from(n).unwrap(), usize::try_from(n).unwrap()),
+        "A hears all of B through C, and B all of A; C forwarded {:?}",
+        cc.relayed_to()
+    );
+
+    // C did the relaying, and says so.
+    let relayed_to = cc.relayed_to();
+    for x in [a, b] {
+        let r = relayed_to
+            .iter()
+            .find(|r| r.child == x.key.key_id)
+            .unwrap_or_else(|| panic!("C forwarded to {}: {relayed_to:?}", x.key.key_id));
+        assert!(r.chunks >= n && r.bytes > 0, "{r:?}");
+    }
+    let (relaying, relaying_for) = cc.relay_status();
+    assert!(relaying);
+    assert_eq!(relaying_for, 2, "C relays for two nodes");
+    let relay_out = c
+        .metrics
+        .wire_bytes
+        .snapshot()
+        .family(ciris_edge::wire_bytes::WireDir::Out);
+    let relay_plane: u64 = relay_out
+        .iter()
+        .filter(|(k, _)| k.ends_with(":relay"))
+        .map(|(_, v)| *v)
+        .sum();
+    assert!(
+        relay_plane > 0,
+        "C's forwarded media is in the relay plane: {relay_out:?}"
+    );
+
+    // No call leg crosses T, and T carried signalling only.
+    for call in [&ca, &cb, &cc] {
+        for leg in call.leg_info() {
+            assert_ne!(
+                leg.path,
+                ciris_edge::transport::av_call::LegPath::Relayed,
+                "a call leg rides a forwarder: {leg:?}"
+            );
+        }
+    }
+    let t_moved = t_after.saturating_sub(t_before);
+    assert!(
+        t_moved * 10 < sent_bytes,
+        "T carried {t_moved} B while the media moved {sent_bytes} B: media crossed T"
+    );
+
+    // The event says through whom; no failure stands for B.
+    let mut restored = None;
+    let mut failed = None;
+    while let Ok(e) = a_events.try_recv() {
+        match e {
+            CallEvent::MediaPathRestored {
+                member,
+                via,
+                through,
+            } if member == b.key.key_id => restored = Some((via, through)),
+            CallEvent::MediaPathFailed { member, .. } if member == b.key.key_id => {
+                failed = Some(member);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        restored,
+        Some((
+            ciris_edge::transport::media_path::PathKind::PeerRelay,
+            Some(c.key.key_id.clone())
+        )),
+        "A is told B is heard through C"
+    );
+    assert_eq!(
+        failed, None,
+        "no MediaPathFailed for a member a relay carries"
+    );
+}
+
+/// The next `Established` on `side`'s direct-path events within `within`, as
+/// `(link_id, at)`.
+async fn next_established(
+    side: &mut Side,
+    within: Duration,
+) -> Option<([u8; 16], tokio::time::Instant)> {
+    tokio::time::timeout(within, async {
+        loop {
+            match side.events.recv().await {
+                Ok(DirectPathEvent::Established { link_id, .. }) => {
+                    return (link_id, tokio::time::Instant::now());
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("events closed"),
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+/// G8 C — from a punched link's close to the call leg back on a punched
+/// interface: ONE redial (the identity link over the relayed route asked for
+/// at the release, and its proposal: ~0.45 s measured) plus ONE punch
+/// (~0.86 s) plus the A/V link over it (ms), and the witness's 250 ms poll:
+/// 1.56 s measured. Each step is bounded at about twice what it took.
+const LEG_BACK_BOUND: Duration = Duration::from_secs(3);
+
+/// Whether `call`'s leg to `to` rides a punched interface now.
+fn leg_is_punched(call: &Call, to: &Side) -> bool {
+    call.leg_info().iter().any(|l| {
+        l.member == to.key.key_id && l.path == ciris_edge::transport::av_call::LegPath::DirectUdp
+    })
+}
+
+/// **G8 C, end to end** — a punched path whose LINK closes under a live call
+/// leg comes back within seconds, not after the 60 s backoff that mirrored
+/// leviculum's per-link proposal cooldown (the 45.1.9 relay matrix's 60–75 s
+/// gaps). leviculum retires the punched interface with its link, so the leg
+/// over it goes too; the released direct path lets the leg's redial propose
+/// at once on a new identity link. Then the bounds: a second close inside
+/// the 60 s window backs the peer off (no punch storm), and a hang-up
+/// proposes nothing.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_punched_link_closed_under_a_call_comes_back_within_seconds() {
+    let mut p = Box::pin(pair("g8c", true)).await;
+    let call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    let call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let (first, _) = next_established(&mut p.a, Duration::from_mins(1))
+        .await
+        .expect("A's identity link moves onto a punched interface");
+    assert!(
+        wait_until(Duration::from_mins(1), || async {
+            leg_is_punched(&call_a, &p.b)
+        })
+        .await,
+        "A's leg to B rides the punched interface: {:?}",
+        call_a.leg_info()
+    );
+
+    // The link closes from under the live leg (here A's own teardown; in
+    // the field a Channel exhausted, leviculum#113).
+    let closed_at = tokio::time::Instant::now();
+    p.a.transport
+        .link_teardown(&first)
+        .await
+        .expect("tear the punched link down");
+    let (second, up_at) = next_established(&mut p.a, Duration::from_secs(45))
+        .await
+        .expect("a new identity link is punched again");
+    assert_ne!(second, first, "a new link");
+    let took = up_at - closed_at;
+    assert!(
+        took < Duration::from_secs(30),
+        "back on a direct path in {took:?}, not after the 60 s backoff"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            leg_is_punched(&call_a, &p.b)
+        })
+        .await,
+        "A's leg to B is back on a punched interface: {:?}",
+        call_a.leg_info()
+    );
+    let leg_back = closed_at.elapsed();
+    eprintln!(
+        "[G8C] link close -> new punched identity link {took:?}; -> call leg punched again {leg_back:?}"
+    );
+    // The leg is back within one redial and one punch (LEG_BACK_BOUND).
+    // Before G8 C (14.5 s and 11.3 s measured): the A/V link on the retired
+    // interface lingered until its Channel exhausted (2-10 s, nothing told
+    // it), and the redial then met "no route" (the relayed route had been
+    // replaced by the punched one and went with it), so its backoff doubled
+    // until an announce came back. Now the release closes the A/V links it
+    // carried and asks for the relayed route at once, and a leg waiting out
+    // a backoff redials as soon as a new direct path is up.
+    assert!(
+        leg_back <= LEG_BACK_BOUND,
+        "the leg came back {leg_back:?} after the close (the direct path {took:?})"
+    );
+    assert!(
+        dl(&p.a.metrics, "direct_link_released_link_closed") >= 1,
+        "{:?}",
+        p.a.metrics.direct_link()
+    );
+
+    // A hang-up proposes nothing: the legs go, the identity link and its
+    // direct path stay, and no release or proposal follows.
+    let proposed = dl(&p.a.metrics, "direct_link_proposed");
+    let released = dl(&p.a.metrics, "direct_link_released_link_closed");
+    let _ = call_a.leave().await;
+    let _ = call_b.leave().await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        (
+            dl(&p.a.metrics, "direct_link_proposed"),
+            dl(&p.a.metrics, "direct_link_released_link_closed")
+        ),
+        (proposed, released),
+        "a hang-up re-punched nothing: {:?}",
+        p.a.metrics.direct_link()
+    );
+
+    // A second close inside the 60 s window is not free: the peer backs
+    // off, so a peer whose links keep dying is never punched in a storm.
+    let call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A rejoins");
+    let _call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B rejoins");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            leg_is_punched(&call_a, &p.b)
+        })
+        .await,
+        "the rejoined leg rides the standing punched path: {:?}",
+        call_a.leg_info()
+    );
+    assert!(
+        closed_at.elapsed() < Duration::from_secs(55),
+        "still inside the window"
+    );
+    let proposed = dl(&p.a.metrics, "direct_link_proposed");
+    p.a.transport
+        .link_teardown(&second)
+        .await
+        .expect("tear the second punched link down");
+    assert!(
+        next_established(&mut p.a, Duration::from_secs(20))
+            .await
+            .is_none(),
+        "no re-punch inside the window"
+    );
+    assert_eq!(
+        dl(&p.a.metrics, "direct_link_proposed"),
+        proposed,
+        "nothing proposed while backing off: {:?}",
+        p.a.metrics.direct_link()
+    );
+    assert!(
+        dl(&p.a.metrics, "direct_link_skipped_backoff") >= 1,
+        "the leg's redials met the backoff: {:?}",
+        p.a.metrics.direct_link()
     );
 }

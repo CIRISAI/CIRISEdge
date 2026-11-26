@@ -2,6 +2,88 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.2.1 — 2026-11-25
+
+**PATCH. A call follows its room's group; every build lane compiles.** Pins unchanged.
+
+### Fixed
+- A call runs at the room group's current stored epoch: `CohortGroup::refresh_from_store` reloads
+  a handle whose store has moved on (another handle on the same store applied a commit), the
+  call's watch refreshes every tick and rolls, and a roll redials every member. A call that joined
+  one epoch behind could never connect. `av_call_roll_failed`, `av_call_room_followed_store`.
+- A publisher with no primary child admits one past RELAY commitments (row S3): the guard was
+  `external_committed == 0`, which a relay standby for another member's stream turned off; the
+  kept-child recovery witness failed about 1 run in 4 on v45.2.0. Own shares keep their room.
+- Dropping a `Call` leaves its addresses and closes its legs and in-links; an A/V link for no
+  live call is closed, not left up. A killed node was never read as lost (regression in 45.2.0:
+  `a_signed_leave_says_why_and_a_killed_node_is_lost_after_the_bound` failed in the tag's CI).
+- Tests: the framed-video loss witness anchors its gap in the settled receive view, and the
+  loaded-receiver keyframe witness starts on both bindings (both raced call start-up).
+- `CohortGroups::open_existing` / `::open` hand out the cached handle when its refresh fails
+  (logged, counted), not an error.
+- `mod leviculum_link` is gated on the reticulum feature again (v45.2.0 did not compile with
+  `transport-http` alone, with `transport-packet-radio` alone, or for the uniffi bindgen build).
+- `NoRouteToPeer` from a derived-address dial reports the path table's own `has_path`.
+
+### Known
+- Through a capped uplink media is delivered late, not dropped: at four members and 250 kbit/s,
+  p50 6.0 s and p95 11.1 s (server matrix, 9a810d2). `MEDIA_STALE_BUDGET` (800 ms) measures a
+  frame's wait in the receiver's own queue only; nothing drops on the signed source timestamp, and
+  a datagram leg has no expiry. 45.3.
+
+## 45.2.0 — 2026-11-25
+
+**MINOR. Group calls on member relays.** Pins: persist v61.4.4 by tag, CIRISVerify v22.2.4,
+leviculum **v0.34.0+ciris.4** by tag (was v0.34.0+ciris.3). No migration. The host-facing call and
+relay tokens are frozen for 45.x in `docs/calls_relay_tokens.md`.
+
+### Added
+- The call tree controller in every call: member relays, slow start (two direct children, widening
+  as the uplink shows room), stall shedding to one direct child, receiver moves on late media
+  (rows RM1–RM7), the own-downlink guard, and the kept-child recovery (row S3, after a LOST
+  primary only).
+- A publisher re-opens after congestion by probing (rows RO, ProbeAfterDrain, FR): one more direct
+  child per 10 s once its uplink has drained for 2 s; a failed probe doubles the wait, to 32 s.
+- The way back to the publisher (row RD): a relayed member moves its standby to the publisher as
+  soon as it offers a whole stream of room.
+- `av_frame_dropped_host_not_reading`, `av_call_event_dropped_host_not_reading`,
+  `av_inbound_control_dropped`; every ALM decision-log line names its stream.
+- Direct links: `DirectLinkSettings` is non-exhaustive; the peer-evidence hold; the queue gauge
+  reads leviculum's learned round trip.
+- `README.md`: why each piece exists, in plain words; links to the Constitution, CEWP, the kernel
+  and the conformance suite.
+
+### Fixed
+- No receive loop waits on the host: a member whose app stops reading frames kept no control
+  plane and stranded its children.
+- A control frame the transport delivered is never shed with media at the receiver.
+- The link stall guard keeps a link whose peer is alive and reaching this node (verified media
+  within 2 s): its acknowledgements are late behind a queue, not lost. The 30 s bound still ends
+  a link whose peer stopped acknowledging. `link_stall_held_peer_alive`.
+- A node that does not propose still answers a direct-link proposal: its facilitator is handed to
+  leviculum whenever one is named (leviculum v0.34.0+ciris.4 answers only through its own).
+- A forwarder sheds an existing child only on a congestion verdict (row NV), never because another
+  stream it relays admitted someone.
+- A Capacity refusal is demand only when the publisher is not latched, did not just shed the
+  asker, and has drained; demand lapses after a dwell. Re-open steps no longer compound.
+- A child its publisher shed does not ask it straight back.
+
+### Changed
+- With leviculum v0.34.0+ciris.4 a node with no facilitator named, or with proposing off (which
+  resolves none), no longer accepts direct links.
+
+### Known
+- **Calls are supported up to four members in 45.2.0.** At six, a capped uplink still tears links
+  down (about 81 % heard at 300 kbit/s; the first ten seconds 12-14 %), and a six-member call
+  whose members all joined in the same instant did not form in one run. Hosts should limit a call
+  to four members.
+- When an uplink is capped, the first ten seconds lose about half of that publisher's media while
+  the shed and the relays settle.
+- Call events to a host that is not reading are dropped past 64 (counted, logged once per call);
+  pair-preserving delivery is planned for 45.2.1.
+- Two members that lose the same relay can promote each other for one round; admission refuses
+  the second.
+
 ## 45.1.10 — 2026-11-22
 
 **PATCH. Where the bytes go, who the links are, and Python leaves the release.** Pins: persist

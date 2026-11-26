@@ -668,3 +668,167 @@ async fn a_withdraws_waits_for_its_target_and_lands_after_it_1252() {
     );
     let _ = &r.dave;
 }
+
+/// CIRISEdge#1029 F7 — **a cosignature for a hold this node has settled is
+/// refused TERMINAL, and not asked for again.**
+///
+/// Field (12-person star, 45.1.9): the joiner admitted dave's widening
+/// assembled, so its hold settled `landed`; the founder then pushed the
+/// event's `cosign:signature:v1` rows every round and each was refused
+/// `cosign_pending_settled`, booked `retry="transient"` (~16 refusals per
+/// joiner). persist 61.4 raises the token as an untyped `InvalidArgument`, so
+/// edge's conservative default read it as moving state. A settled hold is not
+/// held again (CIRISPersist#1252): the same bytes can only be refused again.
+/// Here the joiner holds the pending row, its voices fill it, the event lands,
+/// and then a further member's voice arrives.
+/// Red before: `Some(Transient)`, and the hash not suppressed past the 20 s
+/// transient base.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cosignature_for_a_settled_hold_is_refused_terminal_1029() {
+    use crate::replication::refusal_backoff::{RetryDisposition, TRANSIENT_CAP};
+    use ciris_persist::federation::cosign as persist_cosign;
+    use ciris_persist::federation::group_plane::group_signed_of_row;
+    let people = parties();
+    let dirs = stores(&people, 2).await;
+    let (a, b) = (Arc::clone(&dirs[0]), Arc::clone(&dirs[1]));
+    let r = room_of_three(people, &[&b], &a).await;
+    let (row, bytes) = assembled(&a, &r).await;
+    let nb = bridge(&b, &r.bob);
+    let signed = group_signed_of_row(&row)
+        .expect("a group row")
+        .expect("decodes");
+    // The hold opens at the joiner (its pending row), its two voices fill it,
+    // and the assembled event lands: the hold settles `landed` there.
+    let pending = serde_json::to_vec(&persist_cosign::pending_row(&signed).expect("pending row"))
+        .expect("wire");
+    let held = nb
+        .apply_envelope_bytes(KIND, &pending, Some(&r.alice.node.key_id))
+        .await;
+    assert_eq!(held, ApplyOutcome::Admitted, "the hold opens: {held:?}");
+    for voice in signed.cosignatures() {
+        let wire = serde_json::to_vec(
+            &persist_cosign::signature_row(&signed, voice).expect("signature row"),
+        )
+        .expect("wire");
+        let filled = nb
+            .apply_envelope_bytes(KIND, &wire, Some(&r.alice.node.key_id))
+            .await;
+        assert_eq!(
+            filled,
+            ApplyOutcome::Admitted,
+            "a voice fills the hold: {filled:?}"
+        );
+    }
+    let landed = nb
+        .apply_envelope_bytes(KIND, &bytes, Some(&r.alice.node.key_id))
+        .await;
+    assert!(
+        matches!(landed, ApplyOutcome::Admitted | ApplyOutcome::Duplicate),
+        "the event lands: {landed:?}"
+    );
+    // Then alice's voice, which the event did not need, as the founder pushes
+    // every member's.
+    let voices = vec![cosign(&r.event, &r.alice.person)
+        .await
+        .expect("alice's voice")];
+    let backoff = nb.refusal_backoff_for_test();
+    for voice in &voices {
+        let wire = serde_json::to_vec(
+            &persist_cosign::signature_row(&signed, voice).expect("signature row"),
+        )
+        .expect("wire");
+        let hash = plain_ref(&wire);
+        let outcome = nb
+            .apply_envelope_bytes(KIND, &wire, Some(&r.alice.node.key_id))
+            .await;
+        let ApplyOutcome::Refused { reason, .. } = &outcome else {
+            panic!("a cosignature for a settled hold is refused, got {outcome:?}");
+        };
+        assert!(
+            reason.contains(persist_cosign::COSIGN_PENDING_SETTLED),
+            "precondition: the field's refusal, got {reason}"
+        );
+        assert_eq!(
+            outcome.retry_disposition(),
+            Some(RetryDisposition::Terminal),
+            "a settled hold is not held again: the same bytes can only be refused again"
+        );
+        assert!(
+            backoff.suppressed_at(KIND, &hash, std::time::Instant::now() + TRANSIENT_CAP),
+            "not asked for again inside the terminal window"
+        );
+    }
+}
+
+/// CIRISEdge#1029 — **an admitted widening and the seated member's
+/// KeyPackage are announced on the event bus**, as `RowAdmitted` on the union
+/// channel. The host seats on the decision and adds on the KeyPackage
+/// (~19 s and ~20 s of the 12-person join waited for its next sweep), and
+/// until now the KeyPackage's admission was a log line only. Real rows
+/// through the replicated door: dave's assembled widening, then his
+/// KeyPackage in the room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admitted_widening_and_keypackage_are_announced_1029() {
+    use crate::events::{AdmittedRow, EventBus, EventKind};
+    let people = parties();
+    let dirs = stores(&people, 2).await;
+    let (a, b) = (Arc::clone(&dirs[0]), Arc::clone(&dirs[1]));
+    let r = room_of_three(people, &[&b], &a).await;
+    let (row, bytes) = assembled(&a, &r).await;
+    let bus = Arc::new(EventBus::default());
+    let mut all = bus.subscribe_all();
+    let publish = vec![r.bob.node.key_id.clone(), r.bob.person.key_id.clone()];
+    let nb = FederationDirectoryReplicationBridge::with_config(
+        Arc::clone(&b) as Arc<dyn FederationDirectory>,
+        Arc::new({
+            let publish = publish.clone();
+            move || publish.clone()
+        }),
+        index_on(),
+    )
+    .with_local_key_id(Some(r.bob.node.key_id.clone()))
+    .with_self_provider(Some(Arc::new(move || publish.clone())))
+    .with_events(Some(Arc::clone(&bus)));
+
+    assert_eq!(
+        nb.apply_envelope_bytes(KIND, &bytes, Some(&r.alice.node.key_id))
+            .await,
+        ApplyOutcome::Admitted
+    );
+    let seated = all.try_recv().expect("the widening is announced");
+    assert_eq!(
+        seated.kind,
+        EventKind::RowAdmitted {
+            dimension: AdmittedRow::MembershipWiden,
+            group_id: Some(r.id.clone()),
+            subject: row.attested_key_id.clone(),
+            author: row.attesting_key_id.clone(),
+            row_id: row.attestation_id.clone(),
+        }
+    );
+
+    let kp = crate::chat::key_package_attestation_in(
+        &r.dave.person,
+        &crate::scope_room::ScopeRoom::community(r.id.clone()),
+        b"dave's key package",
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("dave's KeyPackage");
+    let wire = serde_json::to_vec(&kp).expect("wire");
+    let added = nb
+        .apply_envelope_bytes(KIND, &wire, Some(&r.alice.node.key_id))
+        .await;
+    assert_eq!(added, ApplyOutcome::Admitted, "dave is seated: {added:?}");
+    assert_eq!(
+        all.try_recv().expect("the KeyPackage is announced").kind,
+        EventKind::RowAdmitted {
+            dimension: AdmittedRow::KeyPackage,
+            group_id: Some(r.id.clone()),
+            subject: r.dave.person.key_id.clone(),
+            author: r.dave.person.key_id.clone(),
+            row_id: kp.attestation_id.clone(),
+        }
+    );
+    assert!(all.try_recv().is_err(), "one event per admitted row");
+}

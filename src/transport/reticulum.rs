@@ -152,6 +152,13 @@ const EDGE_APP_ASPECT: &str = "edge";
 /// slow (LoRa, multi-hop), so it gets the full patient window.
 const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How recent verified media from a peer must be for the link stall guard to
+/// keep a link whose Channel sends land nothing (CIRISEdge#926): the peer is
+/// alive and reaching this node, so its acknowledgements are late, not lost.
+/// Above a call's chunk cadence and its receive-side evidence rate limit by a
+/// wide margin, below the guard's own three-send trigger (~3 s).
+const PEER_ALIVE_FOR_STALL: Duration = Duration::from_secs(2);
+
 /// CIRISEdge#336 — the establishment window for a target the node has **no
 /// path** to. This is not a guess: leviculum's `connect` builds a
 /// no-path link request with `hops = 1` and *broadcasts* it, so the only
@@ -3234,6 +3241,10 @@ pub struct ReticulumTransport {
     /// leviculum#102 — the host's A/V datagram lever
     /// ([`Self::set_av_datagrams_enabled`]). Default on.
     av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Calls cut — the serve seats (the canonical set) this node knows of,
+    /// shared with the Edge: a call reads it so a seat never relays call media
+    /// and a seat's relay offers are dropped (`av_call::alm`).
+    serve_seats: std::sync::OnceLock<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
     /// v45 — the host's lever for SUBSCRIBE layer caps
     /// ([`Self::set_av_layer_requests_enabled`]). Default OFF until CC rules.
     av_layer_requests: std::sync::atomic::AtomicBool,
@@ -4453,6 +4464,7 @@ impl ReticulumTransport {
             wire_fold: Arc::default(),
             av_caps_withheld: std::sync::atomic::AtomicU32::new(0),
             av_datagrams_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            serve_seats: std::sync::OnceLock::new(),
             av_layer_requests: std::sync::atomic::AtomicBool::new(false),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
@@ -6238,6 +6250,33 @@ impl ReticulumTransport {
         }
     }
 
+    /// Calls cut — share the Edge's live serve-seat (canonical) set with this
+    /// transport's calls. Set once; a later call is ignored.
+    pub fn set_serve_seats(
+        &self,
+        seats: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    ) {
+        let _ = self.serve_seats.set(seats);
+    }
+
+    /// 45.2.0 — whether an Edge shared its seat set with this transport. A
+    /// call on a transport without one cannot apply the seat rule: it says so
+    /// at ERROR, never silently.
+    #[must_use]
+    pub fn serve_seats_attached(&self) -> bool {
+        self.serve_seats.get().is_some()
+    }
+
+    /// Calls cut — the serve seats this node knows of now (empty when no
+    /// Edge shared its set).
+    #[must_use]
+    pub fn serve_seats(&self) -> Vec<String> {
+        self.serve_seats
+            .get()
+            .and_then(|s| s.read().ok().map(|set| set.iter().cloned().collect()))
+            .unwrap_or_default()
+    }
+
     /// leviculum#102 — the A/V datagram lever's position
     /// ([`Self::set_av_datagrams_enabled`]).
     #[must_use]
@@ -6294,6 +6333,14 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn set_datagram_handling_delay_for_test(&self, delay: Duration) {
         self.av_sink.set_datagram_handling_delay(delay);
+    }
+
+    /// Test seam — every `every`, the Reticulum event loop holds the event in
+    /// hand for `hold` before handling it (a starved host held it 290-530 ms):
+    /// everything queued behind it waits. `every` zero ends it.
+    #[doc(hidden)]
+    pub fn hold_event_loop_for_test(&self, every: Duration, hold: Duration) {
+        self.av_sink.set_loop_hold(every, hold);
     }
 
     /// v44 LTS test seam — the next decapsulation panics.
@@ -6555,20 +6602,54 @@ impl ReticulumTransport {
         self.seals.is_sealed(link)
     }
 
-    #[allow(clippy::too_many_lines)] // one dial: target, direct path, per-key attempts, cleanup
+    /// v45.1 — [`Self::open_av_link`], with the facts of its direct-path
+    /// step (`None` when the dial ended before it): a call reads them when
+    /// the leg does not come up, to say why (`CallEvent::MediaPathFailed`).
+    pub(crate) async fn open_av_link_with_path(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+    ) -> (
+        Result<crate::transport::av_sink::AvLink, TransportError>,
+        Option<crate::transport::media_path::DirectPathFacts>,
+    ) {
+        let mut facts = None;
+        let link = self
+            .open_av_link_into(
+                destination_key_id,
+                address,
+                self.occurrence_key_id(),
+                &mut facts,
+            )
+            .await;
+        (link, facts)
+    }
+
     async fn open_av_link_claiming(
         &self,
         destination_key_id: &str,
         address: &MemberAddress,
         initiator_key_id: &str,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
+        self.open_av_link_into(destination_key_id, address, initiator_key_id, &mut None)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)] // one dial: target, direct path, per-key attempts, cleanup
+    async fn open_av_link_into(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+        initiator_key_id: &str,
+        path_facts: &mut Option<crate::transport::media_path::DirectPathFacts>,
+    ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
         // CC 5.4.3 rc16 — a node in anonymous mode is confined to the row
-        // plane: it opens no A/V leg (no call, no stream).
-        if let Err(token) = self.onion.media_allowed() {
-            self.onion.count(token);
+        // plane, and a shaped-only node (45.2.0) carries no live A/V: it
+        // opens no A/V leg (no call, no stream).
+        if let Some(token) = self.media_refusal() {
             return Err(TransportError::Config(format!(
-                "{token}: this node is in anonymous mode (its Anonymous Tier is active); \
-                 no call and no stream ride its links (CC 5.4.3)"
+                "{token}: this node carries no call media (anonymous mode or shaped-only, \
+                 CC 5.4.3); no call and no stream ride its links"
             )));
         }
         let (dest_hash, transport_keys, pair) =
@@ -6578,7 +6659,9 @@ impl ReticulumTransport {
         // nodes share a punched interface: bring the path direct first, when
         // this node can (CC 5.4.6). Whatever the outcome, the dial below is the
         // same; the guard keeps the punched interface for this leg's life.
-        let direct_path = match self.ensure_direct_path(destination_key_id).await {
+        let (direct_path, facts) = self.ensure_direct_path_facts(destination_key_id).await;
+        *path_facts = Some(facts);
+        let direct_path = match direct_path {
             crate::transport::direct_path::DirectPath::Direct { interface, guard } => {
                 tracing::debug!(
                     key_id = %destination_key_id,
@@ -6744,6 +6827,19 @@ impl ReticulumTransport {
         use crate::transport::av_transit_handshake::check_claim;
         use crate::transport::link_seal::SealRefusal;
         let link_id = LinkId::new(arrival.link_id);
+        // 45.2.0 — the accepting side too (#1028's lesson): a node that
+        // carries no call media answers no A/V link, whoever dialled it.
+        if let Some(token) = self.media_refusal() {
+            tracing::info!(
+                peer = %arrival.peer.as_str(),
+                token,
+                "A/V arrival REFUSED: this node carries no call media (anonymous or shaped-only)"
+            );
+            let _ = self.node.close_link(&link_id).await;
+            return Err(TransportError::Config(format!(
+                "{token}: this node carries no call media"
+            )));
+        }
         let checked = match self.seals.transit(arrival.link_id) {
             Some((transit, Some(claimed))) => check_claim(&claimed, arrival.peer.as_str())
                 .map(|()| transit)
@@ -6870,18 +6966,78 @@ impl ReticulumTransport {
     /// Called only by [`Self::open_av_link`], for a member of the call's group:
     /// a proposal reveals this node's public address to the peer, so nothing
     /// else proposes (`direct_path` module docs).
-    pub(crate) async fn ensure_direct_path(
+    ///
+    /// v45.1 — with the [`crate::transport::media_path::DirectPathFacts`] of
+    /// the attempt: what a call reads when the leg it dialled does not come
+    /// up, to say why (`CallEvent::MediaPathFailed`). Every fact that waits on
+    /// leviculum's punch diagnostics is `None` on this pin.
+    pub(crate) async fn ensure_direct_path_facts(
         &self,
         destination_key_id: &str,
-    ) -> crate::transport::direct_path::DirectPath {
+    ) -> (
+        crate::transport::direct_path::DirectPath,
+        crate::transport::media_path::DirectPathFacts,
+    ) {
+        use crate::transport::media_path::{DirectAttempt, DirectPathFacts, NotProposed};
+        let began = std::time::Instant::now();
+        let (path, mut attempt) = self.ensure_direct_path_traced(destination_key_id).await;
+        let (attempts, last_failure, backoff_remaining) = {
+            let t = self.direct_paths.tracker();
+            (
+                t.attempts(destination_key_id),
+                t.last_failure(destination_key_id),
+                t.backoff_remaining(destination_key_id, std::time::Instant::now()),
+            )
+        };
+        // A pass that proposed nothing new (a backoff, leviculum's cooldown, a
+        // yield) carries the failure on record: that is still why there is no
+        // path. No link, or a proposal still running, is its own answer.
+        if let (
+            DirectAttempt::NotProposed(
+                NotProposed::BackingOff | NotProposed::ProposeRefused | NotProposed::Yielded,
+            ),
+            Some(f),
+        ) = (attempt, last_failure)
+        {
+            attempt = DirectAttempt::Failed(f.into());
+        }
+        let config = &self.direct_paths.config;
+        let facts = DirectPathFacts {
+            proposing: config.proposing == crate::transport::direct_path::Proposing::On,
+            facilitator_resolved: config.facilitator.is_some(),
+            // A call dial proposes to every member of the call's group: this
+            // node trusts it with its address (`direct_path` module docs).
+            peer_trusted: true,
+            attempt,
+            attempts,
+            elapsed: began.elapsed(),
+            local_nat: self.direct_paths.local_nat(),
+            backoff_remaining,
+            ..DirectPathFacts::bare(attempt)
+        };
+        (path, facts)
+    }
+
+    #[allow(clippy::too_many_lines)] // one deadline over every step, in order
+    async fn ensure_direct_path_traced(
+        &self,
+        destination_key_id: &str,
+    ) -> (
+        crate::transport::direct_path::DirectPath,
+        crate::transport::media_path::DirectAttempt,
+    ) {
         use crate::transport::direct_path::{
             DirectOutcome, DirectPath, DirectPathState, DIRECT_PATH_BUDGET,
         };
+        use crate::transport::media_path::{DirectAttempt, NotProposed};
         if !self.direct_paths.config.proposes() {
             if let Some(m) = self.metrics.get() {
                 m.inc_direct_link(self.direct_paths.config.off_label());
             }
-            return DirectPath::NotConfigured;
+            return (
+                DirectPath::NotConfigured,
+                DirectAttempt::NotProposed(NotProposed::NoLink),
+            );
         }
         // ONE deadline over the identity-link dial, the proposal and its
         // outcome: the A/V dial never waits on a direct path past the budget,
@@ -6897,10 +7053,13 @@ impl ReticulumTransport {
         let known = self.direct_paths.tracker().state(destination_key_id);
         if let Some(DirectPathState::Direct { link, interface }) = known {
             if self.node.direct_link_interface(&link) == Some(interface) {
-                return DirectPath::Direct {
-                    interface,
-                    guard: self.direct_paths.anchor(link),
-                };
+                return (
+                    DirectPath::Direct {
+                        interface,
+                        guard: self.direct_paths.anchor(link),
+                    },
+                    DirectAttempt::Established,
+                );
             }
         }
         let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
@@ -6909,7 +7068,10 @@ impl ReticulumTransport {
         }
         if candidates.is_empty() {
             count(crate::observability::DIRECT_LINK_SKIPPED_NO_LINK);
-            return DirectPath::Unavailable { reason: "no_link" };
+            return (
+                DirectPath::Unavailable { reason: "no_link" },
+                DirectAttempt::NotProposed(NotProposed::NoLink),
+            );
         }
         // A one-hop neighbour (a shared interface) is already direct.
         if candidates
@@ -6917,7 +7079,10 @@ impl ReticulumTransport {
             .any(|c| self.node.hops_to(&c.dest_hash) == Some(1))
         {
             count(crate::observability::DIRECT_LINK_SKIPPED_NEIGHBOUR);
-            return DirectPath::AlreadyNeighbour;
+            return (
+                DirectPath::AlreadyNeighbour,
+                DirectAttempt::AlreadyNeighbour,
+            );
         }
         // The dial behind `identity_lane` is a detached task: a timeout here
         // abandons the wait, not the link.
@@ -6927,7 +7092,12 @@ impl ReticulumTransport {
         )
         .await;
         let link = match lane {
-            None => return DirectPath::Unavailable { reason: "pending" },
+            None => {
+                return (
+                    DirectPath::Unavailable { reason: "pending" },
+                    DirectAttempt::NoOutcome,
+                )
+            }
             Some(Ok(claim)) => {
                 let link = claim.link_id();
                 // Proposing sends two channel signals, not a resource: the lane
@@ -6942,26 +7112,46 @@ impl ReticulumTransport {
                     error = %e,
                     "direct path: no identity link to the member (CIRISEdge#805 item 8)"
                 );
-                return DirectPath::Unavailable { reason: "no_link" };
+                return (
+                    DirectPath::Unavailable { reason: "no_link" },
+                    DirectAttempt::NotProposed(NotProposed::NoLink),
+                );
             }
         };
         let (link, rx) = match self.start_or_join_proposal(destination_key_id, link).await {
             Ok(waiting) => waiting,
-            Err(done) => return done,
+            Err(done) => {
+                let attempt = match &done {
+                    DirectPath::Unavailable { reason } => {
+                        crate::transport::direct_path::attempt_of_skip(reason)
+                    }
+                    DirectPath::Direct { .. } => DirectAttempt::Established,
+                    DirectPath::AlreadyNeighbour => DirectAttempt::AlreadyNeighbour,
+                    DirectPath::NotConfigured => DirectAttempt::NotProposed(NotProposed::NoLink),
+                };
+                return (done, attempt);
+            }
         };
         match with_timeout(remaining(), rx).await {
-            Some(Ok(DirectOutcome::Established { interface })) => DirectPath::Direct {
-                interface,
-                guard: self.direct_paths.anchor(link),
-            },
-            Some(Ok(DirectOutcome::Failed(failure))) => DirectPath::Unavailable {
-                reason: crate::transport::direct_path::failure_label(failure),
-            },
+            Some(Ok(DirectOutcome::Established { interface })) => (
+                DirectPath::Direct {
+                    interface,
+                    guard: self.direct_paths.anchor(link),
+                },
+                DirectAttempt::Established,
+            ),
+            Some(Ok(DirectOutcome::Failed(failure))) => (
+                DirectPath::Unavailable {
+                    reason: crate::transport::direct_path::failure_label(failure),
+                },
+                DirectAttempt::Failed(failure.into()),
+            ),
             // Lost before the dial got to use it, the waiter dropped, or still
             // running past the budget (its outcome still reaches the tracker).
-            Some(Ok(DirectOutcome::Lost) | Err(_)) | None => {
-                DirectPath::Unavailable { reason: "pending" }
-            }
+            Some(Ok(DirectOutcome::Lost) | Err(_)) | None => (
+                DirectPath::Unavailable { reason: "pending" },
+                DirectAttempt::NoOutcome,
+            ),
         }
     }
 
@@ -7005,7 +7195,7 @@ impl ReticulumTransport {
         let _ = self.start_or_join_proposal(destination_key_id, link).await;
     }
 
-    /// CIRISEdge#805 item 8 — the proposal half of [`Self::ensure_direct_path`]:
+    /// CIRISEdge#805 item 8 — the proposal half of [`Self::ensure_direct_path_facts`]:
     /// start a proposal to `destination_key_id` on its identity `link`, or join
     /// the one already running. `Ok` is the link whose outcome to await and the
     /// registration to await it on; `Err` is the answer when there is nothing
@@ -7100,6 +7290,7 @@ impl ReticulumTransport {
             Ok(()) => dispatch_proposal(
                 &self.node,
                 &self.direct_paths,
+                &self.onion,
                 self.metrics.get(),
                 destination_key_id,
                 link,
@@ -7126,6 +7317,7 @@ impl ReticulumTransport {
         let table = self.scope_addresses.get().cloned();
         let metrics = self.metrics.get().cloned();
         let lifecycle = Arc::clone(&self.lifecycle);
+        let onion = Arc::clone(&self.onion);
         let wait = GLARE_WAIT.mul_f64(1.0 + jitter_draw());
         tokio::spawn(async move {
             tokio::time::sleep(wait).await;
@@ -7144,8 +7336,16 @@ impl ReticulumTransport {
             {
                 return;
             }
-            let _ =
-                dispatch_proposal(&node, &direct_paths, metrics.as_ref(), &peer, link, now).await;
+            let _ = dispatch_proposal(
+                &node,
+                &direct_paths,
+                &onion,
+                metrics.as_ref(),
+                &peer,
+                link,
+                now,
+            )
+            .await;
         });
     }
 
@@ -7160,10 +7360,60 @@ impl ReticulumTransport {
     /// rule ([`crate::transport::direct_path::accepts_direct`]).
     #[must_use]
     pub fn should_accept_direct(&self, peer_key_id: &str) -> bool {
-        crate::transport::direct_path::accepts_direct(
-            self.direct_paths.config.accept,
-            self.direct_standing(peer_key_id),
+        if self.direct_paths.refuses_for_test()
+            || self.direct_paths.refuses_peer_for_test(peer_key_id)
+        {
+            return false;
+        }
+        // CIRISEdge#1028 — an anonymous node accepts no upgrade.
+        self.onion.may_reveal_address().is_ok()
+            && crate::transport::direct_path::accepts_direct(
+                self.direct_paths.config.accept,
+                self.direct_standing(peer_key_id),
+            )
+    }
+
+    /// v45.1 — this node's last NAT measurement
+    /// ([`crate::transport::media_path::NatReport`]): `None` on the
+    /// v0.34.0+ciris.3 pin, which measures nothing (leviculum's probe
+    /// diagnostics will fill it).
+    #[must_use]
+    pub fn local_nat_report(&self) -> Option<crate::transport::media_path::NatReport> {
+        self.direct_paths.local_nat()
+    }
+
+    /// v45.1 — the technique a standing direct path to `peer` rides, if
+    /// one stands: a punched interface is `direct_reflexive` (leviculum does
+    /// not say which candidate won on this pin), else `None`.
+    #[must_use]
+    pub fn direct_path_kind(&self, peer: &str) -> Option<crate::transport::media_path::PathKind> {
+        matches!(
+            self.direct_paths.tracker().state(peer),
+            Some(crate::transport::direct_path::DirectPathState::Direct { .. })
         )
+        .then_some(crate::transport::media_path::PathKind::DirectReflexive)
+    }
+
+    /// Test seam: refuse every peer's direct-link request (REJECT `POLICY`)
+    /// while `refuse` holds, whatever the accept rule says.
+    #[doc(hidden)]
+    pub fn set_refuse_direct_for_test(&self, refuse: bool) {
+        self.direct_paths.set_refuse_for_test(refuse);
+    }
+
+    /// Test seam: refuse `peer`'s direct-link requests (REJECT `POLICY`) from
+    /// now on, whatever the accept rule says: a pair whose punch cannot
+    /// succeed (set on both ends).
+    #[doc(hidden)]
+    pub fn refuse_direct_from_for_test(&self, peer: &str) {
+        self.direct_paths.refuse_peer_for_test(peer);
+    }
+
+    /// Test seam: forget `peer`'s direct-path backoff, so the next dial to it
+    /// proposes at once.
+    #[doc(hidden)]
+    pub fn clear_direct_backoff_for_test(&self, peer: &str) {
+        self.direct_paths.tracker().clear_backoff_for_test(peer);
     }
 
     /// Whether `peer_key_id` may share a direct path with this node: it
@@ -7193,6 +7443,7 @@ impl ReticulumTransport {
             bytes_delivered: st.bytes_delivered(),
             srtt_ms: st.srtt_ms(),
             min_rtt_ms: st.min_rtt_ms(),
+            learned_srtt_ms: st.learned_srtt_ms(),
             busy_rejections: st.busy_rejections(),
             pacing_rejections: st.pacing_rejections(),
             window: st.window(),
@@ -7201,6 +7452,17 @@ impl ReticulumTransport {
             last_sent_seq: seq.map(|q| q.last_sent_sequence()),
             oldest_unacked_seq: seq.and_then(|q| q.oldest_unacked_sequence()),
         })
+    }
+
+    /// Peer evidence (leviculum peer-evidence hold): edge has just verified
+    /// cryptographic proof that the party at the far end of A/V link `link`
+    /// is alive now (a chunk signed by that member's node). Leviculum holds
+    /// the link's teardown on it, bounded by the stale time. `false` for an
+    /// unknown or closed link. Takes leviculum's core lock: callers rate-limit
+    /// and never call it under the call's publisher lock.
+    pub fn note_av_peer_evidence(&self, link: &[u8; 16]) -> bool {
+        self.stall_guard.note_peer_alive(*link);
+        self.node.note_peer_evidence(&LinkId::new(*link))
     }
 
     /// leviculum#102 — one A/V link's datagram counters (sent, received,
@@ -7589,6 +7851,87 @@ impl ReticulumTransport {
             .len()
     }
 
+    /// G8 diagnostic seam — every A/V link this node dialled: `(peer, link,
+    /// datagram bytes sent, attached interface)`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_dialed_links_for_test(&self) -> Vec<(String, [u8; 16], u64, Option<usize>)> {
+        let attached: HashMap<LinkId, Option<usize>> = self
+            .node
+            .link_list()
+            .into_iter()
+            .map(|l| (l.link_id, l.interface_index))
+            .collect();
+        self.av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(l, p)| {
+                let sent = self.node.link_datagram_stats(l).map_or(0, |d| d.sent_bytes);
+                (
+                    p.clone(),
+                    l.into_bytes(),
+                    sent,
+                    attached.get(l).copied().flatten(),
+                )
+            })
+            .collect()
+    }
+
+    /// G8 diagnostic seam — every A/V link this node holds (dialled, and the
+    /// ones members dialled here), with leviculum's Channel counters.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_links_for_test(&self) -> Vec<AvLinkDiag> {
+        let attached: HashMap<LinkId, Option<usize>> = self
+            .node
+            .link_list()
+            .into_iter()
+            .map(|l| (l.link_id, l.interface_index))
+            .collect();
+        let dialled: HashMap<LinkId, String> = self
+            .av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut ids: Vec<LinkId> = dialled.keys().copied().collect();
+        for l in self.av_sink.link_ids() {
+            if !ids.contains(&l) {
+                ids.push(l);
+            }
+        }
+        ids.into_iter()
+            .map(|l| {
+                let st = self.node.link_stats(&l);
+                AvLinkDiag {
+                    peer: dialled.get(&l).cloned().unwrap_or_else(|| "in".to_owned()),
+                    link: l.into_bytes(),
+                    dialled: dialled.contains_key(&l),
+                    datagram_bytes: self
+                        .node
+                        .link_datagram_stats(&l)
+                        .map_or(0, |d| d.sent_bytes),
+                    interface: attached.get(&l).copied().flatten(),
+                    retransmits: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::retransmits),
+                    retransmitted_bytes: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::retransmitted_bytes),
+                    outstanding: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::tx_ring_size),
+                    busy_rejections: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::busy_rejections),
+                    pacing_rejections: st
+                        .as_ref()
+                        .map_or(0, leviculum_core::LinkStats::pacing_rejections),
+                }
+            })
+            .collect()
+    }
+
     /// Seat-tier test seam — name the serve seats and whether this node is one
     /// (production reads the signed genesis bundle).
     #[doc(hidden)]
@@ -7770,6 +8113,59 @@ impl ReticulumTransport {
             .map(|p| (p.hops, p.next_hop))
             .collect();
         scoped_path_shape_from_paths(&paths)
+    }
+
+    /// Calls cut — how this node reaches `destination_key_id` for a blob
+    /// fetch (`blob_swarm::PATH_RANK_*`): a one-hop path is direct; a path, or
+    /// a relay the destination was heard through (leviculum#91), via a roster
+    /// member (a room peer or consented contact) is a peer relay; a path
+    /// whose only forwarders are serve seats is seat-only; anything else
+    /// (no path, an unknown forwarder) is other.
+    pub async fn holder_path_rank(&self, destination_key_id: &str) -> u8 {
+        use crate::blob_swarm::{
+            PATH_RANK_DIRECT, PATH_RANK_OTHER, PATH_RANK_PEER_RELAY, PATH_RANK_SEAT_ONLY,
+        };
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let mut forwarders: Vec<[u8; 16]> = Vec::new();
+        for c in &candidates {
+            if let Some(p) = self.node.get_path_clone(&c.dest_hash) {
+                if p.hops <= 1 && p.next_hop.is_none() {
+                    return PATH_RANK_DIRECT;
+                }
+                forwarders.extend(p.next_hop);
+            }
+            forwarders.extend(self.node.relay_routes(&c.dest_hash).iter().map(|r| r.relay));
+        }
+        if forwarders.is_empty() {
+            return PATH_RANK_OTHER;
+        }
+        let mut via_seat = false;
+        for f in &forwarders {
+            if let Some(k) = self.roster_relay_key(f).await {
+                if k != destination_key_id {
+                    return PATH_RANK_PEER_RELAY;
+                }
+            }
+            via_seat |= self.forwarder_is_serve_seat(f).await;
+        }
+        if via_seat {
+            PATH_RANK_SEAT_ONLY
+        } else {
+            PATH_RANK_OTHER
+        }
+    }
+
+    /// Calls cut — whether transport id `relay` is a known serve seat's.
+    async fn forwarder_is_serve_seat(&self, relay: &[u8; 16]) -> bool {
+        let seats = self.serve_seats();
+        if seats.is_empty() {
+            return false;
+        }
+        let peers = self.peers.lock().await;
+        peers.iter().any(|(key_id, rp)| {
+            seats.iter().any(|s| s == key_id)
+                && TransportIdentityPub::from_pub64(&rp.transport_pubkey64).hash()[..] == relay[..]
+        })
     }
 
     /// CIRISEdge#718 test seam — what a TRANSPORT NODE can say about the
@@ -8313,6 +8709,37 @@ impl ReticulumTransport {
     /// CC 5.4.6 — this node's Anonymous Tier (dormant in v44 unless opted in
     /// and available).
     #[must_use]
+    /// 45.2.0 — why this node carries no call media, if it does not: the
+    /// anonymous tier first (`onion_anonymous_no_media`; anonymous implies
+    /// shaped-only), else its own shaped-only setting
+    /// ([`crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA`], counted on
+    /// the A/V plane). Counted each time it refuses. `None`: media is
+    /// allowed.
+    pub fn media_refusal(&self) -> Option<&'static str> {
+        let token = self.media_refused_now()?;
+        if token == crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA {
+            if let Some(m) = self.metrics.get() {
+                m.inc_av_plane(token);
+            }
+        } else {
+            self.onion.count(token);
+        }
+        Some(token)
+    }
+
+    /// 45.2.0 — [`Self::media_refusal`] without counting: a live call reads
+    /// it every watch tick to end itself on a mid-call switch.
+    #[must_use]
+    pub fn media_refused_now(&self) -> Option<&'static str> {
+        if let Err(token) = self.onion.media_allowed() {
+            return Some(token);
+        }
+        if self.shapers.shaped_only() {
+            return Some(crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA);
+        }
+        None
+    }
+
     pub fn onion(&self) -> &Arc<crate::onion::runtime::OnionRuntime> {
         &self.onion
     }
@@ -10002,6 +10429,42 @@ impl ReticulumTransport {
             .cloned()
             .unwrap_or_else(|| "-".to_owned());
         let link = hex::encode(link_id.as_bytes());
+        // The peer is alive and reaching this node (verified media from it
+        // on one of its links within the last seconds): its acknowledgements
+        // are late behind a queue, not lost. A capped uplink does exactly
+        // this to the one child it still feeds, and retiring that child's
+        // punched path cut the whole call tree for 14 s (server matrix,
+        // N=6 at 300 kbit/s: the kept child's guard fired at 3.2 s). The run's
+        // clock keeps going, so `STALL_BOUND` still ends a link whose peer
+        // truly stopped acknowledging.
+        if peer != "-" && stalled_for < crate::transport::link_stall::STALL_BOUND {
+            let theirs: Vec<[u8; 16]> = self
+                .link_to_peer_key_id
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, p)| **p == peer)
+                .map(|(l, _)| l.into_bytes())
+                .collect();
+            if self
+                .stall_guard
+                .peer_alive_within(&theirs, PEER_ALIVE_FOR_STALL)
+            {
+                self.stall_guard.hold(&link_id.into_bytes());
+                if let Some(m) = self.metrics.get() {
+                    m.inc_link_stall(crate::observability::LINK_STALL_HELD_PEER_ALIVE);
+                }
+                tracing::debug!(
+                    link = %link,
+                    peer = %peer,
+                    zero_sends,
+                    stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
+                    "link Channel landed nothing, but the peer is alive and reaching us: \
+                     its acks are late, the link is kept (CIRISEdge#926)"
+                );
+                return;
+            }
+        }
         if self.node.direct_link_interface(&link_id).is_some()
             && self.node.retire_direct_link(&link_id).await.is_ok()
         {
@@ -11234,6 +11697,10 @@ impl Transport for ReticulumTransport {
         let _ = self.load_ladder.set(ladder);
     }
 
+    fn attach_serve_seats(&self, seats: Arc<std::sync::RwLock<std::collections::HashSet<String>>>) {
+        self.set_serve_seats(seats);
+    }
+
     fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
         self.metrics.get().cloned()
     }
@@ -12096,6 +12563,9 @@ impl ReticulumTransport {
                     };
                     let label = event_label(&event);
                     let began = std::time::Instant::now();
+                    if let Some(hold) = self.av_sink.take_loop_hold() {
+                        tokio::time::sleep(hold).await;
+                    }
                     if matches!(event, NodeEvent::LinkDatagramReceived { .. }) {
                         if let Some(delay) = self.av_sink.datagram_handling_delay() {
                             tokio::time::sleep(delay).await;
@@ -12908,6 +13378,54 @@ fn resource_concluded(
         .is_some_and(|at| at.elapsed() < INBOUND_TRANSFER_STALL)
 }
 
+/// G8 diagnostic — one A/V link as [`ReticulumTransport::av_links_for_test`]
+/// reads it.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AvLinkDiag {
+    pub peer: String,
+    pub link: [u8; 16],
+    pub dialled: bool,
+    pub datagram_bytes: u64,
+    pub interface: Option<usize>,
+    pub retransmits: u64,
+    pub retransmitted_bytes: u64,
+    pub outstanding: usize,
+    /// Channel sends refused: the window full (`Busy`) / the pacing gate
+    /// (`PacingDelay`), since the link came up.
+    pub busy_rejections: u64,
+    pub pacing_rejections: u64,
+}
+
+/// G8 C — whether a link attached to `attached` rode the punched interface
+/// `released`: only a link known to be on exactly it. A link whose interface
+/// leviculum no longer names is left to its own retries rather than risk a
+/// healthy path.
+const fn on_released_interface(attached: Option<usize>, released: usize) -> bool {
+    matches!(attached, Some(i) if i == released)
+}
+
+#[cfg(test)]
+mod released_interface_tests {
+    use super::on_released_interface;
+
+    /// G8 C — a release closes only the A/V links attached to the released
+    /// punched interface: a link on another interface (a LAN path to the
+    /// same peer) or of unknown attachment is left up.
+    #[test]
+    fn only_a_link_on_the_released_interface_is_closed() {
+        assert!(on_released_interface(Some(3), 3));
+        assert!(
+            !on_released_interface(Some(1), 3),
+            "another interface stays up"
+        );
+        assert!(
+            !on_released_interface(None, 3),
+            "unknown attachment stays up"
+        );
+    }
+}
+
 /// CIRISEdge#853 (Codex round two on #854) — is `link_id` a pooled lane, in
 /// either pool family (identity `reusable_dialed_link` or scoped
 /// `reusable_scoped_link`)? A linear scan over the pools' lanes: both are small
@@ -13577,7 +14095,10 @@ impl DialCtx {
             return Err(TransportError::NoRouteToPeer {
                 key_id: destination_key_id.to_string(),
                 target_dest: hex::encode(dest_hash.into_bytes()),
-                has_path: false,
+                // 45.3 — the path table's own answer, not a constant: a
+                // hard-coded `false` sent a call's epoch split (addresses
+                // nobody registered) looking like a routing fault.
+                has_path: self.node.has_path(&dest_hash),
                 paths: self.path_table_snapshot(),
             });
         }
@@ -15018,9 +15539,15 @@ struct AnnounceCtx {
 /// consented contact. Shared by the accept decision and the proposal hook.
 /// Start a proposal to `peer` on `link`: the tracker's record, the waiter for
 /// its outcome, and leviculum's dispatch. The caller has admitted it.
+///
+/// CIRISEdge#1028 — the one door every proposal goes through, so the one
+/// place an anonymous node ([`crate::onion::runtime::OnionRuntime::may_reveal_address`])
+/// is stopped: nothing is sent, so leviculum opens no session and probes no
+/// facilitator, and the peer is backed off as for a refused proposal.
 async fn dispatch_proposal(
     node: &ReticulumNode,
     direct_paths: &crate::transport::direct_path::DirectPaths,
+    onion: &crate::onion::runtime::OnionRuntime,
     metrics: Option<&crate::observability::EdgeMetrics>,
     peer: &str,
     link: LinkId,
@@ -15034,6 +15561,17 @@ async fn dispatch_proposal(
             m.inc_direct_link(label);
         }
     };
+    if let Err(token) = onion.may_reveal_address() {
+        onion.count(token);
+        direct_paths.tracker().propose_refused(peer, link, now);
+        tracing::debug!(
+            link = %hex::encode(link.as_bytes()),
+            "direct path: not proposing — this node's Anonymous Tier is active (CC 5.4.6)"
+        );
+        return Err(crate::transport::direct_path::DirectPath::Unavailable {
+            reason: "propose_refused",
+        });
+    }
     // Registered BEFORE the dispatch, so the outcome cannot precede the
     // registration.
     let rx = direct_paths.wait_for(link);
@@ -16460,6 +16998,22 @@ static AV_SINK_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 /// CIRISEdge#805 — the per-link throttle for routine A/V sink drops (overflow,
 /// no consumer): DEBUG, a few per minute per link, never per frame
 /// (CIRISEdge#460). The exact count is the `av_plane` counter, never throttled.
+/// 45.2.0 — whether this is the first control-frame drop seen on `link`
+/// (the warn-once set; bounded, cleared when it would outgrow leviculum's
+/// own link cap).
+fn av_control_drop_first(link: LinkId) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<LinkId>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.len() >= crate::transport::av_sink::AV_PENDING_ARRIVAL_LINKS_MAX {
+        seen.clear();
+    }
+    seen.insert(link)
+}
+
 fn av_sink_drop_log() -> &'static crate::log_throttle::LogThrottle {
     AV_SINK_DROP_LOG
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
@@ -16583,6 +17137,9 @@ async fn deliver_av_frame(
     let metrics = ctx.metrics.cloned();
     let outbound_liveness = ctx.link_last_outbound_at;
     let data_len = data.as_ref().map(Vec::len);
+    let control = data
+        .as_deref()
+        .is_some_and(crate::transport::realtime_av_alm::controller::wire::is_control_frame);
     let delivery = ctx.av_sink.deliver(link_id, data, |inbound| {
         crate::transport::av_sink::AvArrival {
             link_id: link_id.into_bytes(),
@@ -16632,6 +17189,20 @@ async fn deliver_av_frame(
                 _ => crate::observability::AV_INBOUND_DROPPED_NO_CONSUMER,
             };
             count(label);
+            if control {
+                count(crate::observability::AV_INBOUND_CONTROL_DROPPED);
+                // Never quiet: once per link, at WARN (a control frame the
+                // transport delivered and the call will never see).
+                if av_control_drop_first(link_id) {
+                    tracing::warn!(
+                        link = ?link_id,
+                        reason = label,
+                        "ALM control frame dropped at the A/V sink: its per-link control \
+                         queue was full (av_inbound_control_dropped); later drops on this \
+                         link are counted, not logged"
+                    );
+                }
+            }
             if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                 av_sink_drop_log().check(&format!("{label}:{link_id:?}"))
             {
@@ -19303,8 +19874,129 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 &*ctx.reusable_scoped_link.lock().await,
                 link_id,
             );
+            // G8 — which link went, on which node, which way and on which
+            // plane: read before the book forgets it (target
+            // `ciris_edge::link_close`, debug; the capped-uplink witness
+            // times each one from the cap).
+            if tracing::enabled!(target: "ciris_edge::link_close", tracing::Level::DEBUG) {
+                let direction = ctx
+                    .link_direction
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .by_link
+                    .get(&link_id)
+                    .copied();
+                let av_peer = ctx
+                    .av_dialed_peer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&link_id)
+                    .cloned();
+                let plane = if av_peer.is_some() || ctx.av_sink.link_ids().contains(&link_id) {
+                    "av"
+                } else {
+                    match ctx.link_plane.lock().await.get(&link_id) {
+                        Some(LinkPlane::Identity) => "identity",
+                        Some(LinkPlane::Scoped) => "scoped",
+                        Some(LinkPlane::Av) => "av",
+                        None => "unknown",
+                    }
+                };
+                let peer = match av_peer {
+                    Some(p) => Some(p),
+                    None => ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned(),
+                };
+                tracing::debug!(
+                    target: "ciris_edge::link_close",
+                    node = %ctx.local_key_id,
+                    link = %hex::encode(link_id.as_bytes()),
+                    direction = ?direction,
+                    plane,
+                    peer = ?peer,
+                    reason = ?reason,
+                    "link closed"
+                );
+            }
             ctx.link_book().forget(link_id, close_cause(reason)).await;
             ctx.alm_links.forget(&link_id.into_bytes());
+            // G8 — the punched interface goes with its link: forget the
+            // peer's direct path so its next dial proposes at once.
+            // Bound first: the tracker's std guard must not live across the
+            // path request's await below.
+            let (released, released_iface) = {
+                let mut t = ctx.direct_paths.tracker();
+                let iface = t.interface_of_link(link_id);
+                (t.link_closed(link_id, std::time::Instant::now()), iface)
+            };
+            if let Some(peer) = released {
+                tracing::info!(
+                    peer = %peer,
+                    link = %hex::encode(link_id.as_bytes()),
+                    reason = ?reason,
+                    "direct path RELEASED: its link closed and its punched interface with it; \
+                     the next dial proposes at once (no backoff)"
+                );
+                if let Some(m) = ctx.metrics {
+                    m.inc_direct_link(crate::observability::DIRECT_LINK_RELEASED_LINK_CLOSED);
+                }
+                // G8 C — the route to the peer's announced destination rode
+                // the punched interface and is gone with it: the next dial
+                // (the call leg's redial, which proposes the new punch) met
+                // "no route" and its backoff until an announce came back
+                // (14 s measured). Ask for the relayed path now.
+                let dest = ctx.peers.lock().await.get(&peer).map(|r| r.peer.dest_hash);
+                if let Some(dest) = dest {
+                    if let Err(e) = ctx.node.request_path(&dest).await {
+                        tracing::debug!(peer = %peer, error = %e, "path request after a direct-path release not sent");
+                    } else if let Some(m) = ctx.metrics {
+                        m.inc_direct_link(
+                            crate::observability::DIRECT_LINK_RELEASED_PATH_REQUESTED,
+                        );
+                    }
+                }
+                // G8 C — released punched interface ∧ an A/V link this node
+                // dialled to the peer is attached to THAT interface → close
+                // it now; never a link on any other interface (a LAN path to
+                // the same peer stays up). Such a link is dead with the
+                // interface, but an idle one waits out its Channel's retries
+                // before anyone knows (2-10 s measured); closed, the call's
+                // leg redials at once (its redial proposes the new punch).
+                // The peer's own release closes the ones it dialled here.
+                let dialled: Vec<LinkId> = ctx
+                    .av_dialed_peer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .filter(|(_, p)| **p == peer)
+                    .map(|(l, _)| *l)
+                    .collect();
+                let av_links: Vec<LinkId> = match released_iface {
+                    Some(iface) if !dialled.is_empty() => {
+                        let attached: HashMap<LinkId, Option<usize>> = ctx
+                            .node
+                            .link_list()
+                            .into_iter()
+                            .map(|l| (l.link_id, l.interface_index))
+                            .collect();
+                        dialled
+                            .into_iter()
+                            .filter(|l| {
+                                on_released_interface(attached.get(l).copied().flatten(), iface)
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                for l in av_links {
+                    let closed = ctx.node.close_link(&l).await;
+                    tracing::info!(
+                        peer = %peer,
+                        link = %hex::encode(l.as_bytes()),
+                        closed = ?closed,
+                        "an A/V link on the released punched interface closed with it (G8 C)"
+                    );
+                }
+            }
             if pooled {
                 note_starved_pool_close(reason, &link_id);
             }
@@ -19697,6 +20389,7 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
     let direct_paths = Arc::clone(ctx.direct_paths);
     let metrics = ctx.metrics.cloned();
     let node = Arc::clone(ctx.av_node);
+    let onion = Arc::clone(ctx.onion);
     tokio::spawn(async move {
         let accept = direct_paths.config.accept;
         let standing = |p: &str| direct_standing(table.as_deref(), &direct_paths, p);
@@ -19714,7 +20407,20 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
             shares_room = peer.as_deref().is_some_and(standing);
         }
         let held_ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let accepted = peer.is_some() && accepts_direct(accept, shares_room);
+        // CIRISEdge#1028 — an anonymous node answers no upgrade: accepting
+        // hands the proposer and the facilitator its reflexive address. Read
+        // at the answer, after any standing wait.
+        let anonymous = onion.may_reveal_address().err();
+        if let Some(token) = anonymous {
+            onion.count(token);
+        }
+        let accepted = anonymous.is_none()
+            && peer.is_some()
+            && accepts_direct(accept, shares_room)
+            && !direct_paths.refuses_for_test()
+            && !peer
+                .as_deref()
+                .is_some_and(|p| direct_paths.refuses_peer_for_test(p));
         // v44 — before the answer goes, so the outcome cannot precede the
         // record: from here this link may move under a Resource
         // (`direct_path` docs).

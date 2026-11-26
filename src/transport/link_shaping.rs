@@ -308,6 +308,12 @@ impl BudgetClass {
     }
 }
 
+/// 45.2.0 — the refusal token of a call or A/V link on a shaped-only node
+/// ([`LinkShapers::shaped_only`]): calls ride unshaped links only. Beside the
+/// anonymous tier's `onion_anonymous_no_media`, which wins when both hold
+/// (anonymous mode implies shaped-only).
+pub use crate::observability::SHAPED_ONLY_NO_MEDIA;
+
 /// This node's shaping policy (config; PyO3/UniFFI mirror it).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShapingPolicy {
@@ -3318,6 +3324,15 @@ impl LinkShapers {
         self.asked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 45.2.0 — whether this node is shaped-only by its own setting
+    /// ([`ShapingPolicy::require_shaped_links`]): live A/V rides unshaped
+    /// links only (Eric 2026-11-06), so such a node starts, joins and accepts
+    /// no call media ([`SHAPED_ONLY_NO_MEDIA`]). Direct links stay allowed.
+    #[must_use]
+    pub fn shaped_only(&self) -> bool {
+        self.policy().require_shaped_links
     }
 
     /// Whether this node refuses a shaping peer it cannot shape, by the choice

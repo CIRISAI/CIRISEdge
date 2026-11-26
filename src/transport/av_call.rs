@@ -126,7 +126,9 @@ mod alm;
 pub mod frame;
 #[path = "av_call/legs.rs"]
 mod legs;
-pub use alm::{AlmCounts, AlmParents};
+#[path = "av_call/rxmove.rs"]
+mod rxmove;
+pub use alm::{AlmCounts, AlmParents, RelayedTo, CANONICAL_AV_FALLBACK};
 
 /// ALM C5 — media older than this in the inbound queue is dropped by age
 /// (oldest first) before it is opened: twice [`REORDER_WINDOW_MAX`], past
@@ -137,10 +139,22 @@ pub const MEDIA_STALE_BUDGET: Duration = Duration::from_millis(800);
 const LEG_SHED_AFTER: u32 = 3;
 /// ALM C5 — consecutive clean sends before a shed leg is restored.
 const LEG_RESTORE_AFTER: u32 = 50;
-/// ALM C3 — how long a must-arrive frame is retried against a congested link.
-const C3_RESEND_BUDGET: Duration = Duration::from_secs(2);
-/// ALM C3 — the pause between those retries.
+/// ALM C3 — how long a must-arrive frame (an answer: admit, refuse, shed,
+/// unsubscribe; or a subscribe) is retried against a congested link while
+/// the peer still has a link here. Two seconds lost P's ADMITs on a reverse
+/// in-link whose Channel paced them off (rxmove's come-back trace): an answer
+/// is never dropped while it can still go.
+const C3_RESEND_BUDGET: Duration = Duration::from_secs(30);
+/// ALM C3 — the first pause between those retries; it doubles to
+/// [`C3_RESEND_PAUSE_MAX`].
 const C3_RESEND_PAUSE: Duration = Duration::from_millis(25);
+/// ALM C3 — the longest pause between those retries.
+const C3_RESEND_PAUSE_MAX: Duration = Duration::from_millis(250);
+/// ALM C3 — how long into its period a periodic frame (an OFFER) is retried
+/// against a link that refuses it (the Channel's pacing gate spaces sends by
+/// rtt / window): a quarter of the ~1 s offer period, so a period's offers
+/// never pile onto the next's.
+const OFFER_SEND_WINDOW: Duration = Duration::from_millis(250);
 
 /// The tag of the frame a publisher sends first on its own link, after the
 /// transit KEX: `"CHLO" ‖ version ‖ stream_id[32]`.
@@ -163,6 +177,10 @@ const DIAL_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// How long a publisher's link may take to name its stream.
 const HELLO_BUDGET: Duration = Duration::from_secs(10);
+/// Calls cut — how long a member with no direct path waits for the mesh to
+/// relay it before `MediaPathFailed` fires: an offer each second, a subscribe
+/// and its admit, and the selector's first choice, with margin.
+pub const RELAY_WAIT: Duration = Duration::from_secs(6);
 
 // ─── public types ───────────────────────────────────────────────────
 
@@ -313,6 +331,14 @@ pub enum EndCause {
     Revoked,
     /// An ad-hoc call's community expired (not in this release).
     Expired,
+    /// 45.2.0 — this node stopped carrying call media mid-call: it turned
+    /// shaped-only (`shaped_only_no_media`) or anonymous
+    /// (`onion_anonymous_no_media`). Every leg is torn down at once, so a
+    /// node that changed its setting sends no more unshaped media.
+    MediaRefused {
+        /// The refusal token.
+        token: &'static str,
+    },
 }
 
 /// Where a call stands.
@@ -454,6 +480,67 @@ pub enum CallEvent {
         old: StreamId,
         /// The stream in its place.
         new: StreamId,
+    },
+    /// v45.1 — the media path to `member` failed, and why (Eric's ruling: the
+    /// person sees the real reason). Fired once per (call, member) when its
+    /// path attempt concludes with no media leg; a later failed retry fires
+    /// again only when its cause changed. Every field but `member` is
+    /// behaviours, counts and tokens, never an address
+    /// ([`crate::transport::media_path`]); the cause is edge's, decided once
+    /// by [`crate::transport::media_path::media_path_cause`].
+    MediaPathFailed {
+        /// The member this node has no media leg to.
+        member: String,
+        /// Why.
+        cause: crate::transport::media_path::MediaPathCause,
+        /// Whether a retry can help (decided with the cause:
+        /// [`crate::transport::media_path::media_path_verdict`]).
+        retryable: bool,
+        /// When to retry, in seconds, if known (`None` when not retryable).
+        retry_after_s: Option<u32>,
+        /// The internal branch that decided the cause, a closed token list
+        /// ([`crate::transport::media_path::PathDetail`], rendered as its
+        /// snake_case token on every FFI). Always `Some` when `cause` is
+        /// `other`; never free text.
+        detail: Option<crate::transport::media_path::PathDetail>,
+        /// What was tried toward it.
+        tried: Vec<crate::transport::media_path::PathAttempt>,
+        /// This node's NAT (all `unknown` until leviculum measures it).
+        local_nat: crate::transport::media_path::NatReport,
+        /// The member's NAT, as it claims it, if it said.
+        peer_nat: Option<crate::transport::media_path::PeerNatReport>,
+        /// Whether a relay could carry it instead
+        /// ([`crate::transport::media_path::relay_standing`]):
+        /// `none_available` (no member offered), or `refused_by_policy` (only
+        /// a serve seat offered, and a serve seat never relays call media).
+        relay: crate::transport::media_path::RelayStanding,
+    },
+    /// v45.1 — the member's media reaches this node again, or by another way:
+    /// a direct leg came up after a [`CallEvent::MediaPathFailed`], or the
+    /// member's stream is heard through another member (`via = peer_relay`,
+    /// fired when this node first takes a relay as the parent of the member's
+    /// primary stream, and again whenever `via` or `through` changes, a move
+    /// back to the publisher included).
+    MediaPathRestored {
+        /// The member.
+        member: String,
+        /// The technique the media rides.
+        via: crate::transport::media_path::PathKind,
+        /// With `via = peer_relay`, the member relaying it (its node key id);
+        /// `None` on a direct path.
+        through: Option<String>,
+    },
+    /// Calls cut — this node's relay role: whether it offers to relay others'
+    /// streams, and to how many distinct child NODES it forwards them now
+    /// (admitted, or still draining after a make-before-break hand-off).
+    /// Nodes, not people: the host maps a node to its owner. Fired on change,
+    /// once a value has held for one call tick (250 ms), and at once on
+    /// [`Call::set_relay`]; [`Call::relay_status`] reads it.
+    RelayStatus {
+        /// This node offers relay.
+        relaying: bool,
+        /// Distinct child nodes it forwards others' streams to.
+        relaying_for: u16,
     },
 }
 
@@ -796,6 +883,13 @@ pub enum CallError {
     /// starts and joins no call and no stream. Refused before anything starts.
     #[error("this node is in anonymous mode: no call and no stream (onion_anonymous_no_media)")]
     AnonymousMode,
+    /// 45.2.0 — this node is shaped-only by its own setting
+    /// (`ShapingPolicy::require_shaped_links`): live A/V rides unshaped links
+    /// only (Eric 2026-11-06), so it starts and joins no call and accepts no
+    /// A/V link. Refused before anything starts. Anonymous mode, which
+    /// implies shaped-only, is reported as [`Self::AnonymousMode`].
+    #[error("this node is shaped-only: no call and no stream (shaped_only_no_media)")]
+    ShapedOnly,
     /// v45 — the stream named is not one this node publishes in the call
     /// (never added, or already ended).
     #[error("stream {0} is not one this node publishes in the call")]
@@ -1526,8 +1620,17 @@ impl CallRouter {
                     tracing::debug!(
                         peer = %arrival.peer.as_str(),
                         group = ?group,
-                        "A/V link for no live call on this node — dropped (CIRISEdge#805)"
+                        "A/V link for no live call on this node — closed (CIRISEdge#805, 45.3)"
                     );
+                    // 45.3 — closed, never left up: the dialer's leg goes with
+                    // it and its "lost" timing runs. Left up, a dialer held a
+                    // leg to nowhere for ever (a call dropped, an old build, a
+                    // host out of the call). No join race is cut short: a call
+                    // registers here in the same synchronous step that
+                    // installs its addresses (`Call::join`), and an arrival
+                    // exists only after a link to an installed address carried
+                    // its first frame.
+                    tokio::spawn(async move { arrival.sender.close().await });
                 }
             }
         });
@@ -1654,6 +1757,8 @@ struct Shared {
     owners: Arc<dyn CallOwners>,
     heard_tx: mpsc::Sender<Heard>,
     events_tx: mpsc::Sender<CallEvent>,
+    /// The first event the host could not take was logged at WARN.
+    event_drop_warned: AtomicBool,
     state: StdMutex<CallState>,
     epochs: StdMutex<Vec<u64>>,
     ended: AtomicBool,
@@ -1681,6 +1786,32 @@ struct Shared {
     attendee: String,
     /// Attendees already announced on `events()`.
     attendees_known: StdMutex<std::collections::BTreeSet<String>>,
+    /// 45.2.0 — the NODES of the attendees the call rows name (a row is the
+    /// person's; a node acts for it by persist's owner binding): who a path
+    /// event may concern ([`Shared::is_attendee`]).
+    attendee_nodes: StdMutex<std::collections::BTreeSet<String>>,
+    /// v45.1 — the members a `MediaPathFailed` stands for, with the cause it
+    /// named: once per (call, member) until a leg comes up
+    /// ([`Shared::path_failed`], [`Shared::path_up`]).
+    path_failed: StdMutex<HashMap<String, crate::transport::media_path::MediaPathCause>>,
+    /// Calls cut — a member whose dial failed with no direct path, waiting on
+    /// the mesh: `MediaPathFailed` fires only if no member relays it within
+    /// [`RELAY_WAIT`] (or at once with no one else in the call).
+    path_pending: StdMutex<
+        HashMap<
+            String,
+            (
+                crate::transport::media_path::DirectPathFacts,
+                std::time::Instant,
+            ),
+        >,
+    >,
+    /// Calls cut — how the member's media last read on a `MediaPathRestored`:
+    /// `(via, through)`, so a change re-fires and a repeat does not.
+    path_via: StdMutex<HashMap<String, (crate::transport::media_path::PathKind, Option<String>)>>,
+    /// Calls cut — this node relays others' streams now (`CallOptions::relay`
+    /// at join, then [`Call::set_relay`]; always false on a serve seat).
+    relay_on: AtomicBool,
     /// The one `RecordRefused` has fired.
     record_refused: AtomicBool,
     id: CallId,
@@ -1710,6 +1841,9 @@ struct Shared {
     /// is never booked as lost, and a loss on a layer it was steadily
     /// getting always is.
     layer_views: StdMutex<HashMap<StreamId, u64>>,
+    /// Test seam ([`Call::drop_keeping_the_wire_for_test`]): Drop leaves the
+    /// addresses and links up, as a build before 45.3 did.
+    keep_wire_on_drop: AtomicBool,
     /// v45 — the camera (primary) stream ended while a share went on
     /// (`Call::end_stream_as`): it takes no more frames, and its bindings
     /// are no longer announced.
@@ -1731,6 +1865,11 @@ struct Shared {
     /// this node has no leg of its own to that member).
     in_senders:
         StdMutex<HashMap<String, Arc<crate::transport::realtime_av_runtime::LeviculumAvSender>>>,
+    /// The sender of each live in-link by link id: when the in-link whose
+    /// sender `in_senders` holds closes while another from the same member
+    /// stands (two dials raced, or a redial), that one's takes its place.
+    in_link_senders:
+        StdMutex<HashMap<[u8; 16], Arc<crate::transport::realtime_av_runtime::LeviculumAvSender>>>,
     /// ALM C5 — each out-leg's media TTLs (set once its peer takes timed frames).
     leg_ttl: StdMutex<HashMap<String, Arc<crate::transport::realtime_av_runtime::MediaTtl>>>,
     /// ALM C5 — each out-leg's congestion streaks and whether it is shed to
@@ -1751,6 +1890,34 @@ struct Shared {
     /// ALM C5 — the oldest frame age seen in the inbound queues this window
     /// (ms), for the ladder's `edge:av_queue_age` signal.
     queue_age_ms: AtomicU64,
+    /// G8 — rung when a fan-out parks a chunk: the flusher retries it with
+    /// the publisher lock taken briefly, never inside `publish`.
+    parked_wake: tokio::sync::Notify,
+    /// G8 C — members whose direct path came up while a leg dial to them was
+    /// in flight: if that dial fails, it is retried at once.
+    path_up_mid_dial: StdMutex<std::collections::HashSet<String>>,
+    /// Peer evidence: when each A/V link was last passed on as evidence.
+    evidence_at: StdMutex<HashMap<[u8; 16], Instant>>,
+    /// Members a second leg dial races an in-flight one to: the member
+    /// dialled this node meanwhile, so its call address stands, and the first
+    /// dial may be waiting out a no-path establish timeout from before it did.
+    racing_dial: StdMutex<std::collections::HashSet<String>>,
+    /// ALM C3 — must-arrive frames (answers, subscribes) a link refused,
+    /// per member, in order: one worker per member retries the front, and a
+    /// newer frame queues behind it. Independent retries reordered answers
+    /// (an older ADMIT landing after a newer one).
+    c3_pending: StdMutex<HashMap<String, std::collections::VecDeque<alm::Outgoing>>>,
+    /// G8 serial redial — members whose leg this node had and lost, not yet
+    /// redialled (a redial may be deferred once; a first dial never is).
+    lost_legs: StdMutex<std::collections::HashSet<String>>,
+    /// G8 — re-announce rounds skipped in a row, per leg.
+    reannounce_skipped: StdMutex<HashMap<String, u32>>,
+    /// G8 pacing — a re-announce is in flight.
+    reannounce_running: AtomicBool,
+    /// G8 — the legs (by peer) whose oldest unproved Channel message is
+    /// backlogged ([`alm::UPLINK_BACKLOG_MS`]): their periodic offers are
+    /// held until it is proved.
+    backlogged_legs: StdMutex<std::collections::HashSet<String>>,
     /// The node's service ladder, if any.
     load: Option<Arc<crate::load_ladder::SharedLadder>>,
     /// Test seam: every pump holds its next frame until this instant (a
@@ -1962,8 +2129,23 @@ impl Shared {
     }
 
     fn emit(&self, event: CallEvent) {
-        if self.events_tx.try_send(event).is_err() {
-            tracing::debug!("call event dropped: the events receiver is full or gone");
+        match self.events_tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Never waits on the host, and never quiet: counted, and
+                // the first one of the call is logged at WARN.
+                self.count(crate::observability::AV_CALL_EVENT_DROPPED_HOST_NOT_READING);
+                if !self.event_drop_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        room = %self.room,
+                        "call event dropped: the host is not reading the call's events \
+                         (av_call_event_dropped_host_not_reading); later drops are counted"
+                    );
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("call event dropped: the events receiver is gone");
+            }
         }
     }
 
@@ -1971,6 +2153,229 @@ impl Shared {
         if let Some(m) = &self.metrics {
             m.inc_av_plane(label);
         }
+    }
+
+    /// v45.1 — a dial to `member` ended with no leg, its direct-path step
+    /// having come to `facts`. Fires `MediaPathFailed` the first time, and
+    /// again only when the cause changed on a pass that concluded something
+    /// new; a pass that only met the backoff (or a running proposal) never
+    /// re-fires. Nothing fires when a path stands (the dial failed for
+    /// another reason, and retries) or a link from the member carries media
+    /// here already.
+    fn path_failed(&self, member: &str, facts: &crate::transport::media_path::DirectPathFacts) {
+        if facts.path_stands() || self.ended.load(Ordering::Relaxed) {
+            return;
+        }
+        // 45.2.0 — path events concern attendees only: a room member who is
+        // not in the call has no media path to fail.
+        if !self.is_attendee(member) {
+            return;
+        }
+        if Self::lock(&self.in_links).values().any(|p| p == member) {
+            return;
+        }
+        // Calls cut — the mesh may carry it: wait for a member relay first.
+        let relay = self.relay_facts(member);
+        if relay.member_relay {
+            return;
+        }
+        if relay.others_in_call {
+            let mut pending = Self::lock(&self.path_pending);
+            let since = pending
+                .get(member)
+                .map_or_else(std::time::Instant::now, |(_, t)| *t);
+            pending.insert(member.to_owned(), (facts.clone(), since));
+            if since.elapsed() < RELAY_WAIT {
+                return;
+            }
+        }
+        self.raise_path_failed(member, facts, relay);
+    }
+
+    /// 45.2.0 — whether `member` attends this call, as far as this node can
+    /// tell: its leg reached us, its stream or its key binding reached us
+    /// (directly or through a relay), or a call row names its key. A call row
+    /// is written by the PERSON's key and legs are the NODE's, so on a split
+    /// home the row alone may not name the member; the other three do.
+    fn is_attendee(&self, member: &str) -> bool {
+        // In a two-person room the other member IS the party the call is
+        // with: the direct path is the only way the call can work, so its
+        // path events concern it before it has shown any sign of joining.
+        let two_person = {
+            let m = Self::lock(&self.members);
+            m.len() <= 2 && m.iter().any(|x| x == member)
+        };
+        two_person
+            || Self::lock(&self.in_links).values().any(|p| p == member)
+            || !Self::lock(&self.alm).streams_of(member).is_empty()
+            || self.auth.publishers().iter().any(|p| p == member)
+            || Self::lock(&self.attendees_known).contains(member)
+            || Self::lock(&self.attendee_nodes).contains(member)
+    }
+
+    /// Calls cut — what the ALM mesh says about relaying `member` here.
+    fn relay_facts(&self, member: &str) -> crate::transport::media_path::RelayFacts {
+        let others_in_call = Self::lock(&self.members)
+            .iter()
+            .any(|m| m != member && *m != self.own);
+        let a = Self::lock(&self.alm);
+        let shares = Self::lock(&self.share_streams);
+        let streams: Vec<StreamId> = a
+            .streams_of(member)
+            .into_iter()
+            .filter(|s| !shares.contains(s))
+            .collect();
+        let member_relay = streams
+            .iter()
+            .any(|s| a.primary_of(*s).is_some_and(|p| p != member));
+        let seat_only = !member_relay
+            && streams.iter().any(|s| a.only_a_seat_offered(*s))
+            && !streams.iter().any(|s| a.member_offers(*s));
+        crate::transport::media_path::RelayFacts {
+            others_in_call,
+            member_relay,
+            seat_only,
+        }
+    }
+
+    /// Calls cut — fire `MediaPathFailed` for `member` (no direct leg, no
+    /// member relay), once per cause.
+    fn raise_path_failed(
+        &self,
+        member: &str,
+        facts: &crate::transport::media_path::DirectPathFacts,
+        relay: crate::transport::media_path::RelayFacts,
+    ) {
+        use crate::transport::media_path::MediaPathFailure;
+        let failure = MediaPathFailure::from_facts(facts, &relay, chrono::Utc::now());
+        {
+            let mut standing = Self::lock(&self.path_failed);
+            match standing.get(member) {
+                Some(c) if *c == failure.cause => return,
+                Some(_) if !facts.attempt.conclusive() => return,
+                _ => {}
+            }
+            standing.insert(member.to_owned(), failure.cause);
+        }
+        tracing::info!(
+            peer = %member,
+            cause = failure.cause.token(),
+            detail = failure.detail.map_or("none", |d| d.token()),
+            retryable = failure.retryable,
+            relay = failure.relay.token(),
+            local_mapping = failure.local_nat.mapping.token(),
+            "call: no media path to the member (CallEvent::MediaPathFailed)"
+        );
+        self.emit(CallEvent::MediaPathFailed {
+            member: member.to_owned(),
+            cause: failure.cause,
+            retryable: failure.retryable,
+            retry_after_s: failure.retry_after_s,
+            detail: failure.detail,
+            tried: failure.tried,
+            local_nat: failure.local_nat,
+            peer_nat: failure.peer_nat,
+            relay: failure.relay,
+        });
+    }
+
+    /// v45.1 — a media leg to or from `member` came up over `via`: a
+    /// standing `MediaPathFailed` for it is answered by `MediaPathRestored`.
+    fn path_up(&self, member: &str, via: crate::transport::media_path::PathKind) {
+        Self::lock(&self.path_pending).remove(member);
+        if Self::lock(&self.path_failed).remove(member).is_none() {
+            return;
+        }
+        Self::lock(&self.path_via).insert(member.to_owned(), (via, None));
+        tracing::info!(
+            peer = %member,
+            via = via.token(),
+            "call: the media path to the member came up (CallEvent::MediaPathRestored)"
+        );
+        self.emit(CallEvent::MediaPathRestored {
+            member: member.to_owned(),
+            via,
+            through: None,
+        });
+    }
+
+    /// Calls cut — the ALM chose a new primary parent for `stream`: when it is
+    /// the member's primary stream (not a share), its media now reads
+    /// `peer_relay` through that member, or direct again. `MediaPathRestored`
+    /// fires when this node first takes a relay, again whenever `via` or
+    /// `through` changes, and on the move back to the publisher; a standing
+    /// `MediaPathFailed` or pending failure for the member is cleared.
+    fn on_parent_move(&self, stream: StreamId, primary: Option<&str>) {
+        use crate::transport::media_path::PathKind;
+        if Self::lock(&self.share_streams).contains(&stream) {
+            return;
+        }
+        let Some(publisher) = Self::lock(&self.alm)
+            .publisher_of(stream)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(parent) = primary else {
+            return;
+        };
+        let now = if parent == publisher {
+            (self.path_kind_of(&publisher), None)
+        } else {
+            (PathKind::PeerRelay, Some(parent.to_owned()))
+        };
+        let before = Self::lock(&self.path_via).get(&publisher).cloned();
+        let failed = Self::lock(&self.path_failed).remove(&publisher).is_some();
+        Self::lock(&self.path_pending).remove(&publisher);
+        let relayed = now.0 == PathKind::PeerRelay;
+        let was_relayed = before
+            .as_ref()
+            .is_some_and(|(v, _)| *v == PathKind::PeerRelay);
+        if before.as_ref() == Some(&now) || !(relayed || was_relayed || failed) {
+            return;
+        }
+        Self::lock(&self.path_via).insert(publisher.clone(), now.clone());
+        tracing::info!(
+            peer = %publisher,
+            via = now.0.token(),
+            through = now.1.as_deref().unwrap_or("-"),
+            "call: the member's media path moved (CallEvent::MediaPathRestored)"
+        );
+        self.emit(CallEvent::MediaPathRestored {
+            member: publisher,
+            via: now.0,
+            through: now.1,
+        });
+    }
+
+    /// Calls cut — a pending failure whose relay wait ran out with no member
+    /// relaying fires now.
+    fn raise_due_path_failures(&self) {
+        let due: Vec<(String, crate::transport::media_path::DirectPathFacts)> =
+            Self::lock(&self.path_pending)
+                .iter()
+                .filter(|(_, (_, since))| since.elapsed() >= RELAY_WAIT)
+                .map(|(m, (f, _))| (m.clone(), f.clone()))
+                .collect();
+        for (member, facts) in due {
+            let relay = self.relay_facts(&member);
+            Self::lock(&self.path_pending).remove(&member);
+            if relay.member_relay
+                || Self::lock(&self.in_links).values().any(|p| *p == member)
+                || !self.is_attendee(&member)
+            {
+                continue;
+            }
+            self.raise_path_failed(&member, &facts, relay);
+        }
+    }
+
+    /// The technique a leg to `member` rides when the dial did not say: a
+    /// standing punched path, else a one-hop neighbour.
+    fn path_kind_of(&self, member: &str) -> crate::transport::media_path::PathKind {
+        self.transport
+            .direct_path_kind(member)
+            .unwrap_or(crate::transport::media_path::PathKind::DirectLan)
     }
 
     /// The first frame heard ends this call's setup.
@@ -2040,6 +2445,10 @@ impl std::fmt::Debug for Call {
     }
 }
 
+/// Dropping a `Call` ends it on this node: its addresses are left and its
+/// legs and in-links closed, with NO signed leave. Its peers therefore read
+/// this attendee `Lost` (after [`ATTENDEE_LOST_AFTER`]), never left; a host
+/// that wants them to read "left" (and why) calls [`Call::leave_with`] first.
 impl Drop for Call {
     fn drop(&mut self) {
         self.shared.ended.store(true, Ordering::Relaxed);
@@ -2047,6 +2456,34 @@ impl Drop for Call {
         self.router.unregister(&self.shared.group_id);
         for t in &self.tasks {
             t.abort();
+        }
+        if self.shared.keep_wire_on_drop.load(Ordering::Relaxed) {
+            return;
+        }
+        // 45.3 — a dropped call is gone from the wire too: its addresses are
+        // left and its links closed, as a media-refused end does. Before, the
+        // node kept answering on the call's addresses and kept every link
+        // open with nothing behind it: a member that redialled it (a leg a
+        // send finds gone is redialled, 73a3133) got a "leg" to a call that
+        // no longer existed, so it never read that attendee Lost.
+        let _ = self
+            .shared
+            .lifecycle
+            .leave(&self.shared.scope, &self.shared.group_id);
+        let links: Vec<[u8; 16]> = Shared::lock(&self.shared.out_legs)
+            .drain()
+            .map(|(_, l)| l.link_id)
+            .chain(Shared::lock(&self.shared.in_links).drain().map(|(l, _)| l))
+            .collect();
+        if !links.is_empty() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let transport = Arc::clone(&self.shared.transport);
+                rt.spawn(async move {
+                    for l in links {
+                        let _ = transport.link_teardown(&l).await;
+                    }
+                });
+            }
         }
     }
 }
@@ -2080,6 +2517,13 @@ impl Call {
             verifier,
             load,
         } = deps;
+        // CC 5.4.3 / 45.2.0 — no call on a node that carries no call media,
+        // before anything starts (no address installed, no leg dialled).
+        match transport.media_refusal() {
+            Some(crate::onion::tokens::ANONYMOUS_NO_MEDIA) => return Err(CallError::AnonymousMode),
+            Some(_) => return Err(CallError::ShapedOnly),
+            None => {}
+        }
         if signer.key_id != own_key_id {
             return Err(CallError::Plumbing(format!(
                 "the signer that binds this stream's chunk keys is {}, not the publisher {own_key_id}",
@@ -2132,6 +2576,18 @@ impl Call {
         let arrivals = router.register(&group_id);
 
         let members_for_alm = members.clone();
+        // Calls cut — a serve seat never relays call media, audio included
+        // (`alm::CANONICAL_AV_FALLBACK` off), whatever the host asked.
+        if !transport.serve_seats_attached() {
+            tracing::error!(
+                room = %room,
+                "call: this transport was given no serve-seat set (built outside \
+                 EdgeBuilder::build?) — the rule that a serve seat never relays cannot be \
+                 applied here"
+            );
+        }
+        let seats = transport.serve_seats();
+        let own_is_seat = !alm::CANONICAL_AV_FALLBACK && seats.iter().any(|s| s == own_key_id);
         let alm_seed = {
             let mut b = [0u8; 8];
             ciris_crypto::random::fill(&mut b)
@@ -2167,6 +2623,7 @@ impl Call {
             owners,
             heard_tx,
             events_tx,
+            event_drop_warned: AtomicBool::new(false),
             state: StdMutex::new(CallState::Live),
             epochs: StdMutex::new(vec![epoch.0]),
             ended: AtomicBool::new(false),
@@ -2178,6 +2635,11 @@ impl Call {
             record,
             attendee,
             attendees_known: StdMutex::new(std::collections::BTreeSet::new()),
+            attendee_nodes: StdMutex::new(std::collections::BTreeSet::new()),
+            path_failed: StdMutex::new(HashMap::new()),
+            path_pending: StdMutex::new(HashMap::new()),
+            path_via: StdMutex::new(HashMap::new()),
+            relay_on: AtomicBool::new(opts.relay && !own_is_seat),
             record_refused: AtomicBool::new(false),
             id,
             signer,
@@ -2188,6 +2650,7 @@ impl Call {
             frame_seqs: StdMutex::new(HashMap::new()),
             frames_lost: Arc::new(StdMutex::new(BTreeMap::new())),
             layer_views: StdMutex::new(HashMap::new()),
+            keep_wire_on_drop: AtomicBool::new(false),
             primary_ended: AtomicBool::new(false),
             shares: Mutex::new(BTreeMap::new()),
             registrar: share_registrar,
@@ -2198,9 +2661,12 @@ impl Call {
                     alm::AlmState::new(own_key_id, stream, &members_for_alm, opts.relay, alm_seed);
                 a.withhold_caps(caps_withheld);
                 a.set_layer_requests(layer_requests);
+                a.set_seats(seats.iter().cloned());
+                let _ = a.set_serve_seat(own_is_seat);
                 a
             }),
             in_senders: StdMutex::new(HashMap::new()),
+            in_link_senders: StdMutex::new(HashMap::new()),
             leg_ttl: StdMutex::new(HashMap::new()),
             leg_cong: StdMutex::new(HashMap::new()),
             rx_legs: StdMutex::new(HashMap::new()),
@@ -2208,6 +2674,15 @@ impl Call {
             own_share_codecs: StdMutex::new(HashMap::new()),
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
+            parked_wake: tokio::sync::Notify::new(),
+            path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
+            evidence_at: StdMutex::new(HashMap::new()),
+            racing_dial: StdMutex::new(std::collections::HashSet::new()),
+            c3_pending: StdMutex::new(HashMap::new()),
+            lost_legs: StdMutex::new(std::collections::HashSet::new()),
+            reannounce_skipped: StdMutex::new(HashMap::new()),
+            reannounce_running: AtomicBool::new(false),
+            backlogged_legs: StdMutex::new(std::collections::HashSet::new()),
             load,
             setup_began: std::time::Instant::now(),
             setup_done: AtomicBool::new(false),
@@ -2232,7 +2707,8 @@ impl Call {
             room = %room,
             stream = %crate::transport::realtime_av::stream_label(stream),
             epoch = epoch.0,
-            relay = opts.relay,
+            relay = shared.relay_on.load(Ordering::Relaxed),
+            serve_seat = own_is_seat,
             "CALL JOINED: this node's stream is live in the room's call (CIRISEdge#805 item 5)"
         );
 
@@ -2249,6 +2725,8 @@ impl Call {
                 Arc::clone(&counts),
             )),
             tokio::spawn(watch_loop(Arc::clone(&shared))),
+            tokio::spawn(flush_parked_loop(Arc::clone(&shared))),
+            tokio::spawn(redial_on_direct_path(Arc::clone(&shared))),
         ];
         reconcile_legs(&shared);
         Ok(Self {
@@ -2367,6 +2845,67 @@ impl Call {
         Shared::lock(&self.shared.alm).committed()
     }
 
+    /// Calls cut — start or stop relaying others' streams, live.
+    ///
+    /// Off: this node stops offering, closes its relay admissions and sheds
+    /// every child make-before-break (it keeps forwarding to each until the
+    /// child unsubscribes or the drain passes, so the child's standby or
+    /// another relay takes over first); each child is told (the wire's
+    /// `relay_shed:upstream_lost`, booked here `relay_shed:relay_off`). On:
+    /// it offers again from the next tick. A serve seat stays off. Fires
+    /// [`CallEvent::RelayStatus`] at once; its `CAPS` names `CAP_RELAY` from
+    /// now on (re-sent to every C3 leg; a peer reads relaying from offers).
+    pub async fn set_relay(&self, on: bool) {
+        let (out, caps, legs) = {
+            let mut a = Shared::lock(&self.shared.alm);
+            let out = a.set_relay(on);
+            let now_on = a.relay_capable();
+            self.shared.relay_on.store(now_on, Ordering::Relaxed);
+            let caps = a.caps_frame(self.shared.transport.av_datagrams_enabled());
+            let legs: Vec<String> = Shared::lock(&self.shared.members)
+                .iter()
+                .filter(|m| a.speaks_c3(m))
+                .cloned()
+                .collect();
+            for e in std::mem::take(&mut a.events) {
+                self.shared.emit(e);
+            }
+            for l in std::mem::take(&mut a.labels) {
+                self.shared.count(l);
+            }
+            (out, caps, legs)
+        };
+        tracing::info!(
+            relay = self.shared.relay_on.load(Ordering::Relaxed),
+            asked = on,
+            shed = out.len(),
+            "call: relay role set (Call::set_relay)"
+        );
+        let mut frames = out;
+        frames.extend(legs.into_iter().map(|to| alm::Outgoing {
+            to,
+            frame: caps.clone(),
+        }));
+        send_alm(&self.shared, frames).await;
+    }
+
+    /// Calls cut — what this node forwarded for others, per child node:
+    /// bytes on the wire (each chunk's sealed size) and the streams, since
+    /// the call began. A child that left the room is dropped.
+    #[must_use]
+    pub fn relayed_to(&self) -> Vec<RelayedTo> {
+        Shared::lock(&self.shared.alm).relayed_to()
+    }
+
+    /// Calls cut — `(relaying, relaying_for)` now: whether this node offers
+    /// relay, and how many distinct child nodes it forwards others' streams
+    /// to ([`CallEvent::RelayStatus`]).
+    #[must_use]
+    pub fn relay_status(&self) -> (bool, u16) {
+        let a = Shared::lock(&self.shared.alm);
+        (a.relay_capable(), a.relaying_for())
+    }
+
     /// ALM stage 2 — what the controller counted on this call.
     #[must_use]
     pub fn alm_counts(&self) -> AlmCounts {
@@ -2478,6 +3017,22 @@ impl Call {
         Shared::lock(&self.shared.out_legs)
             .get(member)
             .map(|l| l.link_id)
+    }
+
+    /// Test seam — the members the publisher's dispatcher holds a leg to
+    /// (what a send can reach), beside [`Self::legs`] (what the call
+    /// believes it has); the two must agree.
+    #[doc(hidden)]
+    pub async fn dispatcher_legs_for_test(&self) -> Vec<String> {
+        let mut v = self
+            .shared
+            .publisher
+            .lock()
+            .await
+            .dispatcher_mut()
+            .subscriber_ids();
+        v.sort();
+        v
     }
 
     /// The members this node has a leg to.
@@ -2657,6 +3212,16 @@ impl Call {
     #[doc(hidden)]
     pub fn withhold_forward_for_test(&self, member: &str, every: u64) {
         *Shared::lock(&self.shared.test_withhold_forward) = Some((member.to_owned(), every));
+    }
+
+    /// Test seam: drop this call the way a build before 45.3 did, or a host
+    /// whose call task died with the node still up: the router no longer
+    /// takes its links, but its addresses stay installed and its links open
+    /// (the node still answers on the call's address and routes nothing).
+    #[doc(hidden)]
+    pub fn drop_keeping_the_wire_for_test(self) {
+        self.shared.keep_wire_on_drop.store(true, Ordering::Relaxed);
+        drop(self);
     }
 
     /// Test seam: close this node's leg to `member` and leave it down, as a
@@ -3536,6 +4101,7 @@ async fn send_own_chunk(
     let wire_len = u64::try_from(plaintext_len + AV_CHUNK_WIRE_OVERHEAD + CHUNK_TRAILER_LEN)
         .unwrap_or(u64::MAX);
     let legs_now = publisher.dispatcher_mut().subscriber_ids();
+    exclude.extend(stalled_channel_legs(shared, &legs_now));
     {
         let alm = Shared::lock(&shared.alm);
         if alm.tier().own_call_audio_only() && !base_or_audio {
@@ -3565,8 +4131,7 @@ async fn send_own_chunk(
         .map(|(peer, leg)| {
             let outcome = leg_outcome(leg);
             if outcome == LegOutcome::Gone {
-                Shared::lock(&shared.out_legs).remove(&peer);
-                Shared::lock(&shared.alm).on_child_link_down(&peer);
+                out_leg_gone(shared, &peer);
             }
             (peer, outcome)
         })
@@ -3578,7 +4143,8 @@ fn leg_outcome(leg: LegSend) -> LegOutcome {
         LegSend::Sent => LegOutcome::Delivered,
         LegSend::FilteredByPolicy => LegOutcome::FilteredByPolicy,
         LegSend::Gone => LegOutcome::Gone,
-        LegSend::Failed(AvDispatcherError::Congested) => LegOutcome::Congested,
+        // G8 — Parked: not on the wire now; the leg keeps it for one more try.
+        LegSend::Failed(AvDispatcherError::Congested) | LegSend::Parked => LegOutcome::Congested,
         LegSend::Failed(AvDispatcherError::ChunkTooLarge(_)) => LegOutcome::TooLarge,
         LegSend::Failed(e) => LegOutcome::Failed(e.to_string()),
     }
@@ -3642,6 +4208,20 @@ async fn current_members(shared: &Shared) -> Vec<String> {
 /// members are dialled.
 #[allow(clippy::too_many_lines)] // one roll, every live stream, in one place
 async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
+    // 45.3 — the call runs at the room group's STORED head: another handle
+    // on the same store (the host's chat driver holds its own) may have
+    // applied a commit this handle never saw. One head-slot read a tick; a
+    // reload only when the head moved.
+    match shared.room_group.refresh_from_store().await {
+        Ok(Some(_)) => shared.count(crate::observability::AV_CALL_ROOM_FOLLOWED_STORE),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(CallError::RoomGroupUnavailable {
+                room: shared.room.clone(),
+                detail: format!("the stored head: {e}"),
+            })
+        }
+    }
     let room_epoch = shared.room_group.epoch().await;
     // A replacement waiting out its overlap was minted at the epoch about to
     // end: switch to it first, so the roll rolls the new stream.
@@ -3753,6 +4333,15 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     Shared::lock(&shared.epochs).push(room_epoch);
     close_departed(shared, &left).await;
     readdress(shared, room_epoch, &members).await;
+    // 45.3 — every member's address moved with the epoch: a dial waiting out
+    // a backoff, or still in flight, is aimed at an address of the epoch the
+    // call just left (and at a joiner's, one nobody registered). Dial each
+    // at its new address now; a dial in flight is raced.
+    for m in &members {
+        if *m != shared.own && !joined.contains(m) {
+            dial_now_if_backing_off(shared, m, RACE_ON_ROLL);
+        }
+    }
     shared.emit(CallEvent::EpochRolled {
         from,
         to: room_epoch,
@@ -3802,6 +4391,7 @@ async fn close_departed(shared: &Arc<Shared>, left: &[String]) {
     });
     Shared::lock(&shared.in_senders).retain(|peer, _| !left.contains(peer));
     Shared::lock(&shared.leg_ttl).retain(|peer, _| !left.contains(peer));
+    Shared::lock(&shared.path_failed).retain(|peer, _| !left.contains(peer));
     for l in closing {
         let _ = shared.transport.link_teardown(&l).await;
     }
@@ -3830,14 +4420,181 @@ async fn readdress(shared: &Arc<Shared>, room_epoch: u64, members: &[String]) {
     }
 }
 
+/// G8 C — a member's direct path just came up (a punch, or a re-punch after
+/// the link that held the old one closed): if this node has no leg to it and
+/// is only waiting out a failed dial's backoff, dial now. A leg whose punched
+/// interface went with its link failed its redials while no path stood (the
+/// backoff doubled 1 s → 8 s), and would otherwise wait the rest of it with
+/// the new path already up (CIRISEdge 45.2.0: 15.5 s from close to direct).
+/// A dial in flight is left alone.
+async fn redial_on_direct_path(shared: Arc<Shared>) {
+    use crate::transport::direct_path::DirectPathEvent;
+    let mut events = shared.transport.subscribe_direct_path_events();
+    loop {
+        let peer = match events.recv().await {
+            Ok(DirectPathEvent::Established {
+                peer: Some(peer), ..
+            }) => peer,
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        if shared.ended.load(Ordering::Relaxed) {
+            return;
+        }
+        dial_now_if_backing_off(&shared, &peer, "a direct path came up");
+    }
+}
+
+/// [`dial_now_if_backing_off`]'s reason when the member dialled this node.
+const RACE_ON_INBOUND: &str = "the member dialled this node";
+/// [`dial_now_if_backing_off`]'s reason when this node's call rolled (45.3):
+/// a dial in flight was aimed at the previous epoch's address.
+const RACE_ON_ROLL: &str = "the call rolled to a new epoch";
+
+/// `peer` is reachable now (a direct path came up, or it just dialled this
+/// node): if this node has no leg to it and is only waiting out a failed
+/// dial's backoff, dial now; a dial in flight that fails redials at once.
+/// At setup a member dialled before its call address stood fails ("derived
+/// destination did not establish") and backed off to the next tick or
+/// longer, while the member's own leg here was already up (rxmove's
+/// come-back trace: P had no leg to any member for ~5 s, and its ADMITs rode
+/// the members' paced in-links).
+fn dial_now_if_backing_off(shared: &Arc<Shared>, peer: &str, why: &'static str) {
+    {
+        let peer = peer.to_owned();
+        if !Shared::lock(&shared.members).contains(&peer)
+            || Shared::lock(&shared.out_legs).contains_key(&peer)
+        {
+            return;
+        }
+        let now = Instant::now();
+        let waiting_backoff = {
+            let mut dialling = Shared::lock(&shared.dialling);
+            // A dial in flight holds its entry an hour ahead; a backoff at
+            // most DIAL_BACKOFF_MAX.
+            let until = dialling.get(&peer).copied();
+            let backing_off = until.is_some_and(|u| u > now && u <= now + DIAL_BACKOFF_MAX);
+            if backing_off {
+                dialling.remove(&peer);
+            } else if until.is_some_and(|u| u > now + DIAL_BACKOFF_MAX) {
+                // In flight: it may have started before the path stood and
+                // fail on that ("no route"); if it does, it redials at once
+                // instead of backing off (reconcile_legs).
+                Shared::lock(&shared.path_up_mid_dial).insert(peer.clone());
+                // The member dialled this node: its address stands NOW, and
+                // the dial in flight may sit out the whole no-path establish
+                // timeout from before it did (5 s at every early joiner's
+                // setup). A second dial races it; the loser closes its link.
+                if (why == RACE_ON_INBOUND || why == RACE_ON_ROLL)
+                    && Shared::lock(&shared.racing_dial).insert(peer.clone())
+                {
+                    let s = Arc::clone(shared);
+                    let m = peer.clone();
+                    tokio::spawn(async move {
+                        let ok = dial_leg(&s, &m).await;
+                        Shared::lock(&s.racing_dial).remove(&m);
+                        if ok {
+                            Shared::lock(&s.backoff).remove(&m);
+                            Shared::lock(&s.lost_legs).remove(&m);
+                        }
+                    });
+                    shared.count(crate::observability::AV_LEG_REDIAL_ON_DIRECT_PATH);
+                }
+            }
+            backing_off
+        };
+        if waiting_backoff {
+            Shared::lock(&shared.backoff).remove(&peer);
+            tracing::debug!(
+                peer = %peer,
+                why,
+                "call leg: the member is reachable while the leg waited out a dial backoff; dialling now (G8 C)"
+            );
+            shared.count(crate::observability::AV_LEG_REDIAL_ON_DIRECT_PATH);
+            reconcile_legs(shared);
+        }
+    }
+}
+
+/// G8 serial redial — what [`reconcile_legs`] does with one member that has
+/// no leg and no dial pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedialGate {
+    /// Dial now.
+    Dial,
+    /// Not this tick: the one setup a stalled uplink allows is in flight.
+    Wait,
+    /// Hold the dial for the probe hold.
+    Defer,
+}
+
+/// G8 serial redial, the transitions. Each leg setup pushes the link, the
+/// PQC transit KEX, a hello and ~10 binding parts through this node's uplink
+/// (~1 s of queue at a capped uplink); after a teardown every leg used to
+/// redial at once (the 18.95 s peak).
+/// - verdict latched ∧ legs down → at most ONE setup in flight (the kept
+///   child first: [`reconcile_legs`] orders it first);
+/// - a REDIAL (the leg was had and lost; deferred at most once per loss,
+///   never a first dial) ∧ the member is heard through a relay (every
+///   stream it publishes has a primary other than it) ∧ (verdict latched ∨ this node publishes
+///   nothing, so the leg would carry no media of its own) → redial deferred
+///   by [`alm::STALL_PROBE_HOLD_MS`]: a listener that lost its leg to a
+///   shed publisher pushes no setup through that publisher's queue;
+/// - otherwise dial (an unstalled uplink dials all at once, as before).
+#[allow(clippy::fn_params_excessive_bools)]
+fn redial_gate(
+    stalled: bool,
+    publishing: bool,
+    in_flight: usize,
+    heard_through_relay: bool,
+    redial: bool,
+) -> RedialGate {
+    if redial && heard_through_relay && (stalled || !publishing) {
+        RedialGate::Defer
+    } else if !stalled {
+        RedialGate::Dial
+    } else if in_flight >= 1 {
+        RedialGate::Wait
+    } else {
+        RedialGate::Dial
+    }
+}
+
 /// Dial every member this node has no leg to (and is not already dialling,
 /// and has not just failed to reach).
 fn reconcile_legs(shared: &Arc<Shared>) {
     if shared.ended.load(Ordering::Relaxed) {
         return;
     }
-    let members: Vec<String> = Shared::lock(&shared.members).clone();
+    let mut members: Vec<String> = Shared::lock(&shared.members).clone();
     let now = Instant::now();
+    // G8 serial redial: what the ALM says about this node's uplink and the
+    // members it can already hear through a relay.
+    let (stalled, publishing, kept, relayed): (bool, bool, Vec<String>, Vec<String>) = {
+        let a = Shared::lock(&shared.alm);
+        let kept = a.own_children().into_iter().map(|(p, _)| p).collect();
+        let relayed = members
+            .iter()
+            .filter(|m| {
+                let streams = a.streams_of(m);
+                !streams.is_empty()
+                    && streams
+                        .iter()
+                        .all(|s| a.primary_of(*s).is_some_and(|p| p != **m))
+            })
+            .cloned()
+            .collect();
+        (a.uplink_stalled(), a.publishing(), kept, relayed)
+    };
+    // The kept child first.
+    members.sort_by_key(|m| !kept.contains(m));
+    let mut in_flight = {
+        let dialling = Shared::lock(&shared.dialling);
+        dialling
+            .values()
+            .filter(|u| **u > now + DIAL_BACKOFF_MAX)
+            .count()
+    };
     for m in members {
         if m == shared.own || Shared::lock(&shared.out_legs).contains_key(&m) {
             continue;
@@ -3847,7 +4604,35 @@ fn reconcile_legs(shared: &Arc<Shared>) {
             if dialling.get(&m).is_some_and(|until| *until > now) {
                 continue;
             }
+            // A REDIAL only (this node had a leg to `m` and lost it), and
+            // deferred at most once per loss: a first dial (the call's setup)
+            // is never deferred, nor is the retry after the hold.
+            let redial = Shared::lock(&shared.lost_legs).contains(&m);
+            match redial_gate(stalled, publishing, in_flight, relayed.contains(&m), redial) {
+                RedialGate::Dial => {}
+                RedialGate::Wait => continue,
+                RedialGate::Defer => {
+                    Shared::lock(&shared.lost_legs).remove(&m);
+                    // Heard through a relay: no reason to push a setup
+                    // through this uplink now; try again after the hold.
+                    dialling.insert(
+                        m.clone(),
+                        now + Duration::from_millis(alm::STALL_PROBE_HOLD_MS),
+                    );
+                    shared.count(crate::observability::AV_LEG_REDIAL_DEFERRED);
+                    tracing::debug!(
+                        target: "ciris_edge::c3_fail",
+                        node = %shared.own,
+                        peer = %m,
+                        stalled,
+                        publishing,
+                        "leg redial deferred (heard through a relay)"
+                    );
+                    continue;
+                }
+            }
             dialling.insert(m.clone(), now + Duration::from_hours(1));
+            in_flight += 1;
         }
         let s = Arc::clone(shared);
         tokio::spawn(async move {
@@ -3856,6 +4641,17 @@ fn reconcile_legs(shared: &Arc<Shared>) {
             if ok {
                 dialling.remove(&m);
                 Shared::lock(&s.backoff).remove(&m);
+                Shared::lock(&s.path_up_mid_dial).remove(&m);
+                Shared::lock(&s.lost_legs).remove(&m);
+            } else if Shared::lock(&s.path_up_mid_dial).remove(&m) {
+                // G8 C — the member's direct path came up while this dial was
+                // in flight (it started with no path and failed on that):
+                // dial again now, not after the backoff (measured 12.6 s
+                // with the path already up). Once per path-up.
+                dialling.remove(&m);
+                drop(dialling);
+                s.count(crate::observability::AV_LEG_REDIAL_ON_DIRECT_PATH);
+                reconcile_legs(&s);
             } else {
                 let mut backoff = Shared::lock(&s.backoff);
                 let b = backoff
@@ -3880,16 +4676,41 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     else {
         return false;
     };
-    let link = match shared.transport.open_av_link(member, &address).await {
+    let started = tokio::time::Instant::now();
+    let (dialled, path) = shared
+        .transport
+        .open_av_link_with_path(member, &address)
+        .await;
+    let opened_ms = started.elapsed().as_millis();
+    let link = match dialled {
         Ok(l) => l,
         Err(e) => {
             tracing::debug!(peer = %member, error = %e, "call leg: dial failed (will retry)");
+            if let Some(facts) = &path {
+                shared.path_failed(member, facts);
+            }
             return false;
         }
     };
+    // A punched path the tracker holds names the technique, also for a leg
+    // born on it (which the dial sees as a one-hop neighbour).
+    let via = shared
+        .transport
+        .direct_path_kind(member)
+        .or_else(|| {
+            path.as_ref()
+                .and_then(crate::transport::media_path::DirectPathFacts::via)
+        })
+        .unwrap_or(crate::transport::media_path::PathKind::DirectLan);
     if shared.ended.load(Ordering::Relaxed) {
         let _ = shared.transport.link_teardown(&link.link_id).await;
         return false;
+    }
+    // A racing dial (`racing_dial`) already stood the leg up: this link is
+    // not needed.
+    if Shared::lock(&shared.out_legs).contains_key(member) {
+        let _ = shared.transport.link_teardown(&link.link_id).await;
+        return true;
     }
     let Some(channel_limit) = link.sender.channel_limit() else {
         return false;
@@ -3897,7 +4718,9 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     // The stream hello: the link's first message after the transit KEX.
     let hello = encode_hello(shared.stream());
     let deadline = tokio::time::Instant::now() + HELLO_BUDGET;
-    if let Err(e) = send_patiently(&link.sender, &hello, deadline).await {
+    let hello_sent = send_patiently(&link.sender, &hello, deadline).await;
+    let hello_ms = started.elapsed().as_millis();
+    if let Err(e) = hello_sent {
         tracing::debug!(peer = %member, error = %e, "call leg: hello not sent");
         let _ = shared.transport.link_teardown(&link.link_id).await;
         return false;
@@ -3910,65 +4733,52 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     let link_id = link.link_id;
     let media_ttl = link.sender.media_ttl();
     let leg_inbound = link.inbound;
+    // G8 — the bindings go on the new link BEFORE the publisher lock is
+    // taken: a congested leg waits them out (`send_patiently`, up to the
+    // hello budget), and under the lock that wait held every publish. Under
+    // the lock, what changed meanwhile (a roll, a share, a relayed binding,
+    // CAPS saying v2) is sent too, so no roll lands between the leg's
+    // bindings and the leg joining the roster.
+    let first = leg_binding_wires(shared, member).await;
+    if !send_binding_wires(
+        shared,
+        member,
+        &link.sender,
+        link_id,
+        channel_limit,
+        &first,
+        deadline,
+    )
+    .await
     {
-        // Under the publisher lock, so no roll lands between the binding and
-        // the leg joining the roster: the stream's current binding (and, for a
-        // relay, every binding it holds but the member's own), then the leg.
+        return false;
+    }
+    {
         let mut publisher = shared.publisher.lock().await;
-        // Whether the member's CAPS already came, on the link it dialled
-        // first, and say it takes v2. Then its v2 bindings go here, ahead of
-        // the v1 ones (CC rc18: v2 first), so the framing is known when the
-        // first chunk lands. Read under the publisher lock: CAPS that land
-        // after this read send the v2 bindings themselves
-        // (`send_v2_bindings_to`, which waits for this lock and then finds
-        // the leg).
-        let v2_ok = Shared::lock(&shared.alm).sends_binding_v2_to(member);
-        let camera_live = !shared.primary_ended.load(Ordering::Acquire);
-        let (own_v1, own_v2) = {
-            let k = Shared::lock(&shared.own_key);
-            (Arc::clone(&k.wire), k.wire_v2.clone())
-        };
-        let mut v1: Vec<Arc<Vec<u8>>> = camera_live.then_some(own_v1).into_iter().collect();
-        let mut v2: Vec<Arc<Vec<u8>>> = own_v2
-            .filter(|_| camera_live && v2_ok)
+        let now: Vec<Arc<Vec<u8>>> = leg_binding_wires(shared, member)
+            .await
             .into_iter()
+            .filter(|w| !first.iter().any(|f| f.as_slice() == w.as_slice()))
             .collect();
-        // v45 — and every share's.
-        for share in shared.shares.lock().await.values() {
-            v1.push(Arc::clone(&share.key.wire));
-            v2.extend(share.key.wire_v2.clone().filter(|_| v2_ok));
+        if !send_binding_wires(
+            shared,
+            member,
+            &link.sender,
+            link_id,
+            channel_limit,
+            &now,
+            deadline,
+        )
+        .await
+        {
+            return false;
         }
-        if shared.opts.relay {
-            for w in shared.auth.bindings_except(member, v2_ok) {
-                if StreamKeyBinding::version_of(&w)
-                    == Some(crate::transport::av_chunk_auth::BINDING_VERSION_V2)
-                {
-                    v2.push(w);
-                } else {
-                    v1.push(w);
-                }
-            }
-        }
-        let mut wires = v2;
-        wires.append(&mut v1);
-        for wire in &wires {
-            let parts = StreamKeyBinding::parts(wire, Some(channel_limit));
-            if parts.is_empty() {
-                tracing::warn!(
-                    peer = %member,
-                    channel_limit,
-                    "call leg: the link is too small to carry a stream key binding"
-                );
-                let _ = shared.transport.link_teardown(&link_id).await;
-                return false;
-            }
-            for part in &parts {
-                if let Err(e) = send_patiently(&link.sender, part, deadline).await {
-                    tracing::debug!(peer = %member, error = %e, "call leg: binding not sent");
-                    let _ = shared.transport.link_teardown(&link_id).await;
-                    return false;
-                }
-            }
+        // Two dials to one member can race (`racing_dial`): the one that
+        // finds a leg already standing closes its own link.
+        if Shared::lock(&shared.out_legs).contains_key(member) {
+            drop(publisher);
+            let _ = shared.transport.link_teardown(&link_id).await;
+            return true;
         }
         if let Err(e) = publisher.add_subscriber(AvSubscriberLink {
             subscriber: member.to_owned(),
@@ -3985,15 +4795,16 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         // The binding parts just filled the link's Channel window: the leg
         // settles, so the first chunks retry rather than drop.
         publisher.dispatcher_mut().settle(&member.to_owned());
+        // Under the publisher lock, so a racing dial's check above sees it.
+        Shared::lock(&shared.out_legs).insert(
+            member.to_owned(),
+            OutLeg {
+                link_id,
+                channel_limit,
+                media: Arc::clone(&media_ttl),
+            },
+        );
     }
-    Shared::lock(&shared.out_legs).insert(
-        member.to_owned(),
-        OutLeg {
-            link_id,
-            channel_limit,
-            media: Arc::clone(&media_ttl),
-        },
-    );
     // ALM C5 — media to a peer that takes timed frames rides them; one that
     // takes datagrams (leviculum#102) gets them instead.
     {
@@ -4008,6 +4819,7 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     }
     Shared::lock(&shared.leg_ttl).insert(member.to_owned(), media_ttl);
     Shared::lock(&shared.leg_cong).remove(member);
+    shared.path_up(member, via);
     // ALM C3 — the responder's frames ride this leg's reverse direction.
     tokio::spawn(out_leg_reader(
         Arc::clone(shared),
@@ -4019,8 +4831,82 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         peer = %member,
         link = %hex::encode(link_id),
         channel_limit,
+        opened_ms,
+        hello_ms,
+        up_ms = started.elapsed().as_millis(),
         "call leg UP: this node's stream rides a keyed link to the member (CIRISEdge#805)"
     );
+    true
+}
+
+/// The stream key bindings a new leg to `member` needs now: v2 first where
+/// the member said it parses v2 (CC rc18), then v1; this stream's (while its
+/// camera is live), every share's, and, as a relay, every binding held but
+/// the member's own.
+async fn leg_binding_wires(shared: &Arc<Shared>, member: &str) -> Vec<Arc<Vec<u8>>> {
+    let v2_ok = Shared::lock(&shared.alm).sends_binding_v2_to(member);
+    let camera_live = !shared.primary_ended.load(Ordering::Acquire);
+    let (own_v1, own_v2) = {
+        let k = Shared::lock(&shared.own_key);
+        (Arc::clone(&k.wire), k.wire_v2.clone())
+    };
+    let mut v1: Vec<Arc<Vec<u8>>> = camera_live.then_some(own_v1).into_iter().collect();
+    let mut v2: Vec<Arc<Vec<u8>>> = own_v2
+        .filter(|_| camera_live && v2_ok)
+        .into_iter()
+        .collect();
+    // v45 — and every share's.
+    for share in shared.shares.lock().await.values() {
+        v1.push(Arc::clone(&share.key.wire));
+        v2.extend(share.key.wire_v2.clone().filter(|_| v2_ok));
+    }
+    if shared.relay_on.load(Ordering::Relaxed) {
+        for w in shared.auth.bindings_except(member, v2_ok) {
+            if StreamKeyBinding::version_of(&w)
+                == Some(crate::transport::av_chunk_auth::BINDING_VERSION_V2)
+            {
+                v2.push(w);
+            } else {
+                v1.push(w);
+            }
+        }
+    }
+    let mut wires = v2;
+    wires.append(&mut v1);
+    wires
+}
+
+/// Send `wires` on a new leg's link, part by part, each waiting out
+/// backpressure until `deadline`. A link too small for a binding, or a part
+/// not sent, tears the link down: `false`.
+async fn send_binding_wires(
+    shared: &Arc<Shared>,
+    member: &str,
+    sender: &crate::transport::realtime_av_runtime::LeviculumAvSender,
+    link_id: [u8; 16],
+    channel_limit: usize,
+    wires: &[Arc<Vec<u8>>],
+    deadline: tokio::time::Instant,
+) -> bool {
+    for wire in wires {
+        let parts = StreamKeyBinding::parts(wire, Some(channel_limit));
+        if parts.is_empty() {
+            tracing::warn!(
+                peer = %member,
+                channel_limit,
+                "call leg: the link is too small to carry a stream key binding"
+            );
+            let _ = shared.transport.link_teardown(&link_id).await;
+            return false;
+        }
+        for part in &parts {
+            if let Err(e) = send_patiently(sender, part, deadline).await {
+                tracing::debug!(peer = %member, error = %e, "call leg: binding not sent");
+                let _ = shared.transport.link_teardown(&link_id).await;
+                return false;
+            }
+        }
+    }
     true
 }
 
@@ -4031,11 +4917,17 @@ async fn send_patiently(
     bytes: &[u8],
     deadline: tokio::time::Instant,
 ) -> Result<(), AvDispatcherError> {
+    // From 1 ms, doubling to 25: a refusal is the Channel window (free again
+    // one proof later, a round trip) or its pacing gate (free at rtt/window);
+    // a fixed 25 ms poll made a new leg's bindings (dozens of parts at the
+    // initial window of 2) take ~1 s on loopback, the whole setup's tail.
+    let mut pause = Duration::from_millis(1);
     loop {
         match sender.send(bytes).await {
             Ok(()) => return Ok(()),
             Err(AvDispatcherError::Congested) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_millis(25));
             }
             Err(e) => return Err(e),
         }
@@ -4080,6 +4972,7 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
         return;
     };
     Shared::lock(&shared.in_links).insert(link_id, peer.clone());
+    shared.path_up(&peer, shared.path_kind_of(&peer));
     // ALM C3 — the responder speaks first, on the reverse direction of the
     // link it accepted: a pre-C3 dialler never reads that direction, so the
     // CAPS frame is harmless there, and a C3 dialler answers with its own.
@@ -4090,6 +4983,10 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
         alm.caps_frame(shared.transport.av_datagrams_enabled())
     };
     Shared::lock(&shared.in_senders).insert(peer.clone(), Arc::clone(&sender));
+    Shared::lock(&shared.in_link_senders).insert(link_id, Arc::clone(&sender));
+    // The member reached this node: its call address stands, so a leg back
+    // to it that failed for want of one is dialled now.
+    dial_now_if_backing_off(&shared, &peer, RACE_ON_INBOUND);
     let deadline = tokio::time::Instant::now() + HELLO_BUDGET;
     if send_patiently(&sender, &caps, deadline).await.is_ok() {
         shared.count(crate::observability::ALM_C3_SENT);
@@ -4100,9 +4997,24 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
     if !Shared::lock(&shared.in_links).values().any(|p| *p == peer) {
         Shared::lock(&shared.alm).on_parent_link_down(&peer);
     }
+    Shared::lock(&shared.in_link_senders).remove(&link_id);
+    let other = {
+        let ins = Shared::lock(&shared.in_links);
+        let by_link = Shared::lock(&shared.in_link_senders);
+        ins.iter()
+            .filter(|(_, p)| **p == peer)
+            .find_map(|(l, _)| by_link.get(l).cloned())
+    };
     let mut senders = Shared::lock(&shared.in_senders);
     if senders.get(&peer).is_some_and(|s| Arc::ptr_eq(s, &sender)) {
-        senders.remove(&peer);
+        match other {
+            Some(o) => {
+                senders.insert(peer, o);
+            }
+            None => {
+                senders.remove(&peer);
+            }
+        }
     }
 }
 
@@ -4110,6 +5022,22 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
 /// child, a shed leg and a tier-2 own call still carry.
 fn is_base_or_audio(codec_id: u8, layer: ChunkLayer) -> bool {
     codec_id == crate::transport::realtime_av::CODEC_OPAQUE || layer == ChunkLayer::BASE
+}
+
+/// Row E3 — latched stall verdict ∧ a leg whose media rides the reliable
+/// Channel (no datagram capability yet, e.g. a fresh leg before the peer's
+/// CAPS) → that leg gets no media until it has datagrams: a Channel media
+/// frame on a queued uplink is retransmitted into the same queue. Never on
+/// an unstalled uplink (the Channel fallback serves a pre-datagram peer).
+fn stalled_channel_legs(shared: &Arc<Shared>, legs: &[String]) -> Vec<String> {
+    if !Shared::lock(&shared.alm).uplink_stalled() {
+        return Vec::new();
+    }
+    let ttl = Shared::lock(&shared.leg_ttl);
+    legs.iter()
+        .filter(|l| !ttl.get(*l).is_some_and(|t| t.uses_datagrams()))
+        .cloned()
+        .collect()
 }
 
 /// C1 and C5 on one fan-out's report: every leg's outcome feeds the egress
@@ -4127,6 +5055,10 @@ fn note_leg_outcomes(
     // accepted is all the uplink meter can know it delivered.
     // Lock order: `leg_ttl`, then `alm`, then `leg_cong` (nothing takes
     // `leg_ttl` while holding `alm`).
+    // G8 — a parked chunk is the flusher's to retry, off the publish path.
+    if report.iter().any(|(_, l)| matches!(l, LegSend::Parked)) {
+        shared.parked_wake.notify_one();
+    }
     let ttl = Shared::lock(&shared.leg_ttl);
     let mut alm = Shared::lock(&shared.alm);
     let mut cong = Shared::lock(&shared.leg_cong);
@@ -4175,19 +5107,49 @@ fn note_leg_outcomes(
 /// one, else on the reverse direction of the member's link to this node.
 /// Never to a member that has not said it speaks C3.
 async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
+    // A period's OFFERs to one member go in order on its link, each tried
+    // until the link takes it (OFFER_SEND_WINDOW): back to back, the second
+    // met the Channel's pacing gate (rtt / window) and was refused every
+    // period on every leg (rxmove's baseline trace, uncapped).
+    let mut offers: HashMap<String, Vec<alm::Outgoing>> = HashMap::new();
     for o in out {
         if !Shared::lock(&shared.alm).speaks_c3(&o.to) {
             continue;
         }
+        if is_periodic(&o.frame) {
+            offers.entry(o.to.clone()).or_default().push(o);
+            continue;
+        }
+        // F14a — no offer is held on any leg, backlogged or not: the ~1 s
+        // offer is each leg's fresh Channel message, and leviculum's learned
+        // retry ladder applies only to a message with fresh evidence since
+        // its first send. A held leg went quiet, so the next message on it (a
+        // shed, an admit) ran the cold ladder behind the queue and the link
+        // died (P's kept child, a silent listener, on 9035988aa). Both sides
+        // keep it: P offers its stream on its leg to each member, and every
+        // member offers its own on its leg toward each node, the one it
+        // receives from included. The bulky repeat (the binding re-announce)
+        // is the one held (reannounce_held_legs).
         let refused_by_seam = !is_periodic(&o.frame)
             && shared
                 .test_fail_c3
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok();
-        if refused_by_seam {
-            let s = Arc::clone(shared);
-            tokio::spawn(async move { resend_c3(&s, o).await });
-            continue;
+        // Behind a refused frame to the same member: in order, after it.
+        {
+            let mut pending = Shared::lock(&shared.c3_pending);
+            if let Some(q) = pending.get_mut(&o.to) {
+                q.push_back(o);
+                continue;
+            }
+            if refused_by_seam {
+                let to = o.to.clone();
+                pending.insert(to.clone(), std::collections::VecDeque::from([o]));
+                drop(pending);
+                let s = Arc::clone(shared);
+                tokio::spawn(async move { c3_worker(&s, &to).await });
+                continue;
+            }
         }
         let sent = shared
             .publisher
@@ -4196,42 +5158,168 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             .dispatcher_mut()
             .send_control_to(&o.to, &o.frame)
             .await;
-        let ok = if let Some(LegSend::Sent) = sent {
-            true
+        // Gone, or a leg the dispatcher no longer holds (dial_leg adds it
+        // there before `out_legs`, so this is a real mismatch).
+        if matches!(sent, Some(LegSend::Gone) | None) {
+            out_leg_gone(shared, &o.to);
+        }
+        let (ok, why) = if let Some(LegSend::Sent) = sent {
+            (true, String::new())
         } else {
+            let out_leg = match &sent {
+                None => "no out leg".to_owned(),
+                Some(l) => format!("out leg {l:?}"),
+            };
             let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
             match sender {
-                Some(s) => crate::transport::realtime_av_dispatcher::AvLinkSender::send(
+                Some(s) => match crate::transport::realtime_av_dispatcher::AvLinkSender::send(
                     s.as_ref(),
                     &o.frame,
                 )
                 .await
-                .is_ok(),
-                None => false,
+                {
+                    Ok(()) => (true, String::new()),
+                    Err(e) => (false, format!("{out_leg}; in link {e:?}")),
+                },
+                None => (false, format!("{out_leg}; no in link")),
             }
         };
+        if !ok {
+            tracing::debug!(
+                target: "ciris_edge::c3_fail",
+                node = %shared.own,
+                peer = %o.to,
+                kind = crate::transport::realtime_av_runtime::send_diag::kind_of(&o.frame),
+                why = %why,
+                "C3 send failed"
+            );
+        }
         if ok {
             Shared::lock(&shared.alm).counts.c3_sent += 1;
             shared.count(crate::observability::ALM_C3_SENT);
-        } else if is_periodic(&o.frame) {
-            // The next offer replaces it.
-            shared.count(crate::observability::ALM_C3_SEND_FAILED);
         } else {
             // Everything else changes state on one side only: it must arrive,
             // and it must not hold up the pump or the watch tick waiting.
-            let s = Arc::clone(shared);
-            tokio::spawn(async move { resend_c3(&s, o).await });
+            let to = o.to.clone();
+            let start = {
+                let mut pending = Shared::lock(&shared.c3_pending);
+                if let Some(q) = pending.get_mut(&to) {
+                    q.push_back(o);
+                    false
+                } else {
+                    pending.insert(to.clone(), std::collections::VecDeque::from([o]));
+                    true
+                }
+            };
+            if start {
+                let s = Arc::clone(shared);
+                tokio::spawn(async move { c3_worker(&s, &to).await });
+            }
+        }
+    }
+    for (_, frames) in offers {
+        let s = Arc::clone(shared);
+        tokio::spawn(async move { send_offers_paced(&s, frames).await });
+    }
+}
+
+/// How often, per leg, a verified chunk is passed on to leviculum as peer
+/// evidence (leviculum's own floor is the same 100 ms; this keeps the core
+/// lock off the media path between records).
+const PEER_EVIDENCE_EVERY: Duration = Duration::from_millis(100);
+
+/// Peer evidence, the transition: a chunk edge has JUST verified as signed by
+/// publisher X (its stream key, bound by X's hybrid signature) → for every A/V
+/// link between this node and X's node (the leg this node dialled to X, and
+/// the links X dialled here) note evidence that X's node is alive, at most
+/// once per [`PEER_EVIDENCE_EVERY`] per link. Both arrivals count: on X's own
+/// leg it shows X's node alive and reachable there; through a relay it shows
+/// X alive and publishing, which is enough to stop tearing down a leg to X
+/// (leviculum bounds the hold by the stale time either way). Never on an
+/// unverified chunk, never for the relay that carried it (its own packets
+/// are leviculum's automatic evidence), never under the publisher lock.
+fn note_publisher_evidence(shared: &Arc<Shared>, publisher: &str) {
+    let mut links: Vec<[u8; 16]> = Shared::lock(&shared.out_legs)
+        .get(publisher)
+        .map(|l| l.link_id)
+        .into_iter()
+        .collect();
+    links.extend(
+        Shared::lock(&shared.in_links)
+            .iter()
+            .filter(|(_, p)| p.as_str() == publisher)
+            .map(|(l, _)| *l),
+    );
+    if links.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let due: Vec<[u8; 16]> = {
+        let mut at = Shared::lock(&shared.evidence_at);
+        links
+            .into_iter()
+            .filter(|l| {
+                let fresh = at
+                    .get(l)
+                    .is_none_or(|t| now.duration_since(*t) >= PEER_EVIDENCE_EVERY);
+                if fresh {
+                    at.insert(*l, now);
+                }
+                fresh
+            })
+            .collect()
+    };
+    for l in due {
+        if shared.transport.note_av_peer_evidence(&l) {
+            shared.count(crate::observability::AV_PEER_EVIDENCE_NOTED);
+        }
+    }
+}
+
+/// One member's queue of refused must-arrive frames: the front retried
+/// ([`resend_c3`]) until it goes or is given up, then the next, in order.
+async fn c3_worker(shared: &Arc<Shared>, to: &str) {
+    loop {
+        let front = {
+            let mut pending = Shared::lock(&shared.c3_pending);
+            if let Some(o) = pending.get(to).and_then(|q| q.front().cloned()) {
+                o
+            } else {
+                pending.remove(to);
+                return;
+            }
+        };
+        resend_c3(shared, front).await;
+        let mut pending = Shared::lock(&shared.c3_pending);
+        if let Some(q) = pending.get_mut(to) {
+            q.pop_front();
+            if q.is_empty() {
+                pending.remove(to);
+                return;
+            }
+        } else {
+            return;
         }
     }
 }
 
 /// Retry a C3 frame a congested link refused, until [`C3_RESEND_BUDGET`]
-/// (shorter than a subscriber's request timeout, so a late answer still
-/// counts). Each try is one send: the publisher lock is never held to wait.
+/// or the peer has no link left. An answer that lands after the
+/// subscriber's request timeout is still read: a stale ADMIT is answered
+/// with an UNSUBSCRIBE, which releases the slot. Each try is one send: the
+/// publisher lock is never held to wait.
 async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
     let deadline = tokio::time::Instant::now() + C3_RESEND_BUDGET;
+    let mut pause = C3_RESEND_PAUSE;
     while tokio::time::Instant::now() < deadline && !shared.ended.load(Ordering::Relaxed) {
-        tokio::time::sleep(C3_RESEND_PAUSE).await;
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(C3_RESEND_PAUSE_MAX);
+        // No link to the peer any more: nothing can carry it.
+        let has_link = Shared::lock(&shared.out_legs).contains_key(&o.to)
+            || Shared::lock(&shared.in_senders).contains_key(&o.to);
+        if !has_link {
+            break;
+        }
         let sent = shared
             .publisher
             .lock()
@@ -4239,6 +5327,11 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
             .dispatcher_mut()
             .send_control_to(&o.to, &o.frame)
             .await;
+        // Gone, or a leg the dispatcher no longer holds (dial_leg adds it
+        // there before `out_legs`, so this is a real mismatch).
+        if matches!(sent, Some(LegSend::Gone) | None) {
+            out_leg_gone(shared, &o.to);
+        }
         let mut ok = matches!(sent, Some(LegSend::Sent));
         if !ok {
             let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
@@ -4258,7 +5351,83 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
             return;
         }
     }
+    tracing::debug!(
+        target: "ciris_edge::c3_fail",
+        node = %shared.own,
+        peer = %o.to,
+        kind = crate::transport::realtime_av_runtime::send_diag::kind_of(&o.frame),
+        why = "resend budget spent",
+        "C3 send failed"
+    );
     shared.count(crate::observability::ALM_C3_SEND_FAILED);
+    // An ADMIT nobody heard holds a slot for nothing: release it.
+    Shared::lock(&shared.alm).on_admit_undelivered(&o.to, &o.frame);
+}
+
+/// One send of a C3 frame to `o.to`: its own leg first, else the reverse
+/// direction of the member's link here.
+async fn try_send_c3(shared: &Arc<Shared>, o: &alm::Outgoing) -> bool {
+    let sent = shared
+        .publisher
+        .lock()
+        .await
+        .dispatcher_mut()
+        .send_control_to(&o.to, &o.frame)
+        .await;
+    // Gone, or a leg the dispatcher no longer holds (dial_leg adds it there
+    // before `out_legs`, so this is a real mismatch).
+    if matches!(sent, Some(LegSend::Gone) | None) {
+        out_leg_gone(shared, &o.to);
+    }
+    if matches!(sent, Some(LegSend::Sent)) {
+        return true;
+    }
+    let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
+    match sender {
+        Some(s) => {
+            crate::transport::realtime_av_dispatcher::AvLinkSender::send(s.as_ref(), &o.frame)
+                .await
+                .is_ok()
+        }
+        None => false,
+    }
+}
+
+/// A period's OFFERs to one member, in order: each is tried from a 1 ms
+/// pause doubling to 25 ms until the link takes it, within
+/// [`OFFER_SEND_WINDOW`] of the period's start (the Channel's pacing gate
+/// frees the link rtt / window after the last send; its window, one proof
+/// later). What is still refused then is counted, and the next period's
+/// offer replaces it.
+async fn send_offers_paced(shared: &Arc<Shared>, frames: Vec<alm::Outgoing>) {
+    let deadline = tokio::time::Instant::now() + OFFER_SEND_WINDOW;
+    for o in frames {
+        let mut pause = Duration::from_millis(1);
+        loop {
+            if shared.ended.load(Ordering::Relaxed) {
+                return;
+            }
+            if try_send_c3(shared, &o).await {
+                Shared::lock(&shared.alm).counts.c3_sent += 1;
+                shared.count(crate::observability::ALM_C3_SENT);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::debug!(
+                    target: "ciris_edge::c3_fail",
+                    node = %shared.own,
+                    peer = %o.to,
+                    kind = crate::transport::realtime_av_runtime::send_diag::kind_of(&o.frame),
+                    why = "offer window spent",
+                    "C3 send failed"
+                );
+                shared.count(crate::observability::ALM_C3_SEND_FAILED);
+                break;
+            }
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_millis(25));
+        }
+    }
 }
 
 /// One C3 frame from `peer`. A dialler hearing the responder's CAPS on its
@@ -4318,13 +5487,20 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
         }
     }
     if let Some(caps) = reply {
-        let _ = shared
-            .publisher
-            .lock()
-            .await
-            .dispatcher_mut()
-            .send_control_to(&peer.to_owned(), &caps)
-            .await;
+        // G8 — a congested leg is retried with the publisher let go.
+        for _ in 0..5 {
+            let sent = shared
+                .publisher
+                .lock()
+                .await
+                .dispatcher_mut()
+                .send_control_to(&peer.to_owned(), &caps)
+                .await;
+            if !matches!(sent, Some(LegSend::Failed(AvDispatcherError::Congested))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     send_alm(shared, out).await;
 }
@@ -4362,15 +5538,50 @@ async fn out_leg_reader(
             handle_c3(&shared, &peer, &f.bytes, true).await;
         }
     }
-    // The leg's link closed: unless a fresh leg replaced it, the member holds
-    // no commitment here any more.
-    let replaced = Shared::lock(&shared.out_legs)
+    // The leg's link closed: unless a fresh leg replaced it (or a send
+    // already found it gone), the member holds no commitment here any more.
+    let mine = Shared::lock(&shared.out_legs)
         .get(&peer)
-        .is_some_and(|l| l.link_id != link_id);
-    if !replaced {
-        Shared::lock(&shared.out_legs).remove(&peer);
-        Shared::lock(&shared.alm).on_child_link_down(&peer);
+        .is_some_and(|l| l.link_id == link_id);
+    if mine {
+        leg_lost(&shared, &peer);
     }
+}
+
+/// A send found this node's own leg to `peer` gone (the dispatcher dropped
+/// it: the link is no longer held). The call's legs must say so too: the
+/// dispatcher had forgotten the leg while `out_legs` still listed it, so
+/// [`reconcile_legs`] never redialled and every later answer to `peer` read
+/// "no out leg" and fell to its (congested) in-link — rxmove's come-back
+/// trace, P's ADMITs refused for good.
+fn out_leg_gone(shared: &Arc<Shared>, peer: &str) {
+    if !Shared::lock(&shared.out_legs).contains_key(peer) {
+        return;
+    }
+    shared.count(crate::observability::AV_LEG_GONE_ON_SEND);
+    tracing::debug!(
+        target: "ciris_edge::c3_fail",
+        node = %shared.own,
+        peer = %peer,
+        "own leg gone on send: dropped, to be redialled"
+    );
+    leg_lost(shared, peer);
+}
+
+/// This node's own leg to `peer` is lost: off the call's legs (so it is
+/// redialled), its children's slots released, and — row T1 — a parent
+/// reached on it is lost.
+fn leg_lost(shared: &Arc<Shared>, peer: &str) {
+    Shared::lock(&shared.out_legs).remove(peer);
+    Shared::lock(&shared.lost_legs).insert(peer.to_owned());
+    let mut a = Shared::lock(&shared.alm);
+    a.on_child_link_down(peer);
+    // Row T1 — this node's OWN leg toward a member it receives a stream
+    // from is torn → that parent is lost: fail over now, as when its
+    // media leg closes (the two die together on a congested uplink, but
+    // which close lands first is not ours to pick; waiting for the
+    // other one left a listener on a parent that heard nothing).
+    a.on_parent_link_down(peer);
 }
 
 #[allow(clippy::too_many_lines)] // one linear per-frame sequence: part, open, source check, relay, deliver
@@ -4489,6 +5700,9 @@ async fn pump(
                 continue;
             }
         };
+        // Peer evidence: a chunk verified as signed by `publisher` proves its
+        // node alive now, whichever path carried it.
+        note_publisher_evidence(shared, publisher.as_ref());
         // C1, receiver side: this path delivered this chunk.
         let base_or_audio = is_base_or_audio(signed.codec_id(), signed.layer());
         shared.note_first_frame();
@@ -4543,8 +5757,16 @@ async fn pump(
             },
             at,
         };
-        if shared.heard_tx.send(heard).await.is_err() {
-            break;
+        // No pump ever waits on the host: a frame the reorder stage cannot
+        // take now is dropped and counted, never awaited. A host that stops
+        // reading (a backgrounded app) parked every link's pump here, and
+        // with it the node's control plane and its relaying.
+        match shared.heard_tx.try_send(heard) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                shared.count(crate::observability::AV_FRAME_DROPPED_HOST_NOT_READING);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
 }
@@ -4592,7 +5814,7 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
     if installed {
         on_bound(shared, &binding);
     }
-    if shared.opts.relay && (installed || binding.publisher == peer) {
+    if shared.relay_on.load(Ordering::Relaxed) && (installed || binding.publisher == peer) {
         let mut except = vec![peer.to_owned(), binding.publisher.clone()];
         // A v2 binding goes only to the legs that take v2.
         if binding.version() == crate::transport::av_chunk_auth::BINDING_VERSION_V2 {
@@ -4603,8 +5825,30 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
             // Before the chunks it keys, which this pump forwards next.
             send_binding_paced(shared, &wire, &except, None).await;
         } else {
-            // A publisher's periodic re-send passing through: never in the
-            // way of the chunks queued behind it on this pump.
+            // A publisher's periodic re-send passing through (a repair copy
+            // of a binding every leg already got when it was installed or
+            // set up). The transition: forward it only to this node's
+            // CHILDREN of that stream (the members it forwards the stream
+            // to), never to a leg the re-announce rule holds (uplink stall
+            // verdict, or the leg backlogged). Forwarding every member's
+            // repeat to every other leg made a relaying publisher push each
+            // listener's ~7 KB of bindings through its own capped uplink
+            // every 10 s: the binding_part term of the capped witness's
+            // egress (20-61 kbit/s), the queue that kept growing.
+            let children: Vec<String> = Shared::lock(&shared.alm)
+                .relay_children(binding.stream)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let stalled = Shared::lock(&shared.alm).uplink_stalled();
+            let backlogged = Shared::lock(&shared.backlogged_legs).clone();
+            let legs = shared
+                .publisher
+                .lock()
+                .await
+                .dispatcher_mut()
+                .subscriber_ids();
+            except.extend(repeat_binding_skips(&legs, &children, stalled, &backlogged));
             let s = Arc::clone(shared);
             tokio::spawn(async move {
                 send_binding_paced(&s, &wire, &except, Some(REANNOUNCE_PART_GAP)).await;
@@ -4619,7 +5863,12 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
 /// value reads as queue delay for seconds. The egress meter takes that for
 /// the uplink, on a schedule, so a measured ceiling never goes stale. A
 /// binding nobody lost can arrive half a second later.
-pub const REANNOUNCE_PART_GAP: Duration = Duration::from_millis(50);
+///
+/// G8 pacing: one part per leg per second, so a re-announce trickles
+/// across its period instead of landing as one burst in front of media,
+/// proofs and offers (~10 parts × 2 bindings per leg at the base MTU were
+/// ~3 s of queue on a capped uplink when sent within 0.5 s).
+pub const REANNOUNCE_PART_GAP: Duration = Duration::from_secs(1);
 
 /// Send a binding's parts on every leg but `except`, ONE PART PER HOLD of the
 /// publisher lock. A binding is about ten Channel messages on a base-MTU link;
@@ -4633,21 +5882,37 @@ async fn send_binding_paced(
     except: &[String],
     gap: Option<Duration>,
 ) {
+    // G8 — a congested leg's part is retried (CONTROL_RETRIES, CONTROL_PAUSE
+    // apart) with the publisher let go between tries; the legs that took it
+    // are not sent it again.
+    const CONTROL_RETRIES: u32 = 20;
+    const CONTROL_PAUSE: Duration = Duration::from_millis(10);
     for i in 0.. {
         let more = AtomicBool::new(false);
-        shared
-            .publisher
-            .lock()
-            .await
-            .dispatcher_mut()
-            .send_control_report(except, &|limit| {
-                let part = StreamKeyBinding::parts(wire, limit).into_iter().nth(i);
-                if part.is_some() {
-                    more.store(true, Ordering::Relaxed);
-                }
-                part.into_iter().collect()
-            })
-            .await;
+        let frames_for = |limit: Option<usize>| -> Vec<Vec<u8>> {
+            let part = StreamKeyBinding::parts(wire, limit).into_iter().nth(i);
+            if part.is_some() {
+                more.store(true, Ordering::Relaxed);
+            }
+            part.into_iter().collect()
+        };
+        let mut progress = HashMap::new();
+        for attempt in 0..=CONTROL_RETRIES {
+            let report = shared
+                .publisher
+                .lock()
+                .await
+                .dispatcher_mut()
+                .send_control_from(except, &frames_for, &mut progress)
+                .await;
+            let congested = report
+                .iter()
+                .any(|(_, l)| matches!(l, LegSend::Failed(AvDispatcherError::Congested)));
+            if !congested || attempt == CONTROL_RETRIES {
+                break;
+            }
+            tokio::time::sleep(CONTROL_PAUSE).await;
+        }
         if !more.load(Ordering::Relaxed) {
             return;
         }
@@ -4661,6 +5926,19 @@ async fn send_binding_paced(
 /// Re-send this stream's current binding on every leg (a receiver whose
 /// inbound queue dropped a part gets it again).
 async fn reannounce(shared: &Arc<Shared>) {
+    struct Running<'a>(&'a AtomicBool);
+    impl Drop for Running<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    // G8 pacing — never more than one re-announce in flight: a paced one
+    // can outlast BINDING_REANNOUNCE, and the next round then waits.
+    if shared.reannounce_running.swap(true, Ordering::AcqRel) {
+        shared.count(crate::observability::AV_BINDING_REANNOUNCE_HELD);
+        return;
+    }
+    let _running = Running(&shared.reannounce_running);
     let (wire, wire_v2) = {
         let k = Shared::lock(&shared.own_key);
         (Arc::clone(&k.wire), k.wire_v2.clone())
@@ -4677,16 +5955,95 @@ async fn reannounce(shared: &Arc<Shared>) {
             v2.extend(share.key.wire_v2.clone());
         }
     }
+    // G8 — the transition: re-announce due ∧ (this node's uplink stall
+    // verdict holds ∨ the leg is backlogged) → skip that leg this round
+    // (av_binding_reannounce_held). The re-announce only repeats a binding
+    // the peer already holds (for a part a full inbound queue dropped); on a
+    // queued uplink its ~10 hybrid-signed parts per binding per leg, and
+    // their retransmits, are what kept P's queue from draining after a stall
+    // shed (the capped witness: +5-6 s of queue every 10 s). Never skipped:
+    // a new leg's bindings (dial_leg), an epoch roll's (send_bindings_on), a
+    // v2 upgrade's (send_v2_bindings_to).
+    let held = reannounce_held_legs(shared).await;
+    for _ in &held {
+        shared.count(crate::observability::AV_BINDING_REANNOUNCE_HELD);
+    }
     // v2 first (CC rc18), then v1.
     if !v2.is_empty() {
-        let not_v2 = legs_without_binding_v2(shared).await;
+        let mut not_v2 = legs_without_binding_v2(shared).await;
+        not_v2.extend(held.iter().cloned());
         for w in &v2 {
             send_binding_paced(shared, w, &not_v2, Some(REANNOUNCE_PART_GAP)).await;
         }
     }
     for w in &v1 {
-        send_binding_paced(shared, w, &[], Some(REANNOUNCE_PART_GAP)).await;
+        send_binding_paced(shared, w, &held, Some(REANNOUNCE_PART_GAP)).await;
     }
+}
+
+/// G8 — the legs a relayed periodic binding repeat skips: every leg that is
+/// not this node's child for the stream, and every leg while the uplink
+/// stall verdict holds or the leg is backlogged.
+fn repeat_binding_skips(
+    legs: &[String],
+    children: &[String],
+    stalled: bool,
+    backlogged: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    legs.iter()
+        .filter(|l| !children.contains(*l) || stalled || backlogged.contains(*l))
+        .cloned()
+        .collect()
+}
+
+/// G8 — at most this many re-announce rounds in a row are skipped on one
+/// leg (6 × [`BINDING_REANNOUNCE`] = 60 s): the re-announce repairs a binding
+/// part a receiver's full inbound queue dropped (a new leg gets its bindings
+/// at setup, a roll sends its own, a relay forwards what it verifies), so a
+/// repair may wait out a congested minute, not forever.
+const REANNOUNCE_MAX_SKIPS: u32 = 6;
+
+/// G8 — the legs a periodic re-announce skips now: every leg while this
+/// node's uplink stall verdict holds, else the backlogged ones; never a leg
+/// already skipped [`REANNOUNCE_MAX_SKIPS`] rounds in a row.
+async fn reannounce_held_legs(shared: &Arc<Shared>) -> Vec<String> {
+    let stalled = Shared::lock(&shared.alm).uplink_stalled();
+    let legs = shared
+        .publisher
+        .lock()
+        .await
+        .dispatcher_mut()
+        .subscriber_ids();
+    let backlogged = Shared::lock(&shared.backlogged_legs).clone();
+    let mut skipped = Shared::lock(&shared.reannounce_skipped);
+    skipped.retain(|l, _| legs.contains(l));
+    reannounce_skips(&legs, stalled, &backlogged, &mut skipped)
+}
+
+/// G8 — the pure rule [`reannounce_held_legs`] applies, keeping each leg's
+/// count of rounds skipped in a row.
+fn reannounce_skips(
+    legs: &[String],
+    stalled: bool,
+    backlogged: &std::collections::HashSet<String>,
+    skipped: &mut HashMap<String, u32>,
+) -> Vec<String> {
+    legs.iter()
+        .filter(|l| {
+            let n = skipped.entry((*l).clone()).or_insert(0);
+            // Row B1a: latched verdict → the periodic re-announce is
+            // suspended outright (it is loss repair only; a part lost under
+            // the cap is repaired after it clears). The bound applies to a
+            // backlogged leg on an unstalled uplink.
+            if stalled {
+                return true;
+            }
+            let skip = backlogged.contains(*l) && *n < REANNOUNCE_MAX_SKIPS;
+            *n = if skip { *n + 1 } else { 0 };
+            skip
+        })
+        .cloned()
+        .collect()
 }
 
 /// v45 — each of `links`' Channel watermark now: its newest message's
@@ -4763,7 +6120,7 @@ async fn send_v2_bindings_to(shared: &Arc<Shared>, peer: &str) {
             .values()
             .filter_map(|s| s.key.wire_v2.clone()),
     );
-    if shared.opts.relay {
+    if shared.relay_on.load(Ordering::Relaxed) {
         wires.extend(
             shared
                 .auth
@@ -4832,7 +6189,10 @@ async fn forward(
                 targets.remove(&l);
             }
         }
-        if shared.opts.relay && job.stream == job.link_stream && job.publisher == from {
+        if shared.relay_on.load(Ordering::Relaxed)
+            && job.stream == job.link_stream
+            && job.publisher == from
+        {
             targets.extend(
                 legs.iter()
                     .filter(|l| l.as_str() != from && !alm.speaks_c3(l))
@@ -4849,12 +6209,17 @@ async fn forward(
     if targets.is_empty() {
         return;
     }
-    let exclude: Vec<String> = legs.into_iter().filter(|l| !targets.contains(l)).collect();
+    let mut exclude: Vec<String> = legs
+        .iter()
+        .filter(|l| !targets.contains(*l))
+        .cloned()
+        .collect();
+    exclude.extend(stalled_channel_legs(shared, &legs));
     let wire_len =
         u64::try_from(inner.inner_ciphertext().len() + AV_CHUNK_WIRE_OVERHEAD).unwrap_or(u64::MAX);
     if let Ok(report) = publisher
         .dispatcher_mut()
-        .relay_inner_report(inner, &exclude)
+        .forward_inner_report(inner, &exclude)
         .await
     {
         note_leg_outcomes(shared, publisher.dispatcher_mut(), &report, wire_len, None);
@@ -4862,7 +6227,15 @@ async fn forward(
             .iter()
             .filter(|(_, leg)| matches!(leg, LegSend::Sent))
             .count();
-        Shared::lock(&shared.alm).counts.forwarded += sent as u64;
+        {
+            let mut a = Shared::lock(&shared.alm);
+            a.counts.forwarded += sent as u64;
+            for (child, leg) in &report {
+                if matches!(leg, LegSend::Sent) {
+                    a.note_relayed(child, job.stream, wire_len);
+                }
+            }
+        }
         for _ in 0..sent {
             shared.count(crate::observability::AV_CALL_RELAYED);
         }
@@ -5028,9 +6401,16 @@ async fn reorder_loop(
         if rx_pub.take_due(now) {
             legs::publish_rx(&shared, &mut rx, &mut window, &frames_of, now);
         }
+        // Delivery to the host is lossy by design: a host that is not
+        // reading loses the newest whole frames, counted, and this stage
+        // (and every pump behind it) never waits on it.
         for f in whole {
-            if frames.send(f).await.is_err() {
-                return;
+            match frames.try_send(f) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    shared.count(crate::observability::AV_FRAME_DROPPED_HOST_NOT_READING);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
             }
         }
     }
@@ -5082,7 +6462,53 @@ async fn announce_attendees(shared: &Arc<Shared>) {
             .collect()
     };
     for key_id in fresh {
+        // 45.2.0 — the person's nodes attend with it (a path event names the
+        // node). A failed read leaves the row's own key, as `call_members`.
+        let nodes = shared
+            .owners
+            .nodes_owned_by(&key_id)
+            .await
+            .unwrap_or_default();
+        Shared::lock(&shared.attendee_nodes).extend(nodes);
         shared.emit(CallEvent::AttendeeJoined { key_id });
+    }
+}
+
+/// G8 — retry the chunks settling legs parked, every
+/// [`crate::transport::realtime_av_dispatcher::SETTLE_RETRY`] while any is
+/// parked, each pass one brief hold of the publisher lock (one try per
+/// leg). What a pass replaced or dropped is counted.
+async fn flush_parked_loop(shared: Arc<Shared>) {
+    loop {
+        shared.parked_wake.notified().await;
+        loop {
+            if shared.ended.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::time::sleep(crate::transport::realtime_av_dispatcher::SETTLE_RETRY).await;
+            let (report, more, (replaced, dropped)) = {
+                let mut p = shared.publisher.lock().await;
+                let d = p.dispatcher_mut();
+                let report = d.flush_parked().await;
+                (report, d.has_parked(), d.take_parked_losses())
+            };
+            for (peer, leg) in &report {
+                if matches!(leg, LegSend::Sent) {
+                    shared.count(crate::observability::AV_CHUNK_PARKED_SENT);
+                } else if matches!(leg, LegSend::Gone) {
+                    out_leg_gone(&shared, peer);
+                }
+            }
+            for _ in 0..replaced {
+                shared.count(crate::observability::AV_CHUNK_PARKED_REPLACED);
+            }
+            for _ in 0..dropped {
+                shared.count(crate::observability::AV_CHUNK_DROPPED_CONGESTED);
+            }
+            if !more {
+                break;
+            }
+        }
     }
 }
 
@@ -5091,9 +6517,16 @@ async fn watch_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(WATCH_TICK);
     let mut n: u64 = 0;
     let mut sent_expired: HashMap<[u8; 16], LegCounters> = HashMap::new();
+    let mut unproved: HashMap<[u8; 16], (u16, Instant)> = HashMap::new();
+    let mut roll_failure: Option<(String, Instant)> = None;
     loop {
         tick.tick().await;
         if shared.ended.load(Ordering::Relaxed) {
+            return;
+        }
+        // 45.2.0 — a node that stops carrying call media mid-call ends it.
+        if let Some(token) = shared.transport.media_refused_now() {
+            end_media_refused(&shared, token).await;
             return;
         }
         n = n.wrapping_add(1);
@@ -5104,15 +6537,70 @@ async fn watch_loop(shared: Arc<Shared>) {
             let s = Arc::clone(&shared);
             tokio::spawn(async move { reannounce(&s).await });
         }
-        if let Err(CallError::CallEnded(_)) = roll_if_moved(&shared).await {
-            return;
+        match roll_if_moved(&shared).await {
+            Ok(()) => roll_failure = None,
+            Err(CallError::CallEnded(_)) => return,
+            Err(e) => roll_failed(&shared, &e, &mut roll_failure),
         }
         reconcile_legs(&shared);
         let _ = apply_pending_replace(&shared, false).await;
-        alm_tick(&shared, &mut sent_expired).await;
+        alm_tick(&shared, &mut sent_expired, &mut unproved).await;
         settle_ends(&shared);
         check_lost(&shared);
     }
+}
+
+/// 45.3 — how often one unchanged roll failure is logged again while it
+/// persists (it is counted every tick it happens).
+const ROLL_FAILURE_RELOG: Duration = Duration::from_secs(30);
+
+/// 45.3 — a roll that failed is never silent: counted every tick it fails
+/// (`av_call_roll_failed`), logged once per cause and again every
+/// [`ROLL_FAILURE_RELOG`] while that cause stands. The call stays where it was
+/// and the next tick retries.
+fn roll_failed(shared: &Shared, e: &CallError, last: &mut Option<(String, Instant)>) {
+    shared.count(crate::observability::AV_CALL_ROLL_FAILED);
+    let cause = e.to_string();
+    let now = Instant::now();
+    let repeat = last
+        .as_ref()
+        .is_some_and(|(c, at)| *c == cause && now.duration_since(*at) < ROLL_FAILURE_RELOG);
+    if !repeat {
+        tracing::warn!(
+            room = %shared.room,
+            error = %cause,
+            "call: the roll to the room's epoch failed; the call stays at its epoch and retries \
+             each watch tick (45.3)"
+        );
+        *last = Some((cause, now));
+    }
+}
+
+/// 45.2.0 — end the call because this node no longer carries call media
+/// (`token`): the state reads `Ended(MediaRefused)`, the end is booked once,
+/// every leg and inbound link is torn down and the call's addresses are left.
+async fn end_media_refused(shared: &Arc<Shared>, token: &'static str) {
+    *Shared::lock(&shared.state) = CallState::Ended(EndCause::MediaRefused { token });
+    shared.ended.store(true, Ordering::Relaxed);
+    shared.book_end("media_refused");
+    shared.count(crate::observability::AV_CALL_ENDED_MEDIA_REFUSED);
+    tracing::info!(
+        room = %shared.room,
+        token,
+        "CALL ENDED: this node no longer carries call media (shaped-only or anonymous)"
+    );
+    let legs: Vec<[u8; 16]> = Shared::lock(&shared.out_legs)
+        .drain()
+        .map(|(_, l)| l.link_id)
+        .collect();
+    let ins: Vec<[u8; 16]> = Shared::lock(&shared.in_links)
+        .drain()
+        .map(|(l, _)| l)
+        .collect();
+    for l in legs.iter().chain(ins.iter()) {
+        let _ = shared.transport.link_teardown(l).await;
+    }
+    let _ = shared.lifecycle.leave(&shared.scope, &shared.group_id);
 }
 
 /// A fresh join nonce and the stream id it derives, drawn again on the
@@ -5286,11 +6774,75 @@ struct LegCounters {
     delivered: u64,
 }
 
-async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], LegCounters>) {
+#[allow(clippy::too_many_lines)] // the watch tick's ALM pass, in order
+async fn alm_tick(
+    shared: &Arc<Shared>,
+    sent_expired: &mut HashMap<[u8; 16], LegCounters>,
+    unproved: &mut HashMap<[u8; 16], (u16, Instant)>,
+) {
     let legs: Vec<(String, [u8; 16])> = Shared::lock(&shared.out_legs)
         .iter()
         .map(|(p, l)| (p.clone(), l.link_id))
         .collect();
+    // G8 — how long each leg's oldest unproved Channel message has waited.
+    let now = Instant::now();
+    let mut stalled_legs = 0usize;
+    let mut measurable = 0usize;
+    let mut backlogged: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut worst_ms = 0u64;
+    for (peer, link) in &legs {
+        let st = shared.transport.av_link_stats(link);
+        match st.and_then(|st| st.oldest_unacked_seq) {
+            Some(seq) => {
+                measurable += 1;
+                let (since, carried) = match unproved.get(link) {
+                    Some((s, t)) if *s == seq => (*t, true),
+                    _ => {
+                        unproved.insert(*link, (seq, now));
+                        (now, false)
+                    }
+                };
+                let age = u64::try_from(now.duration_since(since).as_millis()).unwrap_or(u64::MAX);
+                worst_ms = worst_ms.max(age);
+                if age >= alm::UPLINK_STALL_MS {
+                    stalled_legs += 1;
+                }
+                let floor = st.and_then(|st| st.min_rtt_ms).unwrap_or(0);
+                if carried && age.saturating_sub(floor) >= alm::UPLINK_BACKLOG_MS {
+                    backlogged.insert(peer.clone());
+                }
+            }
+            None => {
+                unproved.remove(link);
+            }
+        }
+    }
+    unproved.retain(|l, _| legs.iter().any(|(_, x)| x == l));
+    {
+        let ins: Vec<[u8; 16]> = Shared::lock(&shared.in_links).keys().copied().collect();
+        Shared::lock(&shared.evidence_at)
+            .retain(|l, _| legs.iter().any(|(_, x)| x == l) || ins.contains(l));
+    }
+    let early = backlogged.len() >= alm::UPLINK_STALL_LEGS && backlogged.len() == measurable;
+    let detected = early || stalled_legs >= alm::UPLINK_STALL_LEGS;
+    let rose = {
+        let mut a = Shared::lock(&shared.alm);
+        let was = a.uplink_stalled();
+        a.set_uplink_stall(detected);
+        !was && a.uplink_stalled()
+    };
+    if rose {
+        tracing::info!(
+            node = %shared.own,
+            legs = legs.len(),
+            measurable,
+            backlogged = backlogged.len(),
+            stalled_legs,
+            oldest_unproved_ms = worst_ms,
+            "A/V uplink stall: shedding to one direct child now (G8)"
+        );
+    }
+    *Shared::lock(&shared.backlogged_legs) = backlogged;
     for (peer, link) in &legs {
         let stats = shared.transport.av_link_stats(link);
         let expired = shared.transport.av_link_expired(link).sender;
@@ -5300,6 +6852,11 @@ async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], Leg
         let mut a = Shared::lock(&shared.alm);
         if let Some(st) = stats {
             a.set_leg_queue_ms(peer, st.queue_delay_ms());
+            // Unmeasured is not drained: `min_rtt` is `None` until the link
+            // has a valid sample, and again right after a path move.
+            a.set_leg_busy(peer, st.min_rtt_ms.is_none() || st.tx_ring > 0);
+        } else {
+            a.set_leg_busy(peer, true);
         }
         // §5.1: what the link proved delivered is the uplink meter's rate.
         // A datagram leg proves nothing; its sends count as they leave
@@ -5325,9 +6882,16 @@ async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], Leg
             .filter(|m| (outs.contains_key(m) || ins.contains_key(m)) && a.speaks_c3(m))
             .collect()
     };
-    let (out, events, labels, gaps, commit) = {
+    let seats = shared.transport.serve_seats();
+    let own_is_seat = !alm::CANONICAL_AV_FALLBACK && seats.iter().any(|s| *s == shared.own);
+    let (out, events, labels, gaps, commit, moves) = {
         let mut a = Shared::lock(&shared.alm);
-        let mut out = a.set_tier(tier);
+        a.set_seats(seats);
+        let mut out = a.set_serve_seat(own_is_seat);
+        if own_is_seat {
+            shared.relay_on.store(false, Ordering::Relaxed);
+        }
+        out.extend(a.set_tier(tier));
         out.extend(a.tick(&c3_legs));
         a.book_decisions();
         (
@@ -5336,8 +6900,13 @@ async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], Leg
             std::mem::take(&mut a.labels),
             std::mem::take(&mut a.gaps),
             a.relay_commit_ratio(),
+            std::mem::take(&mut a.parent_moves),
         )
     };
+    for (stream, primary) in moves {
+        shared.on_parent_move(stream, primary.as_deref());
+    }
+    shared.raise_due_path_failures();
     for l in labels {
         shared.count(l);
     }
