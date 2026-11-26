@@ -1918,6 +1918,31 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     // on a layer A is steadily getting.
     let b_stream = cb.stream();
     let view = wait_view_settled(&ca, b_stream).await;
+    // Both ends of a loss gap must lie in one receive view to count. The
+    // frames above may have come before A's first admission (its ADMIT is a
+    // new view): three clean frames handed out in the settled view anchor
+    // the gap's left end in it (45.3; the ADMIT's landing after frame 30 was
+    // a timing accident that once happened to fall the other way).
+    let anchor: Vec<Vec<u8>> = (90..93u64).map(|n| video(n, 3_000).bytes).collect();
+    for n in 90..93u64 {
+        cb.publish(video(n, 3_000)).await.expect("P-frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let mut anchored = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while anchored < anchor.len() {
+            match frames.recv().await {
+                Some(f) if f.publisher == b.key.key_id && anchor.contains(&f.bytes) => {
+                    anchored += 1;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    })
+    .await;
+    assert_eq!(anchored, anchor.len(), "the anchor frames arrive whole");
+    assert_eq!(ca.layer_view(b_stream), view, "in the settled view");
     cb.withhold_from_for_test(&a.key.key_id, 7);
     let mut lossy = Vec::new();
     for n in 100..130u64 {
