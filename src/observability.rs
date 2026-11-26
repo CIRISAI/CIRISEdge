@@ -1162,6 +1162,10 @@ pub const AV_CALL_ROOM_FOLLOWED_STORE: &str = "av_call_room_followed_store";
 /// 45.3 — a call's roll to its room's new epoch failed (the group, the owner
 /// bindings, the stream key or the DEK unreadable); retried every watch tick.
 pub const AV_CALL_ROLL_FAILED: &str = "av_call_roll_failed";
+/// 45.3 — a cached room-group handle could not follow the store's head when
+/// opened (a store fault, a snapshot that will not load): handed out as it
+/// was, counted here.
+pub const AV_CALL_ROOM_REFRESH_FAILED: &str = "av_call_room_refresh_failed";
 /// ALM — a chunk this node forwarded as an admitted media parent.
 pub const ALM_FORWARDED: &str = "alm_forwarded";
 /// ALM C4 — this node's primary parent for a stream changed.
@@ -3059,6 +3063,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_CALL_ENDED_MEDIA_REFUSED,
     AV_CALL_ROOM_FOLLOWED_STORE,
     AV_CALL_ROLL_FAILED,
+    AV_CALL_ROOM_REFRESH_FAILED,
     ALM_FORWARDED,
     ALM_PARENT_CHANGE,
     ALM_RELAY_TIER_ROSTER,

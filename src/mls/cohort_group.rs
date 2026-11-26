@@ -2741,7 +2741,17 @@ pub struct CohortGroups {
     own_key_id: String,
     retained_epochs: u64,
     live: Mutex<HashMap<String, CohortGroup>>,
+    /// 45.3 — where a cached handle's failed refresh is counted
+    /// ([`Self::attach_metrics`]; the Edge attaches its own).
+    metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// 45.3 — the last refresh failure logged per room, and when: one line
+    /// per cause, again every [`REFRESH_FAILURE_RELOG`] while it stands.
+    refresh_failures: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
 }
+
+/// 45.3 — how often one unchanged refresh failure of a cached room handle is
+/// logged again while it persists (it is counted every time).
+const REFRESH_FAILURE_RELOG: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl std::fmt::Debug for CohortGroups {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2777,6 +2787,54 @@ impl CohortGroups {
             own_key_id: own_key_id.into(),
             retained_epochs: retained_epochs.max(1),
             live: Mutex::new(HashMap::new()),
+            metrics: std::sync::OnceLock::new(),
+            refresh_failures: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 45.3 — count this registry's refresh failures in `metrics`
+    /// (`av_plane` `av_call_room_refresh_failed`). The first attach wins; the
+    /// Edge attaches its own when it is handed the registry.
+    pub fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    /// 45.3 — refresh a CACHED handle before it is handed out. A failure
+    /// (a store fault, a head whose snapshot is missing or will not load)
+    /// leaves the handle as it was and is NOT the caller's error: the cached
+    /// handle still works, and refusing it made every open of the room fail
+    /// (boot readdress skipped it, `join_call` failed). It is counted and
+    /// logged once per cause; the call's watch, which calls
+    /// [`CohortGroup::refresh_from_store`] itself, still sees the error.
+    async fn refresh_cached(&self, community_id: &str, handle: &CohortGroup) {
+        let Err(e) = handle.refresh_from_store().await else {
+            return;
+        };
+        if let Some(m) = self.metrics.get() {
+            m.inc_av_plane(crate::observability::AV_CALL_ROOM_REFRESH_FAILED);
+        }
+        let cause = e.to_string();
+        let now = std::time::Instant::now();
+        let log = {
+            let mut seen = self
+                .refresh_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let repeat = seen.get(community_id).is_some_and(|(c, at)| {
+                *c == cause && now.duration_since(*at) < REFRESH_FAILURE_RELOG
+            });
+            if !repeat {
+                seen.insert(community_id.to_owned(), (cause.clone(), now));
+            }
+            !repeat
+        };
+        if log {
+            tracing::warn!(
+                community_id,
+                error = %cause,
+                "cohort group: the cached handle could not follow the store's head; handed \
+                 out as it is (45.3)"
+            );
         }
     }
 
@@ -2791,8 +2849,9 @@ impl CohortGroups {
         if let Some(existing) = live.get(community_id) {
             // 45.3 — a cached handle never answers behind the store's head:
             // another handle on the same store (the host's chat driver holds
-            // its own) may have applied a commit since this one loaded.
-            existing.refresh_from_store().await?;
+            // its own) may have applied a commit since this one loaded. A
+            // refresh that fails still hands out the cached handle.
+            self.refresh_cached(community_id, existing).await;
             return Ok(Some(existing.clone()));
         }
         let Some(handle) =
@@ -2816,7 +2875,7 @@ impl CohortGroups {
         if let Some(existing) = live.get(community_id) {
             // 45.3 — as in `open_existing`: never a handle behind the head,
             // and so never a commit built on an epoch the store left.
-            existing.refresh_from_store().await?;
+            self.refresh_cached(community_id, existing).await;
             return Ok(existing.clone());
         }
         let handle = match CohortGroup::load(self.store.clone(), community_id, self.retained_epochs)
@@ -4720,6 +4779,43 @@ mod tests {
         assert_eq!(held.epoch().await, 2);
         let _ = other.rotate().await.unwrap();
         assert_eq!(edge.open("c-follow").await.unwrap().epoch().await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_cached_handle_whose_refresh_fails_is_still_handed_out_and_counted() {
+        // 45.3 review — a head naming a snapshot that will not load: every
+        // open of the room used to fail although the cached handle worked.
+        let store = open_store();
+        let groups = CohortGroups::with_retention(store.clone(), "node-a", 8);
+        let metrics = crate::observability::EdgeMetrics::default();
+        groups.attach_metrics(metrics.clone());
+        let held = groups.open("c-broken").await.unwrap();
+        store
+            .group_state_put("c-broken", 5, b"not a snapshot")
+            .await
+            .unwrap();
+        store
+            .group_state_put("c-broken", HEAD_SLOT, &encode_head(5))
+            .await
+            .unwrap();
+        assert!(
+            held.refresh_from_store().await.is_err(),
+            "asked directly: the error"
+        );
+        let failed = || {
+            metrics
+                .av_plane
+                .read()
+                .get(crate::observability::AV_CALL_ROOM_REFRESH_FAILED)
+                .copied()
+                .unwrap_or(0)
+        };
+        let again = groups.open_existing("c-broken").await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&again.inner, &held.inner), "the cached handle");
+        assert_eq!(again.epoch().await, 0, "as it was");
+        assert_eq!(failed(), 1, "counted");
+        let _ = groups.open("c-broken").await.unwrap();
+        assert_eq!(failed(), 2, "counted every time");
     }
 
     #[tokio::test]

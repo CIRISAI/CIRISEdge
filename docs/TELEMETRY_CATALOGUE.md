@@ -305,6 +305,11 @@ counts handshakes whose link closed in the queue: they cost no crypto.
    WARN line "the roll to the room's epoch failed" names the cause once, and
    again every 30 s while the same cause stands.
 3. A "CALL ROLLED" INFO line follows each roll, with the epochs.
+4. `av_call_room_refresh_failed` in `av_plane` counts each open of a room
+   whose cached handle could not follow the store's head (a store fault, a
+   snapshot that will not load). The cached handle is handed out as it was;
+   the WARN line "the cached handle could not follow the store's head" names
+   the cause once, and again every 30 s while it stands.
 
 ### What tier is this node in, and who put it there?
 

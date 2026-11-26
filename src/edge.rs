@@ -4815,6 +4815,7 @@ impl Edge {
     /// [`EdgeError::Config`] when the room groups are already set.
     #[cfg(feature = "_reticulum-module")]
     pub fn arm_room_groups(&self, groups: Arc<crate::mls::CohortGroups>) -> Result<(), EdgeError> {
+        groups.attach_metrics(self.metrics.clone());
         self.room_groups.set(groups).map_err(|_| {
             EdgeError::Config("arm_room_groups: the room groups are already set".into())
         })
@@ -9529,7 +9530,10 @@ impl EdgeBuilder {
             },
             #[cfg(feature = "_reticulum-module")]
             room_groups: match self.room_groups {
-                Some(groups) => std::sync::OnceLock::from(groups),
+                Some(groups) => {
+                    groups.attach_metrics(metrics.clone());
+                    std::sync::OnceLock::from(groups)
+                }
                 None => std::sync::OnceLock::new(),
             },
             #[cfg(feature = "_reticulum-module")]
