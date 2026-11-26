@@ -11,6 +11,11 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   a handle whose store has moved on (another handle on the same store applied a commit), the
   call's watch refreshes every tick and rolls, and a roll redials every member. A call that joined
   one epoch behind could never connect. `av_call_roll_failed`, `av_call_room_followed_store`.
+- A publisher with no primary child admits one past RELAY commitments (row S3): the guard was
+  `external_committed == 0`, which a relay standby for another member's stream turned off; the
+  kept-child recovery witness failed about 1 run in 4 on v45.2.0. Own shares keep their room.
+- `CohortGroups::open_existing` / `::open` hand out the cached handle when its refresh fails
+  (logged, counted), not an error.
 - `mod leviculum_link` is gated on the reticulum feature again (v45.2.0 did not compile with
   `transport-http` alone, with `transport-packet-radio` alone, or for the uniffi bindgen build).
 - `NoRouteToPeer` from a derived-address dial reports the path table's own `has_path`.

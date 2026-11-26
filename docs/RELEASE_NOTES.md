@@ -12,6 +12,13 @@ v0.34.0+ciris.4. No migration, no wire change. Detail in CHANGELOG.md.
   call in two minutes. A call now reads the stored group every 250 ms and rolls to it (measured
   under a quarter of a second), then redials every member; a failed roll is counted
   (`av_call_roll_failed`) and logged, never swallowed.
+- **A publisher whose only direct listener is gone takes the next one back, even while it
+  relays for others.** The rule for that case was switched off by any other commitment on the
+  uplink, a relayed standby for another member included, so about one time in four the member
+  that should have been taken back was refused for some 30 s. Relay work no longer blocks it;
+  the publisher's own other streams still keep their room.
+- **A room that cannot be refreshed still opens** from the handle already held (counted and
+  logged), where it would have refused every open.
 - **Every build lane compiles.** v45.2.0's own CI failed four lanes: a feature gate had come off
   the leviculum link module, so a build without the Reticulum transport did not compile. Builds
   that enable it (CIRISServer's) were not affected.
