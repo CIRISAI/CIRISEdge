@@ -1236,6 +1236,76 @@ async fn a_signed_leave_says_why_and_a_killed_node_is_lost_after_the_bound() {
     );
 }
 
+/// **Lost, old-build shape** (45.3): C's call task dies with C's node still
+/// up, still answering on the call's address and routing nothing (a build
+/// before 45.3 dropped a call so; an old peer still does). A redials C after
+/// its leg closes; the dial lands on a node with no live call, which closes
+/// the link, so A holds no leg to C and reads it `Lost` within the bound.
+/// Before 45.3 the router dropped the arrival and left the link up: A held a
+/// leg to nowhere and never read C lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_node_that_answers_but_routes_no_call_is_read_lost_within_the_bound() {
+    use ciris_edge::transport::av_call::{LeaveCause, ATTENDEE_LOST_AFTER};
+    let _call = one_call().await;
+    let tag = "alm2-lost-oldbuild";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, c) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[1], tag, CallOptions::default(), None).await;
+    for x in [&ca, &cc] {
+        wait_legs(x, 1).await;
+        wait_bound(x, 1).await;
+    }
+    let mut events = ca.events().expect("A's events");
+    for seq in 0..10u64 {
+        cc.publish(Frame::opaque(body("c", seq)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let c_stream = cc.stream();
+    // C's legs go, and its call with them; its node stays up on the address.
+    cc.close_leg_for_test(&a.key.key_id).await;
+    let leg = ca.leg_link_for_test(&c.key.key_id);
+    cc.drop_keeping_the_wire_for_test();
+    if let Some(l) = leg {
+        let _ = a.transport.link_teardown(&l).await;
+    }
+    let killed = tokio::time::Instant::now();
+    // The bound: ATTENDEE_LOST_AFTER of no leg and silence, plus a redial
+    // cycle (a dial, the far end's close) and the watch tick.
+    let bound = ATTENDEE_LOST_AFTER + Duration::from_secs(10);
+    let mut seq = 100u64;
+    let lost = tokio::time::timeout(bound, async {
+        loop {
+            let _ = ca.publish(Frame::opaque(body("a", seq))).await;
+            seq += 1;
+            while let Ok(e) = events.try_recv() {
+                if let CallEvent::AttendeeLeft {
+                    key_id,
+                    stream,
+                    cause,
+                    ..
+                } = e
+                {
+                    if key_id == c.key.key_id {
+                        return (stream, cause, killed.elapsed());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("A reads C lost within {bound:?}: legs {:?}", ca.legs()));
+    assert_eq!((lost.0, lost.1), (c_stream, LeaveCause::Lost));
+    assert!(
+        lost.2 >= ATTENDEE_LOST_AFTER,
+        "not before the bound: {:?}",
+        lost.2
+    );
+}
+
 /// **Removed** (v45): the room's MLS group drops C's key; A's call rolls
 /// and reads `AttendeeLeft { C, Removed }`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

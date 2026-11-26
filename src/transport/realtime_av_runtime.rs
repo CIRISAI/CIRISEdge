@@ -1698,6 +1698,13 @@ mod leviculum_link {
             &self.link_id
         }
 
+        /// 45.3 — close the link at the node (its `LinkClosed` event does the
+        /// transport's bookkeeping, as for a close the peer made). Used for a
+        /// peer-opened A/V link no live call on this node takes.
+        pub async fn close(&self) {
+            let _ = self.node.close_link(&self.link_id).await;
+        }
+
         /// The most one Channel message on this link carries (its plaintext,
         /// with room left for the E1 seal), or `None` when leviculum no
         /// longer holds the link.

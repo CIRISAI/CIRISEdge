@@ -1620,8 +1620,17 @@ impl CallRouter {
                     tracing::debug!(
                         peer = %arrival.peer.as_str(),
                         group = ?group,
-                        "A/V link for no live call on this node — dropped (CIRISEdge#805)"
+                        "A/V link for no live call on this node — closed (CIRISEdge#805, 45.3)"
                     );
+                    // 45.3 — closed, never left up: the dialer's leg goes with
+                    // it and its "lost" timing runs. Left up, a dialer held a
+                    // leg to nowhere for ever (a call dropped, an old build, a
+                    // host out of the call). No join race is cut short: a call
+                    // registers here in the same synchronous step that
+                    // installs its addresses (`Call::join`), and an arrival
+                    // exists only after a link to an installed address carried
+                    // its first frame.
+                    tokio::spawn(async move { arrival.sender.close().await });
                 }
             }
         });
@@ -1832,6 +1841,9 @@ struct Shared {
     /// is never booked as lost, and a loss on a layer it was steadily
     /// getting always is.
     layer_views: StdMutex<HashMap<StreamId, u64>>,
+    /// Test seam ([`Call::drop_keeping_the_wire_for_test`]): Drop leaves the
+    /// addresses and links up, as a build before 45.3 did.
+    keep_wire_on_drop: AtomicBool,
     /// v45 — the camera (primary) stream ended while a share went on
     /// (`Call::end_stream_as`): it takes no more frames, and its bindings
     /// are no longer announced.
@@ -2433,6 +2445,10 @@ impl std::fmt::Debug for Call {
     }
 }
 
+/// Dropping a `Call` ends it on this node: its addresses are left and its
+/// legs and in-links closed, with NO signed leave. Its peers therefore read
+/// this attendee `Lost` (after [`ATTENDEE_LOST_AFTER`]), never left; a host
+/// that wants them to read "left" (and why) calls [`Call::leave_with`] first.
 impl Drop for Call {
     fn drop(&mut self) {
         self.shared.ended.store(true, Ordering::Relaxed);
@@ -2440,6 +2456,9 @@ impl Drop for Call {
         self.router.unregister(&self.shared.group_id);
         for t in &self.tasks {
             t.abort();
+        }
+        if self.shared.keep_wire_on_drop.load(Ordering::Relaxed) {
+            return;
         }
         // 45.3 — a dropped call is gone from the wire too: its addresses are
         // left and its links closed, as a media-refused end does. Before, the
@@ -2631,6 +2650,7 @@ impl Call {
             frame_seqs: StdMutex::new(HashMap::new()),
             frames_lost: Arc::new(StdMutex::new(BTreeMap::new())),
             layer_views: StdMutex::new(HashMap::new()),
+            keep_wire_on_drop: AtomicBool::new(false),
             primary_ended: AtomicBool::new(false),
             shares: Mutex::new(BTreeMap::new()),
             registrar: share_registrar,
@@ -3192,6 +3212,16 @@ impl Call {
     #[doc(hidden)]
     pub fn withhold_forward_for_test(&self, member: &str, every: u64) {
         *Shared::lock(&self.shared.test_withhold_forward) = Some((member.to_owned(), every));
+    }
+
+    /// Test seam: drop this call the way a build before 45.3 did, or a host
+    /// whose call task died with the node still up: the router no longer
+    /// takes its links, but its addresses stay installed and its links open
+    /// (the node still answers on the call's address and routes nothing).
+    #[doc(hidden)]
+    pub fn drop_keeping_the_wire_for_test(self) {
+        self.shared.keep_wire_on_drop.store(true, Ordering::Relaxed);
+        drop(self);
     }
 
     /// Test seam: close this node's leg to `member` and leave it down, as a
