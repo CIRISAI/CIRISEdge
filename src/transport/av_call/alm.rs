@@ -343,6 +343,10 @@ pub(super) struct AlmState {
     /// [`UPLINK_STALL_LATCH_MS`] past it (the stalled legs' links can die,
     /// and their detection with them, before the queue has drained).
     uplink_stall_seen_ms: Option<u64>,
+    /// 45.3 row DR — [`UplinkDrain`].
+    drain: UplinkDrain,
+    /// Test seam: rows DR, STALE and AGE off (the backlog is still read).
+    drain_off_for_test: bool,
     /// G8 — frames made between ticks (the shed on a stall's rise), sent
     /// with the next tick's.
     pending_out: Vec<Outgoing>,
@@ -386,6 +390,116 @@ pub(super) const UPLINK_BACKLOG_MS: u64 = 200;
 /// G8 — how long a stall verdict holds after its last detection: about the
 /// time a shed publisher's queue takes to drain the backlog its legs saw.
 pub(super) const UPLINK_STALL_LATCH_MS: u64 = 2_000;
+
+/// 45.3 row DR (drain) — the uplink is BACKLOGGED, and this node sends only
+/// what a call cannot do without, once the oldest unproved Channel message on
+/// its kept leg(s) has waited this long past the leg's RTT floor: the stall
+/// verdict's own bound ([`UPLINK_STALL_MS`]), so the drain starts with the
+/// shed.
+pub(super) const DRAIN_ENTER_MS: u64 = UPLINK_STALL_MS;
+/// 45.3 row DR — the backlog is gone once that age stays under this
+/// ([`UPLINK_BACKLOG_MS`], the verdict's backlog bound) for
+/// [`DRAIN_CLEAR_MS`].
+pub(super) const DRAIN_LEAVE_MS: u64 = UPLINK_BACKLOG_MS;
+/// 45.3 row DR — how long the backlog must read clear before media resumes:
+/// four watch ticks, so one quick proof is not a drained queue.
+pub(super) const DRAIN_CLEAR_MS: u64 = 1_000;
+
+/// **45.3 row DR — the drain.** Transition: observable, the uplink backlog
+/// (the oldest unproved Channel message's age past its leg's RTT floor on
+/// the kept leg(s), from its SEND, measured each watch tick; `None` when no
+/// message is outstanding, which reads as drained); state, whether media is
+/// withheld; action, enter at [`DRAIN_ENTER_MS`], leave once the backlog
+/// has read under [`DRAIN_LEAVE_MS`] for [`DRAIN_CLEAR_MS`]; must never,
+/// withhold control (the rule is applied to media sends only), or leave on a
+/// timer while the backlog still reads high.
+#[derive(Debug, Default, Clone)]
+pub(super) struct UplinkDrain {
+    active: bool,
+    clear_since: Option<u64>,
+    backlog_ms: Option<u64>,
+}
+
+impl UplinkDrain {
+    /// Fold one tick's backlog reading at `now`. `Some(true)`: the drain
+    /// began this tick; `Some(false)`: it ended; `None`: no change.
+    pub(super) fn observe(&mut self, now: u64, backlog_ms: Option<u64>) -> Option<bool> {
+        self.backlog_ms = backlog_ms;
+        let b = backlog_ms.unwrap_or(0);
+        if !self.active {
+            if b >= DRAIN_ENTER_MS {
+                self.active = true;
+                self.clear_since = None;
+                return Some(true);
+            }
+            return None;
+        }
+        if b < DRAIN_LEAVE_MS {
+            let since = *self.clear_since.get_or_insert(now);
+            if now.saturating_sub(since) >= DRAIN_CLEAR_MS {
+                self.active = false;
+                self.clear_since = None;
+                return Some(false);
+            }
+        } else {
+            self.clear_since = None;
+        }
+        None
+    }
+
+    /// Whether media is withheld now.
+    pub(super) fn active(&self) -> bool {
+        self.active
+    }
+
+    /// The last backlog reading (ms past the floor), `None` when nothing was
+    /// outstanding.
+    pub(super) fn backlog_ms(&self) -> Option<u64> {
+        self.backlog_ms
+    }
+}
+
+/// 45.3 row DR — when each Channel message on one leg left: the watch tick's
+/// reading of the leg's newest sent sequence, `(call ms, last_sent_seq)`.
+/// The oldest unproved message was sent no later than the first tick whose
+/// reading reached it, so its age is known to within a tick FROM ITS SEND.
+/// (The stall verdict ages it from the first tick it was the oldest, which
+/// restarts every time an older one is proved: under a standing queue proofs
+/// keep coming, and that age stays near zero however deep the queue is.)
+#[derive(Debug, Default, Clone)]
+pub(super) struct SendClock {
+    marks: std::collections::VecDeque<(u64, u16)>,
+}
+
+/// `a` is `b` or after it, on the Channel's wrapping 16-bit sequence.
+fn seq_at_or_after(a: u16, b: u16) -> bool {
+    a.wrapping_sub(b) < 0x8000
+}
+
+impl SendClock {
+    /// The most readings kept (a minute of ticks).
+    const MAX_MARKS: usize = 240;
+
+    /// This tick's reading of the leg's newest sent sequence.
+    pub(super) fn note(&mut self, now_ms: u64, last_sent: u16) {
+        if self.marks.back().is_none_or(|(_, s)| *s != last_sent) {
+            self.marks.push_back((now_ms, last_sent));
+            while self.marks.len() > Self::MAX_MARKS {
+                self.marks.pop_front();
+            }
+        }
+    }
+
+    /// How long ago the message `oldest` left (ms), at least: from the first
+    /// reading at or past it. Readings before it are dropped (proved). A
+    /// message older than every reading is aged from the oldest reading.
+    pub(super) fn age_of(&mut self, now_ms: u64, oldest: u16) -> Option<u64> {
+        while self.marks.len() > 1 && !seq_at_or_after(self.marks[0].1, oldest) {
+            self.marks.pop_front();
+        }
+        self.marks.front().map(|(t, _)| now_ms.saturating_sub(*t))
+    }
+}
 
 /// **The canonical audio fallback lever** (`FSD/CIRIS_MESH.md` §6.4; Eric
 /// 2026-11-21: no traffic on the canonical, audio included, while the mesh
@@ -473,6 +587,8 @@ impl AlmState {
             relayed: BTreeMap::new(),
             uplink_stall: false,
             uplink_stall_seen_ms: None,
+            drain: UplinkDrain::default(),
+            drain_off_for_test: false,
             pending_out: Vec::new(),
             offered_at: BTreeMap::new(),
             own_published_ms: BTreeMap::new(),
@@ -492,6 +608,46 @@ impl AlmState {
     /// G8 — whether the stall verdict holds now (detected, or latched).
     pub(super) fn uplink_stalled(&self) -> bool {
         self.uplink_stall
+    }
+
+    /// 45.3 row DR — fold this tick's uplink backlog reading ([`UplinkDrain`]).
+    pub(super) fn observe_uplink_backlog(&mut self, backlog_ms: Option<u64>) -> Option<bool> {
+        let now = self.now_ms();
+        if self.drain_off_for_test {
+            self.drain = UplinkDrain::default();
+            self.drain.backlog_ms = backlog_ms;
+            return None;
+        }
+        let changed = self.drain.observe(now, backlog_ms);
+        if changed == Some(true) {
+            self.label(crate::observability::ALM_DRAIN_ENTERED);
+        }
+        changed
+    }
+
+    /// Test seam: turn rows DR, STALE and AGE off (`true`) or back on.
+    pub(super) fn set_drain_off_for_test(&mut self, off: bool) {
+        self.drain_off_for_test = off;
+    }
+
+    /// 45.3 row DR — whether this node withholds media now.
+    pub(super) fn draining(&self) -> bool {
+        self.drain.active()
+    }
+
+    /// 45.3 row DR — the last uplink backlog reading.
+    pub(super) fn uplink_backlog_ms(&self) -> Option<u64> {
+        self.drain.backlog_ms()
+    }
+
+    /// 45.3 row DR — who the backlog is read on: the members this node's own
+    /// stream goes to as a primary (the kept child after a shed).
+    pub(super) fn kept_legs(&self) -> Vec<String> {
+        self.own_children()
+            .into_iter()
+            .filter(|(_, r)| *r == Role::Primary)
+            .map(|(p, _)| p)
+            .collect()
     }
 
     /// G8 — whether this watch tick DETECTED this node's uplink stalled (the
@@ -2097,26 +2253,7 @@ impl AlmState {
         // hold-back: 5 s on every leg made a dead listener noticed ~4 s late.
         if now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0 {
             self.last_offer_ms = now.max(1);
-            let mut own_offer = self.own.offer();
-            // The publisher's upstream latency is its own uplink queue: what
-            // a child admitted now waits for its first chunk (the child's
-            // selector owes a new subscription that much before calling it
-            // silent).
-            let queued = self
-                .leg_queue_ms
-                .values()
-                .copied()
-                .fold(0.0_f64, f64::max)
-                .clamp(0.0, f64::from(u32::MAX));
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            {
-                own_offer.upstream_latency_ms =
-                    own_offer.upstream_latency_ms.max(queued.round() as u32);
-            }
-            own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
-            own_offer.forwarder_headroom_bps =
-                self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
-            let own_frame = encode(self.own_stream, &ControlMsg::Offer(own_offer));
+            let own_frame = self.own_offer_frame();
             let share_frames: Vec<Vec<u8>> = self
                 .shares
                 .iter()
@@ -2221,6 +2358,27 @@ impl AlmState {
             }
         }
 
+        // 45.3 row DR — while media is withheld the backlog must stay
+        // visible: an outstanding Channel message on each kept leg every
+        // watch tick (the own stream's OFFER, the message the leg already
+        // carries each second), or a queue under a second would read as
+        // "nothing outstanding", i.e. drained, between offers.
+        if self.drain.active() {
+            let frame = self.own_offer_frame();
+            for peer in self.kept_legs() {
+                if c3_legs.contains(&peer)
+                    && !out
+                        .iter()
+                        .any(|o| o.to == peer && wire::is_periodic(&o.frame))
+                {
+                    out.push(Outgoing {
+                        to: peer,
+                        frame: frame.clone(),
+                    });
+                }
+            }
+        }
+
         // Calls cut — a relay turned off keeps forwarding to its draining
         // children until each unsubscribes or its drain passes; then the
         // emptied admission goes.
@@ -2247,6 +2405,29 @@ impl AlmState {
             self.relay_status_pending = Some(status);
         }
         out
+    }
+
+    /// The own stream's OFFER as this node sends it now: its upstream
+    /// latency is its own uplink queue (what a child admitted now waits for
+    /// its first chunk; the child's selector owes a new subscription that
+    /// much before calling it silent), its headroom in nominal units.
+    fn own_offer_frame(&self) -> Vec<u8> {
+        let mut own_offer = self.own.offer();
+        let queued = self
+            .leg_queue_ms
+            .values()
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .clamp(0.0, f64::from(u32::MAX));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            own_offer.upstream_latency_ms =
+                own_offer.upstream_latency_ms.max(queued.round() as u32);
+        }
+        own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
+        own_offer.forwarder_headroom_bps =
+            self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
+        encode(self.own_stream, &ControlMsg::Offer(own_offer))
     }
 
     /// RM2 — ReceiverMoves, once a watch tick for each received stream: a
@@ -2482,6 +2663,64 @@ mod tests {
 
     fn s(b: u8) -> StreamId {
         StreamId([b; 32])
+    }
+
+    /// 45.3 row DR — the drain enters at the stall bound, holds while the
+    /// backlog reads high (however long: no timer ends it), and leaves only
+    /// after a full second under the leave bound; a reading back over the
+    /// leave bound restarts that second; "nothing outstanding" is drained.
+    #[test]
+    fn the_drain_enters_at_400_ms_and_leaves_after_a_second_under_200() {
+        let mut d = UplinkDrain::default();
+        assert_eq!(d.observe(0, Some(DRAIN_ENTER_MS - 1)), None);
+        assert!(!d.active());
+        assert_eq!(d.observe(250, Some(DRAIN_ENTER_MS)), Some(true));
+        // A deep backlog for a minute: still draining.
+        for t in (500..60_000).step_by(250) {
+            assert_eq!(d.observe(t, Some(9_000)), None);
+        }
+        assert!(d.active());
+        // Under the leave bound, but not for a second yet.
+        assert_eq!(d.observe(60_000, Some(DRAIN_LEAVE_MS - 1)), None);
+        assert_eq!(d.observe(60_750, Some(10)), None);
+        // One reading back over the leave bound restarts the second.
+        assert_eq!(d.observe(60_900, Some(DRAIN_LEAVE_MS)), None);
+        assert_eq!(d.observe(61_000, None), None);
+        assert_eq!(d.observe(61_750, None), None);
+        assert_eq!(d.observe(62_000, Some(0)), Some(false));
+        assert!(!d.active());
+        // Between the bounds it neither enters nor leaves.
+        assert_eq!(d.observe(62_250, Some(300)), None);
+        assert!(!d.active());
+    }
+
+    /// 45.3 row DR — the oldest unproved message is aged from its SEND, not
+    /// from when it became the oldest: under a standing queue proofs keep
+    /// arriving (the oldest changes every tick) and the age stays the
+    /// queue's depth. Wraps with the Channel's 16-bit sequence.
+    #[test]
+    fn a_send_clock_ages_the_oldest_unproved_message_from_its_send() {
+        let mut c = SendClock::default();
+        // One message a tick, each proved ~9 s (36 ticks) later.
+        let mut ages = Vec::new();
+        for k in 0u64..120 {
+            let now = k * 250;
+            let last = u16::try_from((65_500 + k) % 65_536).unwrap();
+            c.note(now, last);
+            let oldest = u16::try_from((65_500 + k.saturating_sub(36)) % 65_536).unwrap();
+            ages.push(c.age_of(now, oldest).unwrap());
+        }
+        assert!(ages[60..].iter().all(|a| *a == 9_000), "{:?}", &ages[60..]);
+        // The same queue drains: the oldest is the message just sent.
+        let mut c = SendClock::default();
+        c.note(0, 7);
+        c.note(250, 8);
+        assert_eq!(c.age_of(500, 8), Some(250));
+        assert_eq!(
+            c.age_of(500, 9),
+            Some(250),
+            "past every reading: the newest"
+        );
     }
 
     fn roster() -> Vec<String> {

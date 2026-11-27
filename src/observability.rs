@@ -1114,6 +1114,9 @@ pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
 /// G8 — this node's uplink stalled: its legs' Channels held messages
 /// unproved past `UPLINK_STALL_MS` on two legs or more. Counted on the rise.
 pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
+/// 45.3 row DR — this node's uplink read backlogged and it began withholding
+/// media but audio until the backlog drains (once per episode).
+pub const ALM_DRAIN_ENTERED: &str = "alm_drain_entered";
 /// G8 — a periodic offer not sent on a leg whose oldest unproved Channel
 /// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
 /// queue behind the backlog and spend that link's retry budget.
@@ -3047,6 +3050,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_SHED,
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
+    ALM_DRAIN_ENTERED,
     ALM_OFFER_HELD_BACKLOG,
     ALM_DEPARTURE_CONGESTION,
     ALM_LATE_MOVE,
@@ -5601,6 +5605,7 @@ impl EdgeMetrics {
             direct_link_proposing: t.direct_link_proposing,
             alm_active_calls: t.alm_active_calls,
             alm_c3_peers: t.alm_c3_peers,
+            alm_uplink_backlog_ms: t.alm_uplink_backlog_ms,
             decision_row_unheard_total: t.decision_row_unheard_total,
             decision_row_subscribers: t.decision_row_subscribers,
             group_backfill_rows_read_total: t.group_backfill_rows_read_total,
@@ -6095,6 +6100,8 @@ pub struct EdgeMetricsBundle {
     pub alm_active_calls: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub alm_c3_peers: u64,
+    /// 45.3 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_uplink_backlog_ms: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub decision_row_unheard_total: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -6632,6 +6639,7 @@ impl EdgeMetricsBundle {
             ("direct_link_proposing", self.direct_link_proposing),
             ("alm_active_calls", self.alm_active_calls),
             ("alm_c3_peers", self.alm_c3_peers),
+            ("alm_uplink_backlog_ms", self.alm_uplink_backlog_ms),
             ("decision_row_subscribers", self.decision_row_subscribers),
             (
                 "group_backfill_rows_read_total",
@@ -6840,6 +6848,7 @@ edge_metrics_bundle_fields!(
     direct_link_proposing,
     alm_active_calls,
     alm_c3_peers,
+    alm_uplink_backlog_ms,
     decision_row_unheard_total,
     decision_row_subscribers,
     group_backfill_rows_read_total,

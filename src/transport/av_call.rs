@@ -134,6 +134,7 @@ pub use alm::{AlmCounts, AlmParents, RelayedTo, CANONICAL_AV_FALLBACK};
 /// (oldest first) before it is opened: twice [`REORDER_WINDOW_MAX`], past
 /// which the reorder window would skip it anyway.
 pub const MEDIA_STALE_BUDGET: Duration = Duration::from_millis(800);
+
 /// ALM C5 — consecutive congested sends before a leg is shed to the base
 /// layer.
 const LEG_SHED_AFTER: u32 = 3;
@@ -1890,6 +1891,8 @@ struct Shared {
     /// ALM C5 — the oldest frame age seen in the inbound queues this window
     /// (ms), for the ladder's `edge:av_queue_age` signal.
     queue_age_ms: AtomicU64,
+    /// 45.3 row DR — each out leg's [`alm::SendClock`].
+    send_clocks: StdMutex<HashMap<[u8; 16], alm::SendClock>>,
     /// G8 — rung when a fan-out parks a chunk: the flusher retries it with
     /// the publisher lock taken briefly, never inside `publish`.
     parked_wake: tokio::sync::Notify,
@@ -2674,6 +2677,7 @@ impl Call {
             own_share_codecs: StdMutex::new(HashMap::new()),
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
+            send_clocks: StdMutex::new(HashMap::new()),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
             evidence_at: StdMutex::new(HashMap::new()),
@@ -2944,6 +2948,21 @@ impl Call {
     #[must_use]
     pub fn service_tier(&self) -> crate::load_ladder::ServiceTier {
         Shared::lock(&self.shared.alm).tier()
+    }
+
+    /// Test seam: rows DR, STALE and AGE off (the bench's baseline).
+    #[doc(hidden)]
+    pub fn set_drain_off_for_test(&self, off: bool) {
+        Shared::lock(&self.shared.alm).set_drain_off_for_test(off);
+    }
+
+    /// 45.3 row DR — whether this call withholds media but audio now (its
+    /// uplink reads backlogged), and the last backlog reading (ms past the
+    /// RTT floor, `None` when nothing was outstanding).
+    #[must_use]
+    pub fn uplink_drain(&self) -> (bool, Option<u64>) {
+        let a = Shared::lock(&self.shared.alm);
+        (a.draining(), a.uplink_backlog_ms())
     }
 
     /// Every leg this node has, with what carries it (a punched direct UDP
@@ -4081,6 +4100,66 @@ async fn send_pieces(
         }
     }
     Ok(outcome.into_iter().collect())
+}
+
+/// 45.3 row DR — read the uplink backlog this tick and fold it into the
+/// drain: per leg, the oldest unproved Channel message's age FROM ITS SEND
+/// ([`alm::SendClock`]) past the leg's RTT floor; the reading is the LEAST
+/// over every leg with something outstanding, and only with at least
+/// [`alm::UPLINK_STALL_LEGS`] of them (the stall verdict's rule). A leg's
+/// age is a round trip: it reads high when THIS node's uplink queues, and
+/// equally when the PEER's does (its proofs wait behind its own queue), so
+/// one slow leg is that peer, and only a backlog every leg sees is this
+/// node's uplink. (Reading the kept leg alone, every member of a room whose
+/// publisher was capped read the publisher's queue as its own and drained.)
+/// `None` when fewer legs than that have anything outstanding.
+fn uplink_backlog(shared: &Arc<Shared>, legs: &[(String, [u8; 16])]) {
+    let now = Shared::lock(&shared.alm).now_ms();
+    let mut all_ages: Vec<u64> = Vec::new();
+    {
+        let mut clocks = Shared::lock(&shared.send_clocks);
+        clocks.retain(|l, _| legs.iter().any(|(_, x)| x == l));
+        for (_, link) in legs {
+            let Some(st) = shared.transport.av_link_stats(link) else {
+                continue;
+            };
+            let clock = clocks.entry(*link).or_default();
+            if let Some(last) = st.last_sent_seq {
+                clock.note(now, last);
+            }
+            let Some(oldest) = st.oldest_unacked_seq else {
+                continue;
+            };
+            let Some(age) = clock.age_of(now, oldest) else {
+                continue;
+            };
+            all_ages.push(age.saturating_sub(st.min_rtt_ms.unwrap_or(0)));
+        }
+    }
+    // Entering needs the uplink's verdict (every leg, at least two). Once
+    // draining, the kept leg's own reading counts alone: it carries an
+    // outstanding message every tick, while the other legs' offers are at
+    // the liveness minimum and go unmeasured as the queue shrinks.
+    let draining = Shared::lock(&shared.alm).draining();
+    let reading = if all_ages.len() >= alm::UPLINK_STALL_LEGS || (draining && !all_ages.is_empty())
+    {
+        all_ages.into_iter().min()
+    } else {
+        None
+    };
+    let changed = Shared::lock(&shared.alm).observe_uplink_backlog(reading);
+    if let Some(m) = &shared.metrics {
+        m.telemetry.set_uplink_backlog_ms(reading.unwrap_or(0));
+    }
+    match changed {
+        Some(true) => tracing::info!(
+            node = %shared.own,
+            backlog_ms = reading.unwrap_or(0),
+            "A/V uplink backlogged (45.3)"
+        ),
+        Some(false) => tracing::info!(node = %shared.own, "A/V uplink drained (45.3)"),
+        None => {}
+    }
 }
 
 /// One own chunk, sealed and signed, out on the primary publisher's legs
@@ -6818,6 +6897,7 @@ async fn alm_tick(
         }
     }
     unproved.retain(|l, _| legs.iter().any(|(_, x)| x == l));
+    uplink_backlog(shared, &legs);
     {
         let ins: Vec<[u8; 16]> = Shared::lock(&shared.in_links).keys().copied().collect();
         Shared::lock(&shared.evidence_at)

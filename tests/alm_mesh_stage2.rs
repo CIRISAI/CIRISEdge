@@ -6381,6 +6381,8 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
     }
     for c in &calls {
         wait_legs(c, n - 1).await;
+        // The bench's no-drain baseline, on demand.
+        c.set_drain_off_for_test(std::env::var_os("W_NO_DRAIN").is_some());
     }
     // Both bindings from every member (v2 carries the framing).
     for c in &calls {
@@ -6494,7 +6496,7 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
                         c.legs().len(),
                         c.alm_own_children().len(),
                         c.relayed_to().len(),
-                        format!("{:?}", c.service_tier()),
+                        format!("{:?} drain {:?}", c.service_tier(), c.uplink_drain()),
                     ));
                 }
                 if seq.is_multiple_of(8) {

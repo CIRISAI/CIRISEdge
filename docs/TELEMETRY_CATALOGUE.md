@@ -295,6 +295,14 @@ counts handshakes whose link closed in the queue: they cost no crypto.
 7. `Call.alm_log()` in Python returns the hash, the count and the tail while the
    call lives. The tail names peers: it is for the owner's session only.
 
+### Does this node read its uplink as backlogged?
+
+1. `alm_uplink_backlog_ms` is the uplink backlog this node reads on its legs:
+   the oldest unproved Channel message, aged from its send, past the leg's
+   RTT floor, least over every leg (one slow peer is not the uplink).
+2. `alm_drain_entered` counts backlog episodes (400 ms in, under 200 ms for
+   a second out).
+
 ### Why is this call at another epoch than its room?
 
 1. A call runs at its room group's stored head (45.3). Each watch tick (250 ms)
@@ -606,6 +614,7 @@ address.
 | `direct_link_proposing` | `ciris.edge.direct_link.proposing` | gauge | count | operator-only |
 | `alm_active_calls` | `ciris.edge.alm.active_calls` | gauge | count | operator-only |
 | `alm_c3_peers` | `ciris.edge.alm.c3_peers` | gauge | count | operator-only |
+| `alm_uplink_backlog_ms` | `ciris.edge.alm.uplink_backlog` | gauge | milliseconds | operator-only |
 | `decision_row_unheard_total` | `ciris.edge.decision_row.unheard` | counter | count | operator-only |
 | `decision_row_subscribers` | `ciris.edge.decision_row.subscribers` | gauge | count | operator-only |
 | `group_backfill_rows_read_total` | `ciris.edge.group_backfill.rows_read` | counter | count | operator-only |
