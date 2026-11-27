@@ -696,6 +696,14 @@ impl AlmState {
     /// Offers keep their cadence (row D1): only a BACKLOGGED leg's offer is
     /// held, at the send (`alm_offer_held:backlog`).
     pub(super) fn set_uplink_stall(&mut self, detected: bool) {
+        // 45.3 — a draining uplink (row DR) is a stalled one. The verdict's
+        // own age restarts each time an older message is proved, so under a
+        // STANDING queue it stops detecting within seconds and every stall
+        // behaviour (one direct child, standbys get nothing, the offers to
+        // non-children at the liveness minimum, the probe held) lapsed with
+        // the queue still full: W6 saw m0 offer five streams a second to
+        // every member, 58 kbit/s of control on a 300 kbit/s cap.
+        let detected = detected || self.drain.active();
         let now = self.now_ms();
         if detected {
             self.uplink_stall_seen_ms = Some(now);
@@ -2356,7 +2364,12 @@ impl AlmState {
             let relay_offers: Vec<(StreamId, Vec<String>, Vec<u8>)> = self
                 .relays
                 .iter()
-                .filter(|(_, a)| self.relay_capable && a.forwarding())
+                // 45.3 — no relay offers while the uplink is stalled: a stalled
+                // node relays one stream's room at most (G8) and has none to
+                // offer, and its own stream's offer is each leg's liveness
+                // (F14a). Offered anyway they were 4 of the 5 offers a second
+                // m0 sent every member under the W6 cap.
+                .filter(|(_, a)| self.relay_capable && a.forwarding() && !self.uplink_stall)
                 .map(|(s, a)| {
                     let mut o = a.offer();
                     let rate = self.rates.get(s).cloned().unwrap_or_default();
@@ -3097,6 +3110,42 @@ mod tests {
         }
         a.relays.insert(s(7), adm);
         a
+    }
+
+    /// 45.3 fixes (a) and (b). (a) A draining uplink (row DR) is a stalled
+    /// one, with no detection of the verdict's own: under a standing queue
+    /// the verdict stops detecting within seconds. (b) A stalled node sends
+    /// no relay offers (it relays one stream's room at most), while its own
+    /// stream's offer, each leg's liveness, goes on. Mutations: (a) the drain
+    /// not counted, the verdict reads unstalled; (b) the filter gone, stream
+    /// 7 is offered from a stalled uplink (4 of m0's 5 offers a second under
+    /// the W6 cap).
+    #[test]
+    fn a_draining_uplink_is_stalled_and_offers_nothing_it_relays() {
+        let mut a = relaying_a();
+        let legs = ["b".to_owned(), "c".to_owned()];
+        let offers = |out: &[Outgoing], st: StreamId| {
+            out.iter()
+                .filter(|o| {
+                    matches!(
+                        decode(&o.frame, "a"),
+                        Ok(WireFrame::Control(ControlFrame { stream, msg: ControlMsg::Offer(_) })) if stream == st
+                    )
+                })
+                .count()
+        };
+        a.t0 = a.t0.checked_sub(Duration::from_secs(2)).expect("clock");
+        let out = a.tick(&legs);
+        assert!(offers(&out, s(7)) > 0, "a healthy relay offers: {out:?}");
+        // The backlog reads past the drain's entry bound.
+        let _ = a.observe_uplink_backlog(Some(DRAIN_ENTER_MS + 100));
+        assert!(a.draining());
+        a.set_uplink_stall(false);
+        assert!(a.uplink_stalled(), "(a) draining is stalled");
+        a.t0 = a.t0.checked_sub(Duration::from_secs(2)).expect("clock");
+        let out = a.tick(&legs);
+        assert_eq!(offers(&out, s(7)), 0, "(b) no relay offer while stalled");
+        assert!(offers(&out, s(1)) > 0, "the own stream's offer goes on");
     }
 
     fn sheds(out: &[Outgoing]) -> Vec<(String, ShedReason)> {
