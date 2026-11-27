@@ -8641,12 +8641,26 @@ async fn dispatch_inbound(
             // one).
             if sends_typed_reply {
                 if let Some(reply_transport) = response_transport {
-                    ship_typed_ephemeral_reply(
-                        reply_transport,
-                        signer,
-                        &envelope.signing_key_id,
-                        body_sha256,
-                        response_bytes,
+                    // 45.3 — the bytes of a content or blob-chunk fetch are
+                    // file transfer: BULK under the egress budget. Every
+                    // other typed reply is FIRST (the default).
+                    let class = if matches!(
+                        envelope.message_type,
+                        MessageType::ContentFetch | MessageType::BlobChunkFetch
+                    ) {
+                        crate::transport::egress_budget::SendClass::Bulk
+                    } else {
+                        crate::transport::egress_budget::SendClass::First
+                    };
+                    crate::transport::egress_budget::sending_as(
+                        class,
+                        ship_typed_ephemeral_reply(
+                            reply_transport,
+                            signer,
+                            &envelope.signing_key_id,
+                            body_sha256,
+                            response_bytes,
+                        ),
                     )
                     .await;
                 } else {

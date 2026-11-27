@@ -1117,6 +1117,15 @@ pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
 /// 45.3 row DR — this node's uplink read backlogged and it began withholding
 /// media but audio until the backlog drains (once per episode).
 pub const ALM_DRAIN_ENTERED: &str = "alm_drain_entered";
+/// 45.3 — an identity-plane send (an envelope) that waited on the node's
+/// egress budget as bulk.
+pub const AV_BULK_DEFERRED_DRAIN: &str = "av_bulk_deferred_budget";
+/// 45.3 — a media frame (own: every fragment; relayed: one chunk) the egress
+/// budget did not admit, so not sent.
+pub const AV_FRAME_HELD_BUDGET: &str = "av_frame_held_budget";
+/// 45.3 — video resumed after the egress budget held frames of it: the point
+/// where the host's encoder would be asked for a keyframe.
+pub const AV_VIDEO_KEYFRAME_WANTED: &str = "av_video_keyframe_wanted";
 /// G8 — a periodic offer not sent on a leg whose oldest unproved Channel
 /// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
 /// queue behind the backlog and spend that link's retry budget.
@@ -3051,6 +3060,9 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
     ALM_DRAIN_ENTERED,
+    AV_BULK_DEFERRED_DRAIN,
+    AV_FRAME_HELD_BUDGET,
+    AV_VIDEO_KEYFRAME_WANTED,
     ALM_OFFER_HELD_BACKLOG,
     ALM_DEPARTURE_CONGESTION,
     ALM_LATE_MOVE,
@@ -5606,6 +5618,7 @@ impl EdgeMetrics {
             alm_active_calls: t.alm_active_calls,
             alm_c3_peers: t.alm_c3_peers,
             alm_uplink_backlog_ms: t.alm_uplink_backlog_ms,
+            alm_media_budget_bps: t.alm_media_budget_bps,
             decision_row_unheard_total: t.decision_row_unheard_total,
             decision_row_subscribers: t.decision_row_subscribers,
             group_backfill_rows_read_total: t.group_backfill_rows_read_total,
@@ -6102,6 +6115,8 @@ pub struct EdgeMetricsBundle {
     pub alm_c3_peers: u64,
     /// 45.3 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub alm_uplink_backlog_ms: u64,
+    /// 45.3 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_media_budget_bps: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub decision_row_unheard_total: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -6640,6 +6655,7 @@ impl EdgeMetricsBundle {
             ("alm_active_calls", self.alm_active_calls),
             ("alm_c3_peers", self.alm_c3_peers),
             ("alm_uplink_backlog_ms", self.alm_uplink_backlog_ms),
+            ("alm_media_budget_bps", self.alm_media_budget_bps),
             ("decision_row_subscribers", self.decision_row_subscribers),
             (
                 "group_backfill_rows_read_total",
@@ -6849,6 +6865,7 @@ edge_metrics_bundle_fields!(
     alm_active_calls,
     alm_c3_peers,
     alm_uplink_backlog_ms,
+    alm_media_budget_bps,
     decision_row_unheard_total,
     decision_row_subscribers,
     group_backfill_rows_read_total,

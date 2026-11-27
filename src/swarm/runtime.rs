@@ -1066,7 +1066,13 @@ async fn publish_tick(
                 }
                 None => claim.canonical_bytes(),
             };
-            if let Err(e) = transport.send(peer, &envelope_bytes).await {
+            // 45.3 — a holding claim is file-transfer traffic: BULK.
+            if let Err(e) = crate::transport::egress_budget::sending_as(
+                crate::transport::egress_budget::SendClass::Bulk,
+                transport.send(peer, &envelope_bytes),
+            )
+            .await
+            {
                 tracing::warn!(
                     peer = %peer,
                     content_id = %content.content_id,

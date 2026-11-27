@@ -205,9 +205,19 @@ struct Node {
     transport: Arc<ReticulumTransport>,
     metrics: EdgeMetrics,
     lifecycle: Arc<ScopeLifecycle>,
+    /// Identity-plane frames this node received that carry [`PROBE_MARKER`]:
+    /// when, and the bytes.
+    probes: ProbeLog,
     _edge: ciris_edge::Edge,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
+
+/// What a probe envelope starts with (the 45.3 FIRST-class witness).
+const PROBE_MARKER: &[u8] = b"W1PROBE:";
+/// Bulk envelopes queued ahead of each probe.
+const PROBE_FILLERS: usize = 10;
+/// Probe envelopes a node heard: when, and the bytes.
+type ProbeLog = Arc<std::sync::Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>>;
 
 async fn node(
     key: Ident,
@@ -275,11 +285,22 @@ async fn node(
     ));
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
     let listener = Arc::clone(&transport);
+    let probes: ProbeLog = Arc::default();
+    let heard = Arc::clone(&probes);
     let tasks = vec![
         tokio::spawn(async move {
             let _ = listener.listen(tx).await;
         }),
-        tokio::spawn(async move { while rx.recv().await.is_some() {} }),
+        tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if f.envelope_bytes.starts_with(PROBE_MARKER) {
+                    heard
+                        .lock()
+                        .expect("probes")
+                        .push((tokio::time::Instant::now(), f.envelope_bytes));
+                }
+            }
+        }),
     ];
     Node {
         key,
@@ -288,6 +309,7 @@ async fn node(
         transport,
         metrics,
         lifecycle,
+        probes,
         _edge: edge,
         _tasks: tasks,
     }
@@ -6297,6 +6319,115 @@ struct UplinkCapRun {
     video_fresh_of_delivered: Vec<f64>,
     /// Per listener: the longest video gap after the settle.
     video_gap: Vec<Duration>,
+    /// 45.3 (CC review, FIRST class) — a room removal and a chat row of the
+    /// same size, sent m0 → m1 at one instant: before the cap...
+    probe_uncapped: FirstProbe,
+    /// ...and mid-cap, while m0's budget is in force and holding video.
+    probe_capped: FirstProbe,
+}
+
+/// One FIRST-vs-BULK probe: each envelope's class (from edge's own
+/// classifier), its delivery time (`None`: not heard within the wait), the
+/// uplink FIFO's queue time at the send, and m0's held-video count across it.
+#[derive(Debug, Clone, Default)]
+struct FirstProbe {
+    removal_class: Option<ciris_edge::transport::egress_budget::SendClass>,
+    chat_class: Option<ciris_edge::transport::egress_budget::SendClass>,
+    removal: Option<Duration>,
+    chat: Option<Duration>,
+    fifo_ms: u64,
+    budget_bps: Option<f64>,
+    video_held: (u64, u64),
+}
+
+/// The probe: a `membership:removal` Deliver and a `chat:` Deliver, each
+/// classed by `ciris_edge::replication::egress_class::class_of` and sent by
+/// `from` under that class at one instant, padded to one size; heard on
+/// `to`'s identity plane. `cap_kbit` turns the FIFO's backlog into time.
+async fn first_probe(
+    from: &Node,
+    to: &Node,
+    uplink: &NetemUplink,
+    cap_kbit: u64,
+    tag: &str,
+) -> FirstProbe {
+    use ciris_edge::replication::egress_class::class_of;
+    use ciris_edge::replication::protocol::{DeliverMessage, EnvelopeKind, ReplicationMessage};
+    const SIZE: usize = 1_200;
+    let deliver = |dimension: &str| {
+        ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![serde_json::to_vec(&serde_json::json!({
+                "attestation_id": "probe",
+                "attestation_type": "membership",
+                "attestation_envelope": {"dimension": dimension},
+            }))
+            .expect("row")],
+        })
+    };
+    let removal_class = class_of(&deliver("membership:removal:v1"));
+    let chat_class = class_of(&deliver("chat:message:v1"));
+    let bytes = |what: &str| {
+        let mut b = PROBE_MARKER.to_vec();
+        b.extend_from_slice(format!("{tag}:{what}:").as_bytes());
+        b.resize(SIZE, b'.');
+        b
+    };
+    let held = |n: &Node| av(&n.metrics, "av_frame_held_budget");
+    let held0 = held(from);
+    let budget_bps = from.transport.egress_budget().rate_bps();
+    let q = uplink.read();
+    let fifo_ms = (q.backlog_bytes * 8).checked_div(cap_kbit).unwrap_or(0);
+    // Bulk already waiting: ten envelopes of the same size queued ahead, as
+    // a replication round's rows would be. A removal filed as bulk would
+    // wait behind them; the chat row does.
+    for k in 0..PROBE_FILLERS {
+        let t = Arc::clone(&from.transport);
+        let dest = to.key.key_id.clone();
+        let b = bytes(&format!("filler{k}"));
+        tokio::spawn(async move {
+            let _ = ciris_edge::transport::egress_budget::sending_as(
+                ciris_edge::transport::egress_budget::SendClass::Bulk,
+                t.send(&dest, &b),
+            )
+            .await;
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let sent = tokio::time::Instant::now();
+    for (what, class) in [("removal", removal_class), ("chat", chat_class)] {
+        let t = Arc::clone(&from.transport);
+        let dest = to.key.key_id.clone();
+        let b = bytes(what);
+        tokio::spawn(async move {
+            let _ =
+                ciris_edge::transport::egress_budget::sending_as(class, t.send(&dest, &b)).await;
+        });
+    }
+    let heard = |what: &str| {
+        let want = format!("{tag}:{what}:");
+        to.probes
+            .lock()
+            .expect("probes")
+            .iter()
+            .find(|(_, b)| b[PROBE_MARKER.len()..].starts_with(want.as_bytes()))
+            .map(|(at, _)| at.saturating_duration_since(sent))
+    };
+    let until = sent + Duration::from_secs(30);
+    while tokio::time::Instant::now() < until
+        && (heard("removal").is_none() || heard("chat").is_none())
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    FirstProbe {
+        removal_class: Some(removal_class),
+        chat_class: Some(chat_class),
+        removal: heard("removal"),
+        chat: heard("chat"),
+        fifo_ms,
+        budget_bps,
+        video_held: (held0, held(from)),
+    }
 }
 
 /// The frame sequence number `body("w", seq)` carries.
@@ -6444,6 +6575,8 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
         tokio::spawn(async move {
             let mut seq = 0u64;
             let mut aseq = 0u64;
+            let mut long_audio = false;
+            let mut long_audio_packets = 0u64;
             let mut last: Vec<Option<String>> = vec![None; calls.len()];
             let mut next_video = tokio::time::Instant::now();
             let mut audio_due = next_video;
@@ -6452,15 +6585,34 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
                 // AUDIO_EVERY, as a host packetizes it.
                 if audio_due < next_video {
                     tokio::time::sleep_until(audio_due).await;
+                    // The host's congested-mode packetization: 60 ms Opus
+                    // packets (one ~180 B chunk) while the node's media
+                    // budget is under what 20 ms audio costs, 20 ms again
+                    // once it is well over (CC rc23: one codec packet, one
+                    // chunk, any frame length that fits).
+                    let budget = calls[0].media_budget_bps();
+                    if budget.is_some_and(|b| b < AUDIO_20MS_WIRE_BPS * 1.2) {
+                        long_audio = true;
+                    } else if budget.is_none_or(|b| b > AUDIO_20MS_WIRE_BPS * 2.0) {
+                        long_audio = false;
+                    }
+                    let (bytes, every) = if long_audio {
+                        (AUDIO_BYTES * 3, AUDIO_EVERY * 3)
+                    } else {
+                        (AUDIO_BYTES, AUDIO_EVERY)
+                    };
                     let mut a = body("a", aseq);
-                    a.resize(AUDIO_BYTES, b'.');
+                    a.resize(bytes, b'.');
                     audio_sent_at
                         .lock()
                         .expect("audio sent")
                         .push(tokio::time::Instant::now());
                     let _ = calls[0].publish(Frame::opaque(a)).await;
                     aseq += 1;
-                    audio_due += AUDIO_EVERY;
+                    audio_due += every;
+                    if long_audio {
+                        long_audio_packets += 1;
+                    }
                     continue;
                 }
                 tokio::time::sleep_until(next_video).await;
@@ -6496,7 +6648,12 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
                         c.legs().len(),
                         c.alm_own_children().len(),
                         c.relayed_to().len(),
-                        format!("{:?} drain {:?}", c.service_tier(), c.uplink_drain()),
+                        format!(
+                            "{:?} drain {:?} budget {:?}",
+                            c.service_tier(),
+                            c.uplink_drain(),
+                            c.media_budget_bps().map(f64::round)
+                        ),
                     ));
                 }
                 if seq.is_multiple_of(8) {
@@ -6515,6 +6672,7 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
                 }
                 seq += 1;
             }
+            eprintln!("[W] m0 sent {long_audio_packets} audio packets at 60 ms of {aseq}");
             calls
         })
     };
@@ -6594,6 +6752,7 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
     tokio::time::sleep(Duration::from_secs(5)).await;
     let (p2, b2) = uplink.media_totals();
     let per_packet = (b2 - b1) / (p2 - p1).max(1) + NETEM_OVERHEAD_BYTES;
+    let probe_uncapped = first_probe(&nodes[0], &nodes[1], &uplink, 0, "uncapped").await;
     // A copy: 1.5 video packets a frame at 30 Hz (frames alternate one and
     // two fragments, so a copy is ~190 kbit/s, the server's codec's).
     let copy_kbit = per_packet * 45 * 8 / 1000;
@@ -6640,7 +6799,14 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
                         Arc::clone(&in_flight),
                     );
                     tokio::spawn(async move {
-                        let _ = t.send(&to, &blob).await;
+                        // Bulk replication rows (chat, scores): edge classes
+                        // them BULK from their row family; this stand-in says
+                        // so itself (an unclassed send is FIRST).
+                        let _ = ciris_edge::transport::egress_budget::sending_as(
+                            ciris_edge::transport::egress_budget::SendClass::Bulk,
+                            t.send(&to, &blob),
+                        )
+                        .await;
                         f.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
@@ -6664,7 +6830,22 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
         cap_kbit,
         "W cap on"
     );
-    tokio::time::sleep(Duration::from_secs(cap_s)).await;
+    // Mid-cap, once m0's budget is in force and holding video: the probe.
+    let cap_end = tokio::time::Instant::now() + Duration::from_secs(cap_s);
+    tokio::time::sleep(Duration::from_secs(cap_s / 2)).await;
+    let mut probe_capped = FirstProbe::default();
+    let held_at = av(&nodes[0].metrics, "av_frame_held_budget");
+    while tokio::time::Instant::now() + Duration::from_secs(10) < cap_end {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if !no_cap
+            && nodes[0].transport.egress_budget().rate_bps().is_some()
+            && av(&nodes[0].metrics, "av_frame_held_budget") > held_at
+        {
+            probe_capped = first_probe(&nodes[0], &nodes[1], &uplink, cap_kbit, "capped").await;
+            break;
+        }
+    }
+    tokio::time::sleep_until(cap_end).await;
     let torn_under_cap: u64 =
         nodes.iter().map(|x| torn_down(&x.metrics)).sum::<u64>() - torn_before;
     let plane_cap = nodes[0].metrics.av_plane();
@@ -7124,6 +7305,7 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
         "[W] capped {capped:.3?}; within 800 ms after a 10 s settle {capped_fresh:.3?}; first 10 s {first_10s:.3?}; lifted {lifted:.3?}; longest gap {longest_gap:?}; torn under the cap {torn_under_cap}"
     );
     drop(calls);
+    eprintln!("[W] FIRST probe uncapped {probe_uncapped:?}; capped {probe_capped:?}");
     UplinkCapRun {
         capped,
         first_10s,
@@ -7136,8 +7318,64 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
         audio_gap,
         video_fresh_of_delivered,
         video_gap,
+        probe_uncapped,
+        probe_capped,
     }
 }
+
+/// **45.3 (CC review) — a room removal leaves at once while video is held.**
+/// The faithful whole-uplink bench (4 members, m0 capped at 300 kbit/s for
+/// 40 s, bulk on the identity links). Mid-cap, while m0's budget is in force
+/// and holding video, m0 sends m1 a `membership:removal` Deliver and a
+/// `chat:` Deliver of one size at one instant, each classed by edge's own
+/// classifier. The removal is FIRST: edge never holds it, so all it waits on
+/// is the uplink's own FIFO. A 1.2 kB envelope is a Resource and crosses the
+/// capped uplink twice (its advertisement, then its parts after m1's
+/// request), so it must arrive within twice the FIFO's time at the send,
+/// plus the same envelope's uncapped delivery and [`FIRST_PROBE_SLACK`]; and
+/// before the chat row, which is BULK and waits behind the
+/// [`PROBE_FILLERS`] bulk envelopes queued ahead of both. Mutation: the
+/// removal filed as bulk waits behind them too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_room_removal_leaves_at_once_while_video_is_held() {
+    use ciris_edge::transport::egress_budget::SendClass;
+    let _call = one_call().await;
+    let r = whole_uplink_cap("w4-first", 4, 40, W_BULK_KBIT_SERVER).await;
+    let (u, c) = (&r.probe_uncapped, &r.probe_capped);
+    eprintln!("[FIRST] uncapped {u:?}; capped {c:?}");
+    assert_eq!(
+        c.removal_class,
+        Some(SendClass::First),
+        "a removal is FIRST"
+    );
+    assert_eq!(c.chat_class, Some(SendClass::Bulk), "a chat row is BULK");
+    assert!(
+        c.budget_bps.is_some(),
+        "the probe ran under a budget: {c:?}"
+    );
+    assert!(
+        c.video_held.1 > c.video_held.0,
+        "video was being held across the probe: {c:?}"
+    );
+    let base = u.removal.expect("the uncapped removal arrived");
+    let got = c.removal.expect("the capped removal arrived");
+    let bound = base + Duration::from_millis(2 * c.fifo_ms) + FIRST_PROBE_SLACK;
+    assert!(
+        got <= bound,
+        "the removal took {got:?} under the cap, bound {bound:?} (uncapped {base:?} + 2 x FIFO {} ms + slack)",
+        c.fifo_ms
+    );
+    let chat = c.chat.expect("the capped chat row arrived");
+    assert!(
+        got < chat,
+        "the removal ({got:?}) left ahead of the bulk queued before it (the chat row: {chat:?})"
+    );
+}
+
+/// The removal's allowance past its two FIFO crossings and its uncapped
+/// delivery: the FIFO grows between the crossings (it is read once, at the
+/// send) and the receiver's request rides m1's own uplink.
+const FIRST_PROBE_SLACK: Duration = Duration::from_millis(500);
 
 /// 45.3 — m0's audio: one Opus packet per 20 ms, 60 B (24 kbit/s), as a
 /// host packetizes it.
@@ -7147,6 +7385,9 @@ const AUDIO_BYTES: usize = 60;
 /// the sealed codec): a 20 ms audio packet is ~327 B and a 60 ms one ~447 B
 /// before IP/UDP, a video fragment ~500 B.
 const AUDIO_PACKET_MAX: usize = 480;
+/// What one 20 ms audio copy costs on the wire (bits/s, measured: 355 B a
+/// packet with IP/UDP, 50 a second).
+const AUDIO_20MS_WIRE_BPS: f64 = 142_000.0;
 
 /// 45.3 — how late a frame may land and still count as heard in time (the
 /// receiver's media budget, `av_call::MEDIA_STALE_BUDGET`).

@@ -295,12 +295,21 @@ counts handshakes whose link closed in the queue: they cost no crypto.
 7. `Call.alm_log()` in Python returns the hash, the count and the tail while the
    call lives. The tail names peers: it is for the owner's session only.
 
-### Does this node read its uplink as backlogged?
+### Why did this call's video thin out while audio went on?
 
 1. `alm_uplink_backlog_ms` is the uplink backlog this node reads on its legs:
    the oldest unproved Channel message, aged from its send, past the leg's
    RTT floor, least over every leg (one slow peer is not the uplink).
-2. `alm_drain_entered` counts backlog episodes (400 ms in, under 200 ms for
+2. The node's egress budget (45.3) follows it: over 400 ms it decreases
+   (×0.7, at most every 500 ms), under 100 ms it increases. While in force
+   it serves control (never held), then audio, then video, then bulk.
+   `alm_media_budget_bps` is what it leaves media after control, the rate a
+   host's encoder sizes itself to (0: no budget in force).
+3. `av_frame_held_budget` counts media frames the budget did not admit
+   (whole frames of own media; single chunks a relay forwards);
+   `av_video_keyframe_wanted` counts each video resume after held frames;
+   `av_bulk_deferred_budget` counts identity-plane sends that waited.
+4. `alm_drain_entered` counts backlog episodes (400 ms in, under 200 ms for
    a second out).
 
 ### Why is this call at another epoch than its room?
@@ -615,6 +624,7 @@ address.
 | `alm_active_calls` | `ciris.edge.alm.active_calls` | gauge | count | operator-only |
 | `alm_c3_peers` | `ciris.edge.alm.c3_peers` | gauge | count | operator-only |
 | `alm_uplink_backlog_ms` | `ciris.edge.alm.uplink_backlog` | gauge | milliseconds | operator-only |
+| `alm_media_budget_bps` | `ciris.edge.alm.media_budget` | gauge | bits/s | operator-only |
 | `decision_row_unheard_total` | `ciris.edge.decision_row.unheard` | counter | count | operator-only |
 | `decision_row_subscribers` | `ciris.edge.decision_row.subscribers` | gauge | count | operator-only |
 | `group_backfill_rows_read_total` | `ciris.edge.group_backfill.rows_read` | counter | count | operator-only |

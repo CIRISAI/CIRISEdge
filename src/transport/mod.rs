@@ -280,6 +280,10 @@ pub mod onion_liveness;
 #[cfg(feature = "_reticulum-module")]
 pub mod relay_tier;
 
+/// 45.3 — the node's egress budget (delay-based AIMD, served control >
+/// audio > video > bulk).
+pub mod egress_budget;
+
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).
 #[cfg(feature = "_reticulum-module")]

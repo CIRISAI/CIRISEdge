@@ -1893,6 +1893,9 @@ struct Shared {
     queue_age_ms: AtomicU64,
     /// 45.3 row DR — each out leg's [`alm::SendClock`].
     send_clocks: StdMutex<HashMap<[u8; 16], alm::SendClock>>,
+    /// 45.3 — the egress budget held one of this call's video frames since
+    /// the last one it admitted.
+    video_held: AtomicBool,
     /// G8 — rung when a fan-out parks a chunk: the flusher retries it with
     /// the publisher lock taken briefly, never inside `publish`.
     parked_wake: tokio::sync::Notify,
@@ -2678,6 +2681,7 @@ impl Call {
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
             send_clocks: StdMutex::new(HashMap::new()),
+            video_held: AtomicBool::new(false),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
             evidence_at: StdMutex::new(HashMap::new()),
@@ -2954,6 +2958,14 @@ impl Call {
     #[doc(hidden)]
     pub fn set_drain_off_for_test(&self, off: bool) {
         Shared::lock(&self.shared.alm).set_drain_off_for_test(off);
+    }
+
+    /// 45.3 — what the node's egress budget leaves media after control
+    /// (bits/s), `None` when no budget is in force: the figure a host's
+    /// encoder sizes itself to.
+    #[must_use]
+    pub fn media_budget_bps(&self) -> Option<f64> {
+        self.shared.transport.egress_budget().media_bps()
     }
 
     /// 45.3 row DR — whether this call withholds media but audio now (its
@@ -4068,7 +4080,41 @@ async fn send_pieces(
     withhold: Option<&(String, u64)>,
 ) -> Result<Vec<(String, LegOutcome)>, CallError> {
     let mut outcome: BTreeMap<String, LegOutcome> = BTreeMap::new();
+    // 45.3 — a frame is admitted by the egress budget WHOLE or not at all:
+    // every fragment to every leg it would go to.
+    let held = {
+        let legs_now = publisher.dispatcher_mut().subscriber_ids();
+        let base_or_audio = is_base_or_audio(frame.codec_id, frame.layer);
+        let targets = legs_now.len().saturating_sub(
+            Shared::lock(&shared.alm)
+                .own_exclude_on(stream, &legs_now, base_or_audio)
+                .len(),
+        );
+        let bytes: usize = pieces
+            .iter()
+            .map(|p| chunk_wire_bytes(p.len()))
+            .sum::<usize>()
+            * targets;
+        let class = media_class(frame.codec_id);
+        let admitted = bytes == 0 || shared.transport.egress_budget().take(class, bytes);
+        if !admitted {
+            shared.count(crate::observability::AV_FRAME_HELD_BUDGET);
+            if class == crate::transport::egress_budget::Class::Video {
+                shared.video_held.store(true, Ordering::Relaxed);
+            }
+        } else if class == crate::transport::egress_budget::Class::Video
+            && shared.video_held.swap(false, Ordering::Relaxed)
+        {
+            // Video resumes after frames were held: here a keyframe is
+            // wanted (the host event waits on the 45.x token set).
+            shared.count(crate::observability::AV_VIDEO_KEYFRAME_WANTED);
+        }
+        !admitted
+    };
     for (piece, (seq, inner)) in pieces.iter().zip(sealed) {
+        if held {
+            continue;
+        }
         let mut exclude: Vec<String> = outcome
             .iter()
             .filter(|(_, o)| **o != LegOutcome::Delivered)
@@ -4148,18 +4194,58 @@ fn uplink_backlog(shared: &Arc<Shared>, legs: &[(String, [u8; 16])]) {
         None
     };
     let changed = Shared::lock(&shared.alm).observe_uplink_backlog(reading);
+    let budget = shared.transport.egress_budget();
+    budget.observe(reading);
     if let Some(m) = &shared.metrics {
         m.telemetry.set_uplink_backlog_ms(reading.unwrap_or(0));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        m.telemetry
+            .set_media_budget_bps(budget.media_bps().map_or(0, |b| b.round() as u64));
     }
     match changed {
         Some(true) => tracing::info!(
             node = %shared.own,
             backlog_ms = reading.unwrap_or(0),
-            "A/V uplink backlogged (45.3)"
+            budget_bps = ?budget.rate_bps(),
+            "A/V uplink backlogged: the egress budget is in force (45.3)"
         ),
-        Some(false) => tracing::info!(node = %shared.own, "A/V uplink drained (45.3)"),
+        Some(false) => tracing::info!(
+            node = %shared.own,
+            budget_bps = ?budget.rate_bps(),
+            "A/V uplink drained (45.3)"
+        ),
         None => {}
     }
+}
+
+/// 45.3 — what one media chunk of `plaintext` bytes costs on the wire: the
+/// chunk's own overhead (header, codec block, two AEAD tags, source
+/// timestamp and signature), the E1 seal, the RNS link Token and header,
+/// and the IP/UDP header (measured on the bench: 532 B for a 246 B frame).
+const fn chunk_wire_bytes(plaintext: usize) -> usize {
+    plaintext
+        + AV_CHUNK_WIRE_OVERHEAD
+        + crate::transport::av_chunk_auth::CHUNK_TRAILER_LEN
+        + 25
+        + 75
+        + 28
+}
+
+/// 45.3 — the egress budget's class of a media chunk.
+fn media_class(codec_id: u8) -> crate::transport::egress_budget::Class {
+    if codec_id == crate::transport::realtime_av::CODEC_OPAQUE {
+        crate::transport::egress_budget::Class::Audio
+    } else {
+        crate::transport::egress_budget::Class::Video
+    }
+}
+
+/// 45.3 — call control's bytes count against the egress budget; never held.
+fn charge_control(shared: &Shared, frame_len: usize) {
+    let _ = shared.transport.egress_budget().take(
+        crate::transport::egress_budget::Class::Control,
+        frame_len + 25 + 75 + 28,
+    );
 }
 
 /// One own chunk, sealed and signed, out on the primary publisher's legs
@@ -5230,6 +5316,7 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
                 continue;
             }
         }
+        charge_control(shared, o.frame.len());
         let sent = shared
             .publisher
             .lock()
@@ -5399,6 +5486,7 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
         if !has_link {
             break;
         }
+        charge_control(shared, o.frame.len());
         let sent = shared
             .publisher
             .lock()
@@ -5446,6 +5534,7 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
 /// One send of a C3 frame to `o.to`: its own leg first, else the reverse
 /// direction of the member's link here.
 async fn try_send_c3(shared: &Arc<Shared>, o: &alm::Outgoing) -> bool {
+    charge_control(shared, o.frame.len());
     let sent = shared
         .publisher
         .lock()
@@ -6286,6 +6375,16 @@ async fn forward(
         }
     }
     if targets.is_empty() {
+        return;
+    }
+    // 45.3 — the forward draws on the egress budget like own media, per
+    // chunk: the fragment marker that says where a frame ends is inside the
+    // end-to-end AEAD (`frame.rs`), so a relay cannot see a frame's extent.
+    if !shared.transport.egress_budget().take(
+        media_class(inner.codec_id()),
+        chunk_wire_bytes(inner.inner_ciphertext().len()) * targets.len(),
+    ) {
+        shared.count(crate::observability::AV_FRAME_HELD_BUDGET);
         return;
     }
     let mut exclude: Vec<String> = legs

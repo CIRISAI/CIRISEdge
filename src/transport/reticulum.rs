@@ -2881,6 +2881,8 @@ pub struct ReticulumTransport {
     /// live calls, once one exists. It owns the A/V arrivals; `None` inside
     /// means another consumer took them first.
     av_call_router: std::sync::OnceLock<Option<Arc<crate::transport::av_call::CallRouter>>>,
+    /// 45.3 — [`Self::egress_budget`].
+    egress_budget: crate::transport::egress_budget::EgressBudget,
     /// CC 5.3.3.5 E1 test seam — the next identity dial identifies its link
     /// only after its first sealed frames have gone out. `false` in production.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
@@ -4399,6 +4401,7 @@ impl ReticulumTransport {
             homed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             homed_events: tokio::sync::broadcast::channel(16).0,
             av_call_router: std::sync::OnceLock::new(),
+            egress_budget: crate::transport::egress_budget::EgressBudget::default(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
             test_binding_key_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -8727,6 +8730,43 @@ impl ReticulumTransport {
         Some(token)
     }
 
+    /// 45.3 — the node's egress budget ([`crate::transport::egress_budget`]):
+    /// its calls feed it the uplink backlog and draw media from it, and every
+    /// identity-plane envelope waits on it as bulk.
+    #[must_use]
+    pub fn egress_budget(&self) -> &crate::transport::egress_budget::EgressBudget {
+        &self.egress_budget
+    }
+
+    /// 45.3 — an identity-plane send (an envelope: replication rounds and
+    /// replies, chat, anything not call control or call media) is BULK: it
+    /// waits until the egress budget serves it, paced at the budget's rate
+    /// and after control, audio and video. No budget in force, no wait. A
+    /// peer waiting on a reply past its 10 s replication round timeout under
+    /// a long cap abandons that round and retries it after its backoff.
+    /// 45.3 — an identity-plane send under the egress budget, by its class
+    /// ([`crate::transport::egress_budget::current_send_class`]): FIRST is
+    /// charged like call control and never held; BULK waits its turn within
+    /// the floor.
+    async fn wait_egress(&self, bytes: usize) {
+        use crate::transport::egress_budget::{current_send_class, Class, SendClass};
+        // An envelope rides a Resource or Channel parts: ~15 % more on the
+        // wire, plus a packet header per MDU.
+        let wire = bytes + bytes / 7 + 64;
+        match current_send_class() {
+            SendClass::First => {
+                let _ = self.egress_budget.take(Class::Control, wire);
+            }
+            SendClass::Bulk => {
+                if self.egress_budget.wait_bulk(wire).await {
+                    if let Some(m) = self.metrics.get() {
+                        m.inc_av_plane(crate::observability::AV_BULK_DEFERRED_DRAIN);
+                    }
+                }
+            }
+        }
+    }
+
     /// 45.2.0 — [`Self::media_refusal`] without counting: a live call reads
     /// it every watch tick to end itself on a mid-call switch.
     #[must_use]
@@ -11738,6 +11778,8 @@ impl Transport for ReticulumTransport {
         destination_key_id: &str,
         envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
+        // 45.3 — identity-plane sends under the egress budget, by class.
+        self.wait_egress(envelope_bytes.len()).await;
         // Lifecycle — refused while suspended, cancelled if a suspend lands.
         self.lifecycle
             .guard(self.send_live(destination_key_id, envelope_bytes))
@@ -11750,6 +11792,7 @@ impl Transport for ReticulumTransport {
         path: &crate::transport::ReplyPath,
         envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
+        self.wait_egress(envelope_bytes.len()).await;
         self.lifecycle
             .guard(self.send_on_reply_path_live(destination_key_id, path, envelope_bytes))
             .await
@@ -11761,6 +11804,7 @@ impl Transport for ReticulumTransport {
         path: &crate::transport::ReplyPath,
         envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
+        self.wait_egress(envelope_bytes.len()).await;
         self.lifecycle
             .guard(self.send_on_reply_path_only_live(destination_key_id, path, envelope_bytes))
             .await

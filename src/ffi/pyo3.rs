@@ -3796,6 +3796,7 @@ fn telemetry_into_pydict(
         ("alm_active_calls", b.alm_active_calls),
         ("alm_c3_peers", b.alm_c3_peers),
         ("alm_uplink_backlog_ms", b.alm_uplink_backlog_ms),
+        ("alm_media_budget_bps", b.alm_media_budget_bps),
         ("decision_row_subscribers", b.decision_row_subscribers),
         (
             "group_backfill_rows_read_total",
