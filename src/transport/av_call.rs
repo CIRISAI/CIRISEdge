@@ -130,9 +130,16 @@ mod legs;
 mod rxmove;
 pub use alm::{AlmCounts, AlmParents, RelayedTo, CANONICAL_AV_FALLBACK};
 
-/// ALM C5 — media older than this in the inbound queue is dropped by age
-/// (oldest first) before it is opened: twice [`REORDER_WINDOW_MAX`], past
-/// which the reorder window would skip it anyway.
+/// **The live-media staleness budget** (CC's text names it; 800 ms): live
+/// media older than this is of no use to a listener. Row STALE (the sender:
+/// never handed to the uplink) and ALM C5 (the inbound queue, dropped oldest
+/// first before it is opened: twice [`REORDER_WINDOW_MAX`], past which the
+/// reorder window would skip it anyway) judge against it.
+///
+/// Scope (CC review): STALE applies on the LIVE PUSH path, for
+/// presentation, and to profile-0 (live) streams only. A profile-1
+/// (accountable) stream is exempt when edge publishes one; edge publishes no
+/// stream profile today, so every stream it carries is profile 0.
 pub const MEDIA_STALE_BUDGET: Duration = Duration::from_millis(800);
 
 /// ALM C5 — consecutive congested sends before a leg is shed to the base
@@ -4218,6 +4225,14 @@ fn uplink_backlog(shared: &Arc<Shared>, legs: &[(String, [u8; 16])]) {
     }
 }
 
+/// 45.3 row STALE — whether a media chunk is held back because it would
+/// reach its receivers stale (audio included). Control never comes here.
+fn media_held_back(shared: &Shared, _codec_id: u8) -> Option<&'static str> {
+    Shared::lock(&shared.alm)
+        .sends_stale()
+        .then_some(crate::observability::AV_CHUNK_DROPPED_STALE_AT_SENDER)
+}
+
 /// 45.3 — what one media chunk of `plaintext` bytes costs on the wire: the
 /// chunk's own overhead (header, codec block, two AEAD tags, source
 /// timestamp and signature), the E1 seal, the RNS link Token and header,
@@ -4267,6 +4282,10 @@ async fn send_own_chunk(
         .unwrap_or(u64::MAX);
     let legs_now = publisher.dispatcher_mut().subscriber_ids();
     exclude.extend(stalled_channel_legs(shared, &legs_now));
+    if let Some(why) = media_held_back(shared, codec_id) {
+        shared.count(why);
+        exclude.clone_from(&legs_now);
+    }
     {
         let alm = Shared::lock(&shared.alm);
         if alm.tier().own_call_audio_only() && !base_or_audio {
@@ -6377,9 +6396,15 @@ async fn forward(
     if targets.is_empty() {
         return;
     }
-    // 45.3 — the forward draws on the egress budget like own media, per
-    // chunk: the fragment marker that says where a frame ends is inside the
-    // end-to-end AEAD (`frame.rs`), so a relay cannot see a frame's extent.
+    // 45.3 row STALE — a relay on a backlogged uplink holds back what would
+    // arrive stale; and the forward draws on the egress budget like own
+    // media, per CHUNK: the fragment marker that says where a frame ends
+    // (`frame.rs`) is inside the end-to-end AEAD, so a relay cannot see a
+    // frame's extent, and a held chunk can cost a receiver the whole frame.
+    if let Some(why) = media_held_back(shared, inner.codec_id()) {
+        shared.count(why);
+        return;
+    }
     if !shared.transport.egress_budget().take(
         media_class(inner.codec_id()),
         chunk_wire_bytes(inner.inner_ciphertext().len()) * targets.len(),

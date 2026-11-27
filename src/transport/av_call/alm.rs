@@ -405,6 +405,19 @@ pub(super) const DRAIN_LEAVE_MS: u64 = UPLINK_BACKLOG_MS;
 /// four watch ticks, so one quick proof is not a drained queue.
 pub(super) const DRAIN_CLEAR_MS: u64 = 1_000;
 
+/// **45.3 row STALE — never send media that will arrive stale.** Transition:
+/// observable, the uplink backlog ([`UplinkDrain`]'s reading); action, while
+/// it is over the receivers' media budget (`MEDIA_STALE_BUDGET`, 800 ms) a
+/// media chunk handed to the uplink now would be dropped by row AGE at every
+/// receiver, so it is dropped here instead, AUDIO INCLUDED, and counted;
+/// must never, apply to control. What it buys: the queue drains even when
+/// audio alone does not fit, and audio resumes first (video waits for row
+/// DR to leave).
+pub(super) fn stale_at_sender(backlog_ms: Option<u64>) -> bool {
+    let budget = u64::try_from(super::MEDIA_STALE_BUDGET.as_millis()).unwrap_or(u64::MAX);
+    backlog_ms.is_some_and(|b| b > budget)
+}
+
 /// **45.3 row DR — the drain.** Transition: observable, the uplink backlog
 /// (the oldest unproved Channel message's age past its leg's RTT floor on
 /// the kept leg(s), from its SEND, measured each watch tick; `None` when no
@@ -628,6 +641,12 @@ impl AlmState {
     /// Test seam: turn rows DR, STALE and AGE off (`true`) or back on.
     pub(super) fn set_drain_off_for_test(&mut self, off: bool) {
         self.drain_off_for_test = off;
+    }
+
+    /// 45.3 row STALE — whether media handed to the uplink now would reach
+    /// its receivers stale ([`stale_at_sender`] on this tick's backlog).
+    pub(super) fn sends_stale(&self) -> bool {
+        !self.drain_off_for_test && stale_at_sender(self.drain.backlog_ms())
     }
 
     /// 45.3 row DR — whether this node withholds media now.
@@ -2692,6 +2711,17 @@ mod tests {
         // Between the bounds it neither enters nor leaves.
         assert_eq!(d.observe(62_250, Some(300)), None);
         assert!(!d.active());
+    }
+
+    /// 45.3 row STALE — media is dropped at the sender only once the backlog
+    /// is past the receivers' budget; nothing outstanding is never stale.
+    #[test]
+    fn media_is_dropped_at_the_sender_once_the_backlog_is_past_800_ms() {
+        assert!(!stale_at_sender(None));
+        assert!(!stale_at_sender(Some(0)));
+        assert!(!stale_at_sender(Some(800)));
+        assert!(stale_at_sender(Some(801)));
+        assert!(stale_at_sender(Some(9_000)));
     }
 
     /// 45.3 row DR — the oldest unproved message is aged from its SEND, not

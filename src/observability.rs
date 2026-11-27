@@ -1126,6 +1126,10 @@ pub const AV_FRAME_HELD_BUDGET: &str = "av_frame_held_budget";
 /// 45.3 — video resumed after the egress budget held frames of it: the point
 /// where the host's encoder would be asked for a keyframe.
 pub const AV_VIDEO_KEYFRAME_WANTED: &str = "av_video_keyframe_wanted";
+/// 45.3 row STALE — one media chunk (own or relayed, audio included) not
+/// handed to a backlogged uplink because it would reach its receivers past
+/// their media budget.
+pub const AV_CHUNK_DROPPED_STALE_AT_SENDER: &str = "av_chunk_dropped_stale_at_sender";
 /// G8 — a periodic offer not sent on a leg whose oldest unproved Channel
 /// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
 /// queue behind the backlog and spend that link's retry budget.
@@ -3063,6 +3067,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_BULK_DEFERRED_DRAIN,
     AV_FRAME_HELD_BUDGET,
     AV_VIDEO_KEYFRAME_WANTED,
+    AV_CHUNK_DROPPED_STALE_AT_SENDER,
     ALM_OFFER_HELD_BACKLOG,
     ALM_DEPARTURE_CONGESTION,
     ALM_LATE_MOVE,

@@ -309,8 +309,10 @@ counts handshakes whose link closed in the queue: they cost no crypto.
    (whole frames of own media; single chunks a relay forwards);
    `av_video_keyframe_wanted` counts each video resume after held frames;
    `av_bulk_deferred_budget` counts identity-plane sends that waited.
-4. `alm_drain_entered` counts backlog episodes (400 ms in, under 200 ms for
-   a second out).
+4. Over 800 ms, `av_chunk_dropped_stale_at_sender` counts media (audio
+   included) not sent because it would arrive stale (row STALE).
+   `alm_drain_entered` counts backlog episodes (400 ms in, under 200 ms for a
+   second out).
 
 ### Why is this call at another epoch than its room?
 
