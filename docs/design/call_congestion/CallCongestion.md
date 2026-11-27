@@ -253,6 +253,74 @@ The final run is in `results/` (`matrix.json`, `matrix.md`, `quality.md`). The t
   - The step fix (no compounding on unused room) changed nothing visible here.
 - **R13 — an overshoot at 1.5×.** With one sample per watch tick, a second child still reads late 200 ms after the first one left, before the queue has drained. So two leave where one would do, and the climb back costs one more widening. The rule should judge on a sustained, non-falling reading (decision row RM2).
 
+## The 45.3 rules (R24–R29)
+
+The 45.3 call-reliability rules as built on `work/45.3` (edge 6392b0a) are each checked by their own small spec in `rules_453/`, not folded into `CallCongestion.tla`. Each spec carries the code lines it models in its header.
+
+- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
+- **How to run.** `python3 docs/design/call_congestion/rules_453/run_rules.py OUTDIR --split [--only REGEX]`. `--split` runs each invariant alone, because with `-continue` a state that breaks two invariants is reported under the first only.
+- **The scheduler.** The same convention as `run_matrix.py`: `GRACE_SCHED_*` + `cargo_guard.sh` at priority low, nice 19, idle I/O class, `-Xmx2g`, 2 workers, declared peak 3 GB. Grace measured peaks of 0.78–1.7 GB.
+- **Tick.** One step is one watch tick (250 ms) unless a row says otherwise. Every timer is an age in ticks, capped, so most specs need no horizon.
+
+In the tables, "states / distinct / depth" are TLC's figures for that run. A failing run's figures are those at the first violation.
+
+### R29 OFFER-AS-LIFE
+
+**Rule.** A child does not charge a parent's silence while that parent's offer is < 2.5 s old, it is forwarding, and its upstream latency is > 800 ms. Excused time is nobody's silence: once the excuse ends, the parent owes chunks under the unchanged silence bound. A relay advertises ≥ its parent's latency + RTT/2, and ≥ the age of the chunks it dropped as stale in the last 2.5 s.
+
+**The model.** One publisher, one relay under test, one child. Life = 10 ticks; down_silence = 20; suspect = 6. The relay is at depth 1, so 9 ticks of silence make it Suspected (`selector.rs:1390`, `peer_state.rs:127-133`), and a Suspected primary is failed over (`selector.rs:1500-1503`). The publisher's backlog runs 0–12 ticks (3 s) and moves at most one tick a tick. Its backlog stamps wait in its own uplink FIFO, so a stamp reaches the relay as old as the backlog it declares. One offer in a row may be lost.
+
+There are four relay kinds:
+- **honest:** forwards fresh media and claims late exactly when the publisher's last word is late;
+- **liar:** offers every second claiming late, and sends nothing;
+- **black hole:** offers on time and sends nothing;
+- **gone:** its offers and media stop at some point.
+
+There are three rules for the excuse:
+- **current:** `selector.rs:1342-1344`, the relay's own unsigned claim;
+- **signed_pubage:** the excuse needs the publisher's signed backlog stamp, relayed unaltered, no older than 2.5 s;
+- **signed:** as signed_pubage, but the stamp's age is judged net of the backlog it declares (age − b ≤ 2.5 s).
+
+`gs` means the first-chunk grace (`selector.rs:1382-1389`) also comes from the stamp.
+
+| Run | Checks | States / distinct / depth | Result |
+|---|---|---|---|
+| liar-ontime-current | LiarFailsOver (◇ failover), publisher never late | 951 / 339 / – | **FAIL** (lasso) |
+| liar-ontime-current | LiarHeldTotal (held < down_silence) | 394 / 149 / 21 | **FAIL** |
+| liar-late-current | LiarAfterCalm (held ≤ Life + down after the publisher's last real backlog) | 64,721 / 22,675 / 32 | **FAIL** |
+| liar-late-current | LiarWithinDown | 223,123 / 72,062 / 56 | pass (vacuous: the liar is never unexcused) |
+| liar-ontime-signed | LiarFailsOver | 621 / 227 / 30 | pass |
+| liar-ontime-signed | LiarHeldTotal | 394 / 149 / 21 | **FAIL** |
+| liar-late-signed | LiarWithinDown, LiarAfterCalm | 106,633 / 38,057 / 37; 121,167 / 41,453 / 38 | **FAIL**, **FAIL** |
+| liar-ontime-signed-gs | LiarHeldTotal, LiarFailsOver | 171 / 67 / 10 | pass, pass |
+| liar-late-signed-gs | LiarWithinDown, LiarAfterCalm | 140,956 / 47,468 / 44 | pass, pass |
+| honest-current | NeverFailsOver, NotChargedAtOnce | 252,837 / 83,463 / 49 | pass |
+| honest-signed-gs | NeverFailsOver, NotChargedAtOnce | 252,837 / 83,463 / 49 | pass |
+| honest-signed_pubage-gs | NeverFailsOver | 614,349 / 207,717 / 53 | **FAIL** |
+| honest-signed_pubage-gs, backlog ≤ 2 s | NeverFailsOver | 539,444 / 179,622 / 53 | pass |
+| gone-current / -signed_pubage-gs / -signed-gs | OffersStopBound (≤ 2.5 s + down_silence), NotChargedAtOnce | 14.79 M / 5.24 M / 49; 15.18 M / 5.45 M / 53; 14.79 M / 5.24 M / 49 | pass |
+| blackhole-current | BlackHoleBound (on time ⇒ failed over within down_silence), NotChargedAtOnce | 1,134 / 429 / 10 | pass |
+| blackhole-signed_pubage-gs / -signed-gs | BlackHoleBound, NotChargedAtOnce | 216,987 / 83,826 / 44; 99,307 / 37,080 / 44 | pass |
+| advert-last (R29b, as built) | AdvOverParent, AdvOverDrops, AdvStillLate | see below | see below |
+
+**Counterexamples, in plain words.**
+- **The lying relay holds a child forever under the current rule.** The liar offers once a second with `forwarding` set and an upstream latency of 900 ms, and sends no media. Every offer is fresh and claims late, so the excuse holds on every tick and the child's silence stays 0. TLC's lasso repeats one offer period for ever, with the child still attached and no chunk ever arrived.
+  - Nothing in the failover path moves it. Failover needs Suspected, Down, depth, membership or eligibility (`selector.rs:1500-1503`). Lateness gives at most Degraded, and that needs a meter window of chunks.
+  - The only exit is the voluntary switch (`selector.rs:1646-1698`). It needs a warm standby with at least 2 windows of its own media, room, and a better score held for `hysteresis_hold_windows`. With no such standby, the child is held.
+- **Signing the excuse is not enough while the grace is unsigned.** The liar never delivers, so `first_owed` stays true for ever. The grace is `min(offer.upstream_latency_ms, down_silence)` = 5 s, taken from the liar's unsigned claim. A liar whose excuse is grounded is therefore still held 5 s plus the silence bound past it: 29 ticks = 7.25 s when the publisher was never late.
+- **Judging a stamp's age raw fails honest relays.** Once the publisher's backlog passes about 2.5 s, every stamp reaches the relay already older than 2.5 s, because it waited in the very queue it reports. No honest relay is excused, and the child fails over a parent that is dropping stale media correctly. Judging age net of the declared backlog removes this: 252,837 states pass.
+- **With the fix (signed, net of backlog, grace from the stamp):**
+  - A liar on a publisher that was never late is failed over within 12 ticks (3 s) < down_silence.
+  - A liar that saved a real late stamp is failed over within down_silence of that stamp expiring, and within Life + down_silence of the publisher's last real backlog.
+  - Any relay that holds a real, recent late stamp is excused, honest or not. That is correct: nothing fresh exists then.
+- **NotChargedAtOnce holds under every rule.** No failover happens before 9 ticks of silence have passed since both the last chunk and the last excused tick.
+
+**R29b, the advertised latency.** The as-built relay keeps only its LATEST stale drop (`alm.rs:1722-1726`, `stale_seen.insert` overwrites), not the largest drop of the last 2.5 s. So "advertised ≥ every recent drop's age" can fail: a 2.0 s drop followed by a 0.9 s drop advertises 0.9 s. Each recorded drop is already past 800 ms, so the excuse (> 800 ms) still holds (AdvStillLate). Result: see the R29b row of the table below.
+
+### R24–R28
+
+The table and counterexamples for these rows follow.
+
 
 ## Decision table
 

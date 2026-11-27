@@ -1,0 +1,60 @@
+"""Scenarios for rows R24-R28 and R29's advertised-latency clause; imported by
+run_rules.py (see its docstring)."""
+
+
+def register(add, B, S):
+    # ---------------------------------------------------------------- R24
+    sc = dict(MaxMarks=240, SeqMod=16, MaxOut=3, MaxSend=2, H=8)
+    add("R24-sendclock", "SendClock", dict(sc, Clock=S("send")),
+        invs=["TypeOK", "SendClockExact", "NeverOverReads"])
+    add("R24-sendclock-marks3", "SendClock", dict(sc, Clock=S("send"), MaxMarks=3),
+        invs=["TypeOK", "SendClockExact", "SendClockBounded", "NeverOverReads"])
+    add("R24-sendclock-seqmod8", "SendClock", dict(sc, Clock=S("send"), SeqMod=8),
+        invs=["TypeOK", "SendClockExact", "NeverOverReads"])
+    add("R24-oldest-since", "SendClock", dict(sc, Clock=S("oldest_since")),
+        invs=["TypeOK", "SendClockExact"])
+    # ---------------------------------------------------------------- R25
+    ub = dict(QMax=4, PMax=2, Enter=2, Leave=1, Clear=4, Latch=8, StaleT=4,
+              SlowOnly=S("any"))
+    for n in (1, 2, 3):
+        add(f"R25-backlog-n{n}", "UplinkBacklog", dict(ub, N=n),
+            invs=["TypeOK", "OnePeerIsNotOwn", "OwnQueueSeen", "OwnStaleSeen",
+                  "BackloggedStalled", "DrainStalled", "NoRelayOfferStalled"])
+    add("R25-backlog-n3-slowkept", "UplinkBacklog", dict(ub, N=3, SlowOnly=S("kept")),
+        invs=["TypeOK"], props=["DrainEnds"])
+    # ---------------------------------------------------------------- R26
+    st = dict(C=2, MMax=4, CtlMax=1, LMax=14, StaleT=3)
+    for bound in (3, 5, 6, 7):
+        add(f"R26-stale-bound{bound}", "StaleAtSender", dict(st, Rule=S("stale"), Bound=bound),
+            invs=["TypeOK", "ArrivalBound"])
+    add("R26-stale", "StaleAtSender", dict(st, Rule=S("stale"), Bound=99),
+        invs=["TypeOK", "ControlNeverHeld"], props=["Drains"])
+    add("R26-none", "StaleAtSender", dict(st, Rule=S("none"), Bound=99),
+        invs=["TypeOK", "ControlNeverHeld"], props=["Drains"])
+    # ---------------------------------------------------------------- R27
+    af = dict(Budget=16, Near=1, Step=40, DMax=20, WMax=4, MaxSteps=1, Rolls=1,
+              MaxReanchor=1)
+    for fl in ("current", "confirm", "confirm0"):
+        add(f"R27-age-{fl}", "AgeFloor", dict(af, Floor=S(fl)),
+            invs=["TypeOK", "NoFalseStale", "NoFalseStaleHandout", "StaleCaught",
+                  "NeverForwardStale", "HandedFresh"])
+        add(f"R27-age-{fl}-nostep", "AgeFloor", dict(af, Floor=S(fl), MaxSteps=0),
+            invs=["TypeOK", "NoFalseStale", "StaleCaught", "HandedFresh"])
+    # ---------------------------------------------------------------- R28
+    eb = dict(C=4, RMin=2, RMax=8, VMax=4, S=2, LMax=24, FastT=8, LiftT=12,
+              WMax=3, KWire=3, DebtMax=8, FloorDebit=S("all"))
+    for deb in ("all", "floor_only"):
+        add(f"R28-budget-{deb}", "EgressBudget", dict(eb, Floor=B(True), FloorDebit=S(deb)),
+            invs=["TypeOK", "FirstWireWait", "AudioBeforeVideo", "VideoBeforeBulk",
+                  "BulkWaitBound", "FloorDebtBounded", "WithinRate", "QueueBounded"],
+            props=["BulkServed"])
+    for kw in (4, 5, 6):
+        add(f"R28-firstwait-k{kw}", "EgressBudget", dict(eb, Floor=B(True), KWire=kw),
+            invs=["TypeOK", "FirstWireWait"])
+    add("R28-budget-nofloor", "EgressBudget", dict(eb, Floor=B(False)),
+        invs=["TypeOK", "BulkWaitBound"], props=["BulkServed"])
+    # ---------------------------------------------------- R29 (second clause)
+    ra = dict(Life=10, AMax=10, StaleB=8, Parent=3, HalfRtt=1)
+    for keep in ("last", "max"):
+        add(f"R29b-advert-{keep}", "RelayAdvert", dict(ra, Keep=S(keep)),
+            invs=["TypeOK", "AdvOverParent", "AdvOverDrops", "AdvStillLate"])
