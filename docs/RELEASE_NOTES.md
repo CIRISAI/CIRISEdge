@@ -1,5 +1,21 @@
 # CIRISEdge Release Notes
 
+# Unreleased — 45.3 (in progress): a capped uplink sends what will arrive in time
+
+Not yet released. Detail in CHANGELOG.md.
+
+- **A node reads its own uplink's backlog** and keeps one sending budget for everything it
+  sends: call control first and never held, then audio, then video, then everything else. Room
+  removals, revocations, keys, halts and other rows that change who may see what are never held
+  behind video; bulk always gets a share and never arrives in a burst.
+- **Nothing is sent, delivered or relayed once it is past 800 ms old** (the live-media staleness
+  budget): a listener hears late media as a gap, not seconds behind the room.
+- **A relay judges what it forwards chunk by chunk.** The marker that says where a video frame
+  ends is sealed end to end, so a relay cannot see frame boundaries: when it must hold or drop
+  media it does so per chunk, and one lost chunk can cost a listener the whole frame.
+- **Known:** on a capped uplink audio still misses its bar; the next step is scheduling inside
+  the Reticulum layer itself.
+
 # v45.2.1 — a call follows its room, and every build lane compiles
 
 **2026-11-25.** **PATCH.** Pins unchanged: persist v61.4.4, CIRISVerify v22.2.4, leviculum

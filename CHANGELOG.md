@@ -2,6 +2,41 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## Unreleased — 45.3 (in progress)
+
+**A capped uplink sends what will arrive in time.** Not yet released; no wire change.
+
+### Added
+- The uplink backlog reading: per leg, the oldest unproved Channel message aged from its send
+  past the leg's RTT floor, least over every leg with something outstanding (two at least).
+  `alm_uplink_backlog_ms`, `alm_drain_entered`.
+- The node's egress budget: one rate for everything edge sends, set by delay-based AIMD from the
+  reading, serving control (never held), audio, video, then bulk. Own media is admitted per whole
+  frame. `alm_media_budget_bps`, `av_frame_held_budget`, `av_video_keyframe_wanted`,
+  `av_bulk_deferred_budget`.
+- FIRST class: identity-plane sends are never held unless known to be bulk. Replication rows are
+  classed by family (key, revocation, accord, membership/roster, epoch, session, consent and
+  moderation rows FIRST; chat, file, scores and directory rows bulk); what edge cannot place is
+  FIRST. Bulk has a guaranteed floor of the budget (10 %, at least 8 kbit/s) and never bursts.
+- Row STALE: media that would arrive past the 800 ms live-media staleness budget is not sent,
+  audio included (`av_chunk_dropped_stale_at_sender`).
+- Row AGE: media more than 800 ms above its per-(stream, epoch) floor is dropped by receivers and
+  relays, per chunk on arrival and per frame at hand-out; never delivered, never relayed on.
+- Offer-as-life: a parent still offering a stream whose upstream it reports past the budget is
+  not failed over for silence; offers carry the publisher's backlog and a relay's real lateness.
+
+### Fixed
+- A backlogged uplink counts as stalled (the verdict lapsed under a standing queue), and a
+  stalled node sends no relay offers.
+
+### Known
+- A relay drops and admits per CHUNK, not per frame: the fragment marker that says where a frame
+  ends is inside the end-to-end AEAD, so a relay cannot see a frame's extent, and one chunk held
+  or dropped can cost a receiver the whole frame.
+- On the faithful 300 kbit/s bench audio within 800 ms is 0.31-0.35 (bar 0.95): the remaining
+  queue is below edge (first burst, loop delay, proofs and Resource parts it does not schedule).
+  The leviculum egress scheduler is the next step.
+
 ## 45.2.1 — 2026-11-25
 
 **PATCH. A call follows its room's group; every build lane compiles.** Pins unchanged.
