@@ -131,16 +131,34 @@ mod rxmove;
 pub use alm::{AlmCounts, AlmParents, RelayedTo, CANONICAL_AV_FALLBACK};
 
 /// **The live-media staleness budget** (CC's text names it; 800 ms): live
-/// media older than this is of no use to a listener. Row STALE (the sender:
-/// never handed to the uplink) and ALM C5 (the inbound queue, dropped oldest
+/// media older than this is of no use to a listener. Row AGE (receivers and
+/// relays: never delivered, never relayed on), row STALE (the sender: never
+/// handed to the uplink), and ALM C5 (the inbound queue, dropped oldest
 /// first before it is opened: twice [`REORDER_WINDOW_MAX`], past which the
-/// reorder window would skip it anyway) judge against it.
+/// reorder window would skip it anyway) all judge against it.
 ///
-/// Scope (CC review): STALE applies on the LIVE PUSH path, for
-/// presentation, and to profile-0 (live) streams only. A profile-1
-/// (accountable) stream is exempt when edge publishes one; edge publishes no
-/// stream profile today, so every stream it carries is profile 0.
+/// Scope (CC review): AGE and STALE apply on the LIVE PUSH path, for
+/// presentation, and to profile-0 (live) streams only. A stored chunk read
+/// back later is not judged by it, and a profile-1 (accountable) stream is
+/// exempt when edge publishes one; edge publishes no stream profile today,
+/// so every stream it carries is profile 0.
 pub const MEDIA_STALE_BUDGET: Duration = Duration::from_millis(800);
+/// 45.3 row AGE — whether a media chunk whose latency reads `latency_ms`
+/// above its AGE floor is stale: past [`MEDIA_STALE_BUDGET`]. The floor is
+/// the least `wall − source_ts` this receiver has seen for the stream IN
+/// THIS EPOCH (CC review: the floor's lifetime is one (stream, epoch), so a
+/// floor taught wrong, by a publisher clock that stepped for one chunk,
+/// lasts at most to the next roll) and only ever falls on a better sample
+/// (RM1, with its drift re-anchor), so a ±5 min skew between the hosts (CC
+/// 2.6.7) is in the floor, not the latency. A stream that is ALREADY late
+/// when this receiver first hears it in an epoch reads its late offset as
+/// the floor until one faster chunk arrives: such media passes (it is not
+/// known stale) until then. Each receiver keeps its own floor: a relay's
+/// never travels.
+fn is_stale_end_to_end(latency_ms: Option<i64>) -> bool {
+    let budget = i64::try_from(MEDIA_STALE_BUDGET.as_millis()).unwrap_or(i64::MAX);
+    latency_ms.is_some_and(|l| l > budget)
+}
 
 /// ALM C5 — consecutive congested sends before a leg is shed to the base
 /// layer.
@@ -5893,7 +5911,7 @@ async fn pump(
         // C1, receiver side: this path delivered this chunk.
         let base_or_audio = is_base_or_audio(signed.codec_id(), signed.layer());
         shared.note_first_frame();
-        Shared::lock(&shared.alm).on_chunk(
+        let latency_ms = Shared::lock(&shared.alm).on_chunk(
             stream,
             peer,
             signed.epoch().0,
@@ -5903,6 +5921,17 @@ async fn pump(
             base_or_audio,
             hop_lost,
         );
+        // 45.3 row AGE — media judged END TO END: past the stream's RM1
+        // floor (its fastest delivery seen, so clock skew between the hosts
+        // cancels) by more than the budget, it is stale whatever path or
+        // queue made it so. Dropped and counted like a per-hop stale chunk,
+        // never delivered and never relayed on. The per-hop queue test above
+        // stands beside it.
+        if is_stale_end_to_end(latency_ms) && !Shared::lock(&shared.alm).queue_rules_off() {
+            Shared::lock(&shared.alm).counts.stale_dropped += 1;
+            shared.count(crate::observability::AV_FRAME_STALE_DROPPED);
+            continue;
+        }
         // Forward as an admitted media parent (ALM), and first-hand copies to
         // pre-C3 members when this node relays (the legacy relay). The
         // signature travels with the chunk.
@@ -6604,10 +6633,30 @@ async fn reorder_loop(
         if rx_pub.take_due(now) {
             legs::publish_rx(&shared, &mut rx, &mut window, &frames_of, now);
         }
+        // 45.3 row AGE at presentation: a whole frame is judged again as it
+        // is handed out. The pump judged each chunk on arrival; a frame
+        // waiting on its other fragments or the reorder window can pass that
+        // and still reach the host stale (837-918 ms above the floor on the
+        // capped bench), and the host is never handed stale media.
+        let stale_now: Vec<bool> = {
+            let a = Shared::lock(&shared.alm);
+            let off = a.queue_rules_off();
+            whole
+                .iter()
+                .map(|f| {
+                    !off && is_stale_end_to_end(a.latency_now(f.stream, f.epoch.0, f.source_ts_ms))
+                })
+                .collect()
+        };
         // Delivery to the host is lossy by design: a host that is not
         // reading loses the newest whole frames, counted, and this stage
         // (and every pump behind it) never waits on it.
-        for f in whole {
+        for (f, stale) in whole.into_iter().zip(stale_now) {
+            if stale {
+                Shared::lock(&shared.alm).counts.stale_dropped += 1;
+                shared.count(crate::observability::AV_FRAME_STALE_DROPPED);
+                continue;
+            }
             match frames.try_send(f) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {

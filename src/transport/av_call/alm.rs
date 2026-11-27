@@ -292,6 +292,10 @@ pub(super) struct AlmState {
     forwarded_seen: BTreeMap<StreamId, SeenRing>,
     /// RM1 — each received stream's latency floor ([`LatencyFloor`]).
     min_offset: BTreeMap<StreamId, LatencyFloor>,
+    /// 45.3 row AGE — the AGE floor, one per (stream, epoch) (CC review):
+    /// RM1's rule, restarting at each roll. RM2's lateness keeps the
+    /// stream's own floor ([`Self::min_offset`]).
+    age_floor: BTreeMap<(StreamId, u64), LatencyFloor>,
     last_offer_ms: u64,
     pub(super) counts: AlmCounts,
     pub(super) labels: Vec<&'static str>,
@@ -580,6 +584,7 @@ impl AlmState {
             rates: BTreeMap::new(),
             forwarded_seen: BTreeMap::new(),
             min_offset: BTreeMap::new(),
+            age_floor: BTreeMap::new(),
             last_offer_ms: 0,
             counts: AlmCounts::default(),
             labels: Vec::new(),
@@ -641,6 +646,11 @@ impl AlmState {
     /// Test seam: turn rows DR, STALE and AGE off (`true`) or back on.
     pub(super) fn set_drain_off_for_test(&mut self, off: bool) {
         self.drain_off_for_test = off;
+    }
+
+    /// Whether the queue rules (DR, STALE, AGE) are off (a test seam).
+    pub(super) fn queue_rules_off(&self) -> bool {
+        self.drain_off_for_test
     }
 
     /// 45.3 row STALE — whether media handed to the uplink now would reach
@@ -1504,7 +1514,9 @@ impl AlmState {
     /// C1, receiver side: a verified chunk of `stream` from `from`.
     /// `source_ms` is the publisher's signed timestamp; latency is measured
     /// above the fastest delivery seen for the stream, so clock offset
-    /// between the hosts cancels.
+    /// between the hosts cancels. Returns that latency (ms above the RM1
+    /// floor; `None` for this node's own stream): 45.3 row AGE drops a chunk
+    /// whose latency is past [`super::MEDIA_STALE_BUDGET`].
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_wrap,
@@ -1520,32 +1532,44 @@ impl AlmState {
         source_ms: u64,
         base_or_audio: bool,
         hop_lost: u64,
-    ) {
+    ) -> Option<i64> {
         if self.is_own(stream) {
-            return;
+            return None;
         }
         let now = self.now_ms();
         let newest = self.epochs.entry(stream).or_insert(epoch);
         if epoch > *newest {
             *newest = epoch;
             self.labels.push(crate::observability::ALM_EPOCH_RESYNC);
+            // The AGE floor starts again with the roll; the epoch before
+            // stays for the chunks still on their way from it.
+            let keep_from = epoch.saturating_sub(1);
+            self.age_floor
+                .retain(|(s, e), _| *s != stream || *e >= keep_from);
         }
         let wall = crate::transport::av_chunk_auth::unix_ms_now();
         let offset = wall as i64 - source_ms as i64;
+        let age_ms = self
+            .age_floor
+            .entry((stream, epoch))
+            .or_insert_with(|| LatencyFloor::new(offset, now))
+            .sample(offset, now);
         // RM1: a better floor wins at once; only an on-time sample
         // re-anchors an old one (drift), never a queued one.
-        let latency = self
+        let latency_ms = self
             .min_offset
             .entry(stream)
             .or_insert_with(|| LatencyFloor::new(offset, now))
-            .sample(offset, now) as f64;
+            .sample(offset, now);
+        #[allow(clippy::cast_precision_loss)]
+        let latency = latency_ms as f64;
         // RM2: per path, so the publisher's own delivery is read alone.
         self.readings
             .entry((stream, from.to_owned()))
             .or_default()
             .push(now, latency);
         let Some(sel) = self.sels.get_mut(&stream) else {
-            return;
+            return Some(age_ms);
         };
         let role = sel
             .subscriptions()
@@ -1573,6 +1597,7 @@ impl AlmState {
                 .or_default()
                 .add(bytes, base_or_audio);
         }
+        Some(age_ms)
     }
 
     /// What every admission on this uplink but `stream`'s commits (bits/s):
@@ -1665,6 +1690,18 @@ impl AlmState {
         a.set_shed_on_verdict_only(true);
         self.relays.insert(s, a);
         self.sync_upstream(s);
+    }
+
+    /// 45.3 row AGE — a received frame of `stream` stamped `source_ms` by its
+    /// publisher: how far above the stream's RM1 floor it is NOW (`None`
+    /// before the stream's first chunk set a floor). Read at hand-out to the
+    /// host: what the pump passed can still go stale waiting on its other
+    /// fragments or the reorder window.
+    pub(super) fn latency_now(&self, stream: StreamId, epoch: u64, source_ms: u64) -> Option<i64> {
+        let floor = self.age_floor.get(&(stream, epoch))?.floor();
+        #[allow(clippy::cast_possible_wrap)]
+        let offset = crate::transport::av_chunk_auth::unix_ms_now() as i64 - source_ms as i64;
+        Some(offset.saturating_sub(floor))
     }
 
     fn sync_upstream(&mut self, stream: StreamId) {
@@ -2009,6 +2046,7 @@ impl AlmState {
         self.rates.remove(&old);
         self.forwarded_seen.remove(&old);
         self.min_offset.remove(&old);
+        self.age_floor.retain(|(s, _), _| *s != old);
         self.readings.retain(|(s, _), _| *s != old);
         self.late_moved.remove(&old);
         self.late_noted.remove(&old);
@@ -3711,6 +3749,57 @@ mod tests {
     /// The receiver's floor for `stream` (its minimum clock offset).
     fn floor_of(n: &AlmState, stream: StreamId) -> i64 {
         n.min_offset[&stream].floor()
+    }
+
+    /// 45.3 row AGE (CC review) — the AGE floor lives one (stream, epoch).
+    /// The publisher's clock steps 2 s ahead for ONE chunk: that chunk is the
+    /// floor's new minimum, so every on-time chunk after it reads 2 s late
+    /// and is dropped as stale; the drift re-anchor never takes it back (no
+    /// later chunk comes within FLOOR_NEAR_MS of it), however long. At the
+    /// next roll the floor starts again and the stream is fresh at once.
+    /// Mutation: a floor kept per stream across epochs drops the stream for
+    /// good.
+    #[test]
+    fn a_publisher_clock_step_for_one_chunk_is_forgotten_at_the_roll() {
+        let mut b = AlmState::new("b", s(2), &roster(), true, 2);
+        b.on_caps("a", CAPS_THIS_BUILD);
+        b.note_publisher(s(1), "a");
+        b.note_bound_publisher(s(1), "a");
+        let stale = |l: Option<i64>| super::super::is_stale_end_to_end(l);
+        let chunk = |b: &mut AlmState, epoch: u64, seq: u64, ahead_ms: u64| {
+            let src = crate::transport::av_chunk_auth::unix_ms_now() + ahead_ms;
+            let l = b.on_chunk(s(1), "a", epoch, seq, 300, src, true, 0);
+            b.t0 = b.t0.checked_sub(Duration::from_millis(33)).expect("clock");
+            l
+        };
+        let mut seq = 0;
+        for _ in 0..30 {
+            assert!(!stale(chunk(&mut b, 1, seq, 0)), "on time");
+            seq += 1;
+        }
+        // One chunk stamped 2 s ahead: the floor falls to it.
+        assert!(!stale(chunk(&mut b, 1, seq, 2_000)));
+        seq += 1;
+        for _ in 0..30 {
+            assert!(
+                stale(chunk(&mut b, 1, seq, 0)),
+                "read 2 s late after the step"
+            );
+            seq += 1;
+        }
+        // Forty seconds on, still the same epoch: the re-anchor needs a chunk
+        // near the floor, and none comes.
+        b.t0 = b.t0.checked_sub(Duration::from_secs(40)).expect("clock");
+        assert!(
+            stale(chunk(&mut b, 1, seq, 0)),
+            "no re-anchor from a late sample"
+        );
+        seq += 1;
+        // The roll: the floor starts again, fresh from its first chunk.
+        for k in 0..30 {
+            assert!(!stale(chunk(&mut b, 2, k, 0)), "fresh in the new epoch");
+        }
+        let _ = seq;
     }
 
     /// RM1 — observable: a chunk's signed `source_ts_ms` against the wall

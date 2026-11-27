@@ -43,7 +43,6 @@ impl LatencyFloor {
     }
 
     /// The floor (ms of clock offset).
-    #[cfg(test)]
     pub(super) fn floor(&self) -> i64 {
         self.floor
     }

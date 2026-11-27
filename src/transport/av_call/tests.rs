@@ -1109,3 +1109,46 @@ fn a_relayed_binding_repeat_goes_only_to_children() {
         "no children: nobody"
     );
 }
+
+/// 45.3 row AGE — staleness is judged end to end above the stream's RM1
+/// floor, so a ±5 min clock skew between the publisher and this receiver
+/// (CC 2.6.7) cancels: 799 ms late passes, 801 ms is dropped, either way the
+/// clocks disagree.
+#[test]
+fn media_is_stale_past_800_ms_above_its_floor_whatever_the_clock_skew() {
+    use super::rxmove::LatencyFloor;
+    for skew in [-300_000_i64, 0, 300_000] {
+        let mut floor = LatencyFloor::new(skew + 20, 0);
+        let mut at =
+            |offset: i64, now: u64| super::is_stale_end_to_end(Some(floor.sample(offset, now)));
+        assert!(!at(skew + 20, 100), "on time ({skew})");
+        assert!(!at(skew + 20 + 799, 200), "799 ms late passes ({skew})");
+        assert!(at(skew + 20 + 801, 300), "801 ms late is stale ({skew})");
+        assert!(at(skew + 20 + 9_000, 400), "a 9 s queue is stale ({skew})");
+    }
+    assert!(!super::is_stale_end_to_end(None), "this node's own stream");
+}
+
+/// 45.3 row AGE — a stream already 9 s late when this receiver first hears
+/// it: its late offset is the floor (not known stale) until one faster chunk
+/// lowers it, and from then the late ones are stale. The floor never rises
+/// on a late sample, so a queue that persists cannot teach itself away.
+#[test]
+fn a_stream_that_starts_late_is_judged_from_its_first_on_time_chunk() {
+    use super::rxmove::LatencyFloor;
+    let skew = 123_456_i64;
+    let late = skew + 9_000;
+    let mut floor = LatencyFloor::new(late, 0);
+    assert!(!super::is_stale_end_to_end(Some(floor.sample(late, 250))));
+    // Still late a minute on: the floor did not climb to make it "on time"
+    // (it was already there), and nothing faster has come.
+    assert!(!super::is_stale_end_to_end(Some(
+        floor.sample(late + 30, 60_000)
+    )));
+    // The queue drains: one on-time chunk is the new floor at once...
+    assert!(!super::is_stale_end_to_end(Some(
+        floor.sample(skew + 10, 61_000)
+    )));
+    // ...and the queue coming back is stale.
+    assert!(super::is_stale_end_to_end(Some(floor.sample(late, 62_000))));
+}

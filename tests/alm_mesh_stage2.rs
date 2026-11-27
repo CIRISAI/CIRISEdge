@@ -4066,6 +4066,57 @@ fn count_frames_from(listeners: &mut [Call], publisher: &str) -> FrameCounts {
     FrameCounts { counts, tasks }
 }
 
+/// One listener's arrivals: each frame's seq and when it was handed out.
+type ArrivalLog = Arc<std::sync::Mutex<Vec<(u64, tokio::time::Instant)>>>;
+
+/// Every frame each of `listeners` hears from `publisher`: its seq (the
+/// `body` prefix) and when it was handed out, recorded as it arrives.
+struct FrameArrivals {
+    got: Vec<ArrivalLog>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl FrameArrivals {
+    fn read(&self) -> Vec<Vec<(u64, tokio::time::Instant)>> {
+        self.got
+            .iter()
+            .map(|g| g.lock().expect("arrivals").clone())
+            .collect()
+    }
+}
+
+impl Drop for FrameArrivals {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+fn record_frames_from(listeners: &mut [Call], publisher: &str) -> FrameArrivals {
+    let mut got = Vec::new();
+    let mut tasks = Vec::new();
+    for l in listeners.iter_mut() {
+        let mut rx = l.frames().expect("frames");
+        let g: ArrivalLog = Arc::default();
+        let w = Arc::clone(&g);
+        let from = publisher.to_owned();
+        tasks.push(tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if f.publisher == from {
+                    if let Some(s) = seq_of(&f.bytes) {
+                        w.lock()
+                            .expect("arrivals")
+                            .push((s, tokio::time::Instant::now()));
+                    }
+                }
+            }
+        }));
+        got.push(g);
+    }
+    FrameArrivals { got, tasks }
+}
+
 /// One frame at the 30 Hz these witnesses publish at.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
@@ -4550,7 +4601,11 @@ async fn a_member_whose_host_reads_nothing_still_relays_to_its_child() {
 /// and everyone keeps hearing `P` at about the one-copy rate. What must not
 /// happen (CIRISEdge 45.1.9 matrix, leviculum#113): every link of `P`
 /// torn down by Channel retry exhaustion within ~2 s of the cap.
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::cast_precision_loss
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     let _call = one_call().await;
@@ -4588,17 +4643,47 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     for l in &listeners {
         wait_legs(l, 3).await;
     }
-    // Counted as they arrive: each call's frame queue holds 256, and a
-    // count read only at the end is capped there.
-    let heard_of = count_frames_from(&mut listeners, &p.key.key_id);
+    // Recorded as they arrive: each call's frame queue holds 256, and a
+    // count read only at the end is capped there. Each frame's age is its
+    // arrival less its publish() call, on the one process clock.
+    let arrivals = record_frames_from(&mut listeners, &p.key.key_id);
+    let pid = p.key.key_id.clone();
+    let mut stamps: Vec<Stamp> = Vec::new();
+    let mut looks = Vec::new();
     // Baseline: the full mesh carries P.
-    let (seq, base_lat) = publish_timed_for(&mut cp, 5, 0).await;
+    let origin = tokio::time::Instant::now();
+    let seq = publish_looking_stamped(
+        &mut cp,
+        &listeners,
+        &uplink,
+        origin,
+        5,
+        0,
+        &mut looks,
+        Some(&mut stamps),
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let base = heard_of.read();
+    let base: Vec<usize> = arrivals.read().iter().map(Vec::len).collect();
     assert!(
-        base.iter().all(|n| *n * 10 >= seq * 9),
+        base.iter().all(|n| *n as u64 * 10 >= seq * 9),
         "baseline: {base:?} of {seq}"
     );
+    let sent_at: std::collections::HashMap<u64, tokio::time::Instant> =
+        stamps.iter().map(|(q, t, _)| (*q, *t)).collect();
+    // Each listener's floor: its quickest baseline frame (AGE's RM1 floor is
+    // the same kind of minimum, learned from the stream's on-time chunks).
+    let floor: Vec<Duration> = arrivals
+        .read()
+        .iter()
+        .map(|g| {
+            g.iter()
+                .filter_map(|(q, at)| sent_at.get(q).map(|t| at.saturating_duration_since(*t)))
+                .min()
+                .unwrap_or_default()
+        })
+        .collect();
+    let base_lat = stamps.iter().map(|(_, _, d)| *d).max().unwrap_or_default();
 
     // The cap: one copy of P's stream on the wire and a third to spare (the
     // server's cell, 250 kbit/s against ~190 kbit/s a copy, scaled to this
@@ -4644,17 +4729,30 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     };
     let capped_from = seq;
     let _ = uplink.take_peak();
-    let (seq, capped_lat) = publish_timed_for(&mut cp, 30, seq).await;
+    let mut capped = Vec::new();
+    let mut capped_stamps: Vec<Stamp> = Vec::new();
+    let seq = publish_looking_stamped(
+        &mut cp,
+        &listeners,
+        &uplink,
+        cap_on,
+        30,
+        seq,
+        &mut capped,
+        Some(&mut capped_stamps),
+    )
+    .await;
     sampler.abort();
     let peak = uplink.take_peak();
     let sent = seq - capped_from;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let heard: Vec<u64> = heard_of
-        .read()
+    let capped_lat = capped_stamps
         .iter()
-        .zip(&base)
-        .map(|(n, b)| n - b)
-        .collect();
+        .map(|(_, _, d)| *d)
+        .max()
+        .unwrap_or_default();
+    let sent_in_cap: std::collections::HashMap<u64, tokio::time::Instant> =
+        capped_stamps.iter().map(|(q, t, _)| (*q, *t)).collect();
     let exhausted: u64 = nodes
         .iter()
         .map(|n| channel_exhausted(&n.metrics))
@@ -4667,15 +4765,79 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
         .collect();
     let direct = parents
         .iter()
-        .filter(|x| x.as_deref() == Some(p.key.key_id.as_str()))
+        .filter(|x| x.as_deref() == Some(pid.as_str()))
         .count();
+    // Settled: P's uplink first queued 300 ms, that media's 300 ms on its
+    // way, and a second for the moves (the deadline
+    // `a_capped_publishers_children_move_themselves_and_come_back` holds the
+    // children to).
+    let late_at = capped
+        .iter()
+        .find(|l| l.queue_ms.is_some_and(|q| q >= 300))
+        .map(|l| l.at);
+    let settle = late_at.map(|t| t + Duration::from_millis(300) + Duration::from_secs(1));
+    let settle_at = settle.map(|d| cap_on + d);
+    // Per listener, over the capped run: frames delivered, the oldest one's
+    // age above its floor, and the fresh ones after the settle (within
+    // MEDIA_FRESH of their publish, above the floor).
+    let got = arrivals.read();
+    let mut delivered = Vec::new();
+    let mut oldest = Vec::new();
+    let mut fresh_settled = Vec::new();
+    for (i, g) in got.iter().enumerate() {
+        let mine: Vec<(Duration, tokio::time::Instant)> = g
+            .iter()
+            .filter_map(|(q, at)| {
+                sent_in_cap
+                    .get(q)
+                    .map(|t| (at.saturating_duration_since(*t), *at))
+            })
+            .collect();
+        delivered.push(mine.len());
+        oldest.push(
+            mine.iter()
+                .map(|(a, _)| a.saturating_sub(floor[i]))
+                .max()
+                .unwrap_or_default(),
+        );
+        fresh_settled.push(
+            mine.iter()
+                .filter(|(a, at)| {
+                    settle_at.is_some_and(|s| *at >= s) && a.saturating_sub(floor[i]) <= MEDIA_FRESH
+                })
+                .count(),
+        );
+    }
+    let settled_secs = settle.map_or(0.0, |d| 30.0 - d.as_secs_f64());
+    let direct_idx = parents
+        .iter()
+        .position(|x| x.as_deref() == Some(pid.as_str()));
     let context = format!(
-        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; peak queue {peak:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
-         ChannelExhausted {exhausted}; torn {torn}; first teardown after the cap (P, A, B, C, T) {:?}; P legs {:?}",
+        "copy {copy_kbit} kbit/s; sent {sent}; delivered {delivered:?}; floors {floor:?}; oldest above floor {oldest:?}; \
+         fresh after settle {fresh_settled:?} over {settled_secs:.1} s (direct listener {direct_idx:?}); late at {late_at:?}; \
+         peak queue {peak:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
+         ChannelExhausted {exhausted}; torn {torn}; first teardown after the cap (P, A, B, C, T) {:?}; P legs {:?}; \
+         looks {:?}",
         cp.alm_own_children(),
         cp.alm_counts(),
         first_torn.lock().expect("first").clone(),
-        cp.legs()
+        cp.legs(),
+        capped
+            .iter()
+            .step_by(5)
+            .map(|l| (
+                l.at.as_millis(),
+                l.queue_ms,
+                l.parents
+                    .iter()
+                    .map(|x| match x.as_deref() {
+                        None => '-',
+                        Some(x) if x == pid.as_str() => 'P',
+                        Some(_) => 'r',
+                    })
+                    .collect::<String>()
+            ))
+            .collect::<Vec<_>>(),
     );
     // Every criterion is judged and every failure named, so a red run says
     // what each fix buys (G8: A and C in edge, leviculum#113).
@@ -4701,31 +4863,75 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
             cp.alm_own_children()
         ));
     }
-    if parents.iter().any(Option::is_none) {
-        failed.push("a listener has no parent".to_owned());
-    }
     // The host's capture loop waits on publish(): one call must never cost
     // it a frame, capped or not (G8: 45-60 ms a call, and seconds when a
     // leg redialled, with sends retried under the publisher lock).
     for (phase, lat) in [("uncapped", base_lat), ("capped", capped_lat)] {
-        if lat.max >= FRAME_INTERVAL {
+        if lat >= FRAME_INTERVAL {
             failed.push(format!(
                 "publish() {phase}: {lat:?}, over one frame interval"
             ));
         }
     }
-    for (i, n) in heard.iter().enumerate() {
-        // About the one-copy rate: the uplink carries one copy, so each
-        // listener hears most of what P published once it settled.
-        if *n * 10 < sent * 7 {
-            failed.push(format!("listener {i} heard {n} of {sent}"));
+    // 45.3 — the bar changed with row AGE. Before it, each listener had to
+    // hear 70 % of what P published: true while relays passed on whatever
+    // reached them, however late. Under AGE a receiver never delivers or
+    // relays media more than MEDIA_FRESH (800 ms) above its floor, and a
+    // capped uplink's queue is seconds deep, so most of what P published
+    // during the cap is stale and dropped, by design. What AGE makes true,
+    // and is judged instead:
+    //   (1) after the settle no listener is without a parent;
+    //   (2) no stale media is delivered: every frame within MEDIA_FRESH of
+    //       its publish, above the listener's floor;
+    //   (3) the relayed listeners get fresh media at a fraction of what the
+    //       direct child gets (RELAYED_FRESH_SHARE, from this run's numbers).
+    let Some(settle) = settle else {
+        panic!("the cap never queued P's uplink 300 ms: {context}");
+    };
+    if let Some(l) = capped
+        .iter()
+        .find(|l| l.at > settle && l.parents.iter().any(Option::is_none))
+    {
+        failed.push(format!(
+            "a listener without a parent at {:?} (settled {settle:?}): {:?}",
+            l.at, l.parents
+        ));
+    }
+    for (i, o) in oldest.iter().enumerate() {
+        if *o > MEDIA_FRESH {
+            failed.push(format!(
+                "listener {i} was handed a frame {o:?} above its floor (stale past {MEDIA_FRESH:?})"
+            ));
+        }
+    }
+    if let Some(d) = direct_idx {
+        let base = fresh_settled[d];
+        for (i, n) in fresh_settled.iter().enumerate() {
+            if i != d && (*n as f64) < base as f64 * RELAYED_FRESH_SHARE {
+                failed.push(format!(
+                    "relayed listener {i}: {n} fresh frames after the settle, under {RELAYED_FRESH_SHARE} of the direct child's {base}"
+                ));
+            }
         }
     }
     eprintln!("[G8] capped publisher: {context}; failed {failed:?}");
     assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(arrivals);
     drop(listeners);
     drop(cp);
 }
+
+/// 45.3 — the share of the direct child's fresh frames each relayed listener
+/// must get after the settle in
+/// [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`]. The
+/// relayed ones hear the same copy one hop later, so they lose only what the
+/// relay's extra hop drops or turns stale: on this bench, 13 runs (10 alone,
+/// 3 under `taskset -c 0`), the worst relayed listener got 0.964 of the
+/// direct child's count (541 of 561 over 28.4 s settled) and the median
+/// about 0.99. 0.9 is about three times the worst shortfall seen: a relay
+/// whose hop pushes a tenth of the direct child's fresh frames past the
+/// budget is not relaying the one copy the cap carries.
+const RELAYED_FRESH_SHARE: f64 = 0.9;
 
 /// **G8 slow start — a call that STARTS on a capped uplink.** The same
 /// room and cap as [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`]
@@ -5261,6 +5467,25 @@ async fn publish_looking(
     seq0: u64,
     looks: &mut Vec<Look>,
 ) -> u64 {
+    publish_looking_stamped(cp, listeners, uplink, origin, secs, seq0, looks, None).await
+}
+
+/// One frame as `P` published it: its seq, when `publish()` was called, and
+/// how long that call took (the host's capture loop waits on it).
+type Stamp = (u64, tokio::time::Instant, Duration);
+
+/// [`publish_looking`], stamping every frame into `stamps` when given.
+#[allow(clippy::too_many_arguments)]
+async fn publish_looking_stamped(
+    cp: &mut Call,
+    listeners: &[Call],
+    uplink: &CappedUplink,
+    origin: tokio::time::Instant,
+    secs: u64,
+    seq0: u64,
+    looks: &mut Vec<Look>,
+    mut stamps: Option<&mut Vec<Stamp>>,
+) -> u64 {
     let size = cp.chunk_plaintext_budget().unwrap_or(240).min(600);
     let stream = cp.stream();
     let mut seq = seq0;
@@ -5268,7 +5493,11 @@ async fn publish_looking(
     while tokio::time::Instant::now() < end {
         let mut b = body("p", seq);
         b.resize(size, b'.');
+        let t = tokio::time::Instant::now();
         let _ = cp.publish(Frame::opaque(b)).await;
+        if let Some(st) = stamps.as_deref_mut() {
+            st.push((seq, t, t.elapsed()));
+        }
         if seq.is_multiple_of(3) {
             looks.push(Look {
                 at: origin.elapsed(),
