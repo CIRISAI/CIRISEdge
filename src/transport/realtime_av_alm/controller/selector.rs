@@ -128,6 +128,10 @@ struct Cand<P> {
     /// (the request timed out and the selector told the forwarder its
     /// current wish: an UNSUBSCRIBE, or the standby restated).
     abandoned_at_ms: Option<u64>,
+    /// 45.3 — the last tick this candidate's silence was excused by its
+    /// offer (offer-as-life): a path owes chunks only from then on, as it
+    /// owes them only from a stream's resume.
+    excused_at_ms: Option<u64>,
 }
 
 /// One chunk as a path delivered it.
@@ -418,7 +422,12 @@ impl<P: PeerRef> ParentSelector<P> {
                 c.health.state(),
                 PeerState::Available | PeerState::Degraded | PeerState::Recovering
             ) && o.forwarding,
-            latency_ms: Self::e2e_latency(c) as u32,
+            // 45.3 — never less late than the parent says its own upstream
+            // is: a relay's meter is a smoothed reading that lags a queue
+            // building at the publisher, and a child judging this node's
+            // silence (offer-as-life) reads its offer.
+            latency_ms: Self::e2e_latency(c).max(f64::from(o.upstream_latency_ms) + c.rtt_ms / 2.0)
+                as u32,
         })
     }
 
@@ -440,6 +449,7 @@ impl<P: PeerRef> ParentSelector<P> {
             tier,
             offer_at_ms: now_ms,
             abandoned_at_ms: None,
+            excused_at_ms: None,
         })
     }
 
@@ -1316,6 +1326,26 @@ impl<P: PeerRef> ParentSelector<P> {
             if rolled && standby.as_ref() == Some(p) {
                 rolled_standby = true;
             }
+            // 45.3 — a parent still OFFERING this stream, whose offer says
+            // its own upstream is past the stale budget, is alive: it offers
+            // only while it forwards the stream (its upstream healthy), and
+            // what it receives is too late to pass on (a relay never
+            // forwards stale media; a capped publisher sends none), so its
+            // media silence is staleness being dropped, not death. No
+            // silence failover for it; the lateness rules may still move
+            // this node. Once its offers stop or its upstream reads on time
+            // again it owes chunks from then on, not for the excused span
+            // (charged at once, the span read as a Down the moment the
+            // publisher's backlog dipped under the budget). A parent that
+            // offers a fresh stream and sends nothing is a black hole, and
+            // is failed over as before.
+            let excused = c.offer.as_ref().is_some_and(|o| {
+                o.forwarding && u64::from(o.upstream_latency_ms) > STALE_UPSTREAM_MS
+            }) && now_ms.saturating_sub(c.offer_at_ms) <= OFFER_IS_LIFE_MS;
+            if excused && c.link.subscribed() {
+                c.excused_at_ms = Some(now_ms);
+            }
+            let excused_at = c.excused_at_ms;
             let silent = c.link.subscribed().then(|| {
                 let last = c
                     .meter
@@ -1328,6 +1358,10 @@ impl<P: PeerRef> ParentSelector<P> {
                     // not this parent dead.
                     return 0;
                 }
+                if excused {
+                    return 0;
+                }
+                let last = last.max(excused_at.unwrap_or(0));
                 // The stream's idle gap is nobody's silence: a path owes
                 // chunks only since the stream resumed.
                 let last = if idle_aware {
@@ -1787,6 +1821,15 @@ impl<P: PeerRef> ParentSelector<P> {
     }
 }
 
+/// 45.3 — how recent a parent's offer for a stream must be to count as its
+/// life (its media silence then reads as stale media dropped, not death):
+/// two and a half offer periods, so one lost or late offer is not death
+/// either, and a parent whose offers stop is silent again within it.
+pub const OFFER_IS_LIFE_MS: u64 = 2_500;
+/// 45.3 — an upstream this late (ms) has nothing a receiver keeps: the
+/// receivers' media budget (`av_call::MEDIA_STALE_BUDGET`).
+pub const STALE_UPSTREAM_MS: u64 = 800;
+
 #[cfg(test)]
 mod tests {
     use super::super::{AdmitDecision, SplitMix64};
@@ -2221,6 +2264,147 @@ mod tests {
             Some(PeerState::Available),
             "real silence is seen"
         );
+    }
+
+    /// 45.3 — a parent that keeps OFFERING a stream whose upstream it reports
+    /// past the stale budget, while its media for it is silent (a relay
+    /// dropping its upstream's stale media), is not failed over; once its
+    /// offers stop, the silence counts and it is failed over within the
+    /// existing bound (`down_silence_ms` past the offer's life). When the
+    /// excuse ends with the offers still coming, the excused span is not
+    /// charged at once: the parent owes chunks from then. A parent offering
+    /// an on-time upstream and sending nothing is a black hole: failed over.
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    fn a_parent_that_still_offers_is_alive_and_one_that_stops_is_not() {
+        let cfg = ControllerConfig::interactive();
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2]);
+        let mut rng = SplitMix64(9);
+        let mut log = DecisionLog::default();
+        let mut t = 0;
+        while s.primary().is_none() && t < 10_000 {
+            if t % 1_000 == 0 {
+                s.on_offer(t, offer(2, 4, &cfg), 20.0, &mut log);
+            }
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let d = AdmitDecision::Admit { role };
+                    let _ = s.on_decision(t, &parent, &d, &mut rng, &mut log);
+                }
+            }
+            t += 250;
+        }
+        assert_eq!(s.primary(), Some(&2));
+        s.on_chunk(t, &2, at(1, false, 100, 5.0));
+        // 20 s of media silence, offers each second that say the parent's
+        // upstream is seconds late: never failed over.
+        let late = |cfg: &ControllerConfig| {
+            let mut o = offer(2, 4, cfg);
+            o.upstream_latency_ms = 3_000;
+            o
+        };
+        let quiet_from = t;
+        while t < quiet_from + 20_000 {
+            t += 250;
+            if t % 1_000 == 0 {
+                s.on_offer(t, late(&cfg), 20.0, &mut log);
+            }
+            let _ = s.tick(t, &mut rng, &mut log);
+            assert_eq!(s.state_of(&2), Some(PeerState::Available), "at {t}");
+        }
+        assert_eq!(s.primary(), Some(&2));
+        // A black hole: on-time offers and no media. Failed over as before.
+        let mut b = ParentSelector::new(1u32, cfg.clone(), false);
+        b.set_members([1u32, 2]);
+        let mut bt = 0;
+        while b.primary().is_none() && bt < 10_000 {
+            if bt % 1_000 == 0 {
+                b.on_offer(bt, offer(2, 4, &cfg), 20.0, &mut log);
+            }
+            for a in b.tick(bt, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let d = AdmitDecision::Admit { role };
+                    let _ = b.on_decision(bt, &parent, &d, &mut rng, &mut log);
+                }
+            }
+            bt += 250;
+        }
+        b.on_chunk(bt, &2, at(1, false, 100, 5.0));
+        let hole_from = bt;
+        while b.state_of(&2) == Some(PeerState::Available) {
+            bt += 250;
+            if bt % 1_000 == 0 {
+                b.on_offer(bt, offer(2, 4, &cfg), 20.0, &mut log);
+            }
+            let _ = b.tick(bt, &mut rng, &mut log);
+            assert!(
+                bt <= hole_from + cfg.down_silence_ms + 250,
+                "a black hole is seen"
+            );
+        }
+        // The excuse ends with the offers still coming (the publisher's
+        // backlog dips under the budget): the excused span is not charged at
+        // once; the parent owes chunks from then, within down_silence_ms.
+        let mut e = ParentSelector::new(1u32, cfg.clone(), false);
+        e.set_members([1u32, 2]);
+        let mut et = 0;
+        while e.primary().is_none() && et < 10_000 {
+            if et % 1_000 == 0 {
+                e.on_offer(et, late(&cfg), 20.0, &mut log);
+            }
+            for a in e.tick(et, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let d = AdmitDecision::Admit { role };
+                    let _ = e.on_decision(et, &parent, &d, &mut rng, &mut log);
+                }
+            }
+            et += 250;
+        }
+        e.on_chunk(et, &2, at(1, false, 100, 5.0));
+        let excused_from = et;
+        while et < excused_from + 20_000 {
+            et += 250;
+            if et % 1_000 == 0 {
+                e.on_offer(et, late(&cfg), 20.0, &mut log);
+            }
+            let _ = e.tick(et, &mut rng, &mut log);
+        }
+        assert_eq!(e.state_of(&2), Some(PeerState::Available));
+        et += 250;
+        e.on_offer(et, offer(2, 4, &cfg), 20.0, &mut log);
+        let ended = et;
+        let _ = e.tick(et, &mut rng, &mut log);
+        assert_eq!(
+            e.state_of(&2),
+            Some(PeerState::Available),
+            "the excused span is not charged at once"
+        );
+        while e.primary() == Some(&2) {
+            et += 250;
+            if et % 1_000 == 0 {
+                e.on_offer(et, offer(2, 4, &cfg), 20.0, &mut log);
+            }
+            let _ = e.tick(et, &mut rng, &mut log);
+            assert!(
+                et <= ended + cfg.down_silence_ms + 250,
+                "silence after the excuse is seen: failed over (at {et})"
+            );
+        }
+        assert_ne!(e.state_of(&2), Some(PeerState::Available));
+        // The offers stop: failed over within the offer's life plus the
+        // silence bound (Suspected drops a primary with no standby to wait
+        // on; it never reaches Down unsubscribed).
+        let stopped = t;
+        while s.primary() == Some(&2) {
+            t += 250;
+            let _ = s.tick(t, &mut rng, &mut log);
+            assert!(
+                t <= stopped + OFFER_IS_LIFE_MS + cfg.down_silence_ms + 250,
+                "failed over within the bound (at {t})"
+            );
+        }
+        assert_ne!(s.state_of(&2), Some(PeerState::Available));
     }
 
     /// #945 item 3: a standby promoted to primary owes nothing from before

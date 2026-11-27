@@ -5639,6 +5639,29 @@ async fn send_offers_paced(shared: &Arc<Shared>, frames: Vec<alm::Outgoing>) {
 /// own leg answers with its own (`reply_caps`); a peer that takes timed
 /// frames gets its media timed from now on.
 async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: bool) {
+    if tracing::enabled!(target: "ciris_edge::c3_rx", tracing::Level::DEBUG) {
+        let (stream, offer_up_ms) = match decode_c3(bytes, peer) {
+            Ok(WireFrame::Control(cf)) => (
+                crate::transport::realtime_av::stream_label(cf.stream),
+                match &cf.msg {
+                    crate::transport::realtime_av_alm::controller::ControlMsg::Offer(o) => {
+                        i64::from(o.upstream_latency_ms)
+                    }
+                    _ => -1,
+                },
+            ),
+            _ => (String::new(), -1),
+        };
+        tracing::debug!(
+            target: "ciris_edge::c3_rx",
+            node = %shared.own,
+            peer = %peer,
+            kind = crate::transport::realtime_av_runtime::send_diag::kind_of(bytes),
+            stream = %stream,
+            offer_up_ms,
+            "C3 received"
+        );
+    }
     let rtt = leg_rtt_ms(shared, peer);
     let (out, reply, timed, datagrams, binding_v2) = {
         let mut a = Shared::lock(&shared.alm);
@@ -5928,7 +5951,10 @@ async fn pump(
         // never delivered and never relayed on. The per-hop queue test above
         // stands beside it.
         if is_stale_end_to_end(latency_ms) && !Shared::lock(&shared.alm).queue_rules_off() {
-            Shared::lock(&shared.alm).counts.stale_dropped += 1;
+            let mut a = Shared::lock(&shared.alm);
+            a.counts.stale_dropped += 1;
+            a.note_stale_end_to_end(stream, latency_ms.unwrap_or_default());
+            drop(a);
             shared.count(crate::observability::AV_FRAME_STALE_DROPPED);
             continue;
         }

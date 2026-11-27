@@ -281,6 +281,10 @@ pub(super) struct AlmState {
     last_primary: BTreeMap<StreamId, Option<String>>,
     egress: EgressMeter,
     leg_queue_ms: BTreeMap<String, f64>,
+    /// 45.3 row AGE — per received stream, the last chunk this node dropped
+    /// as stale end to end: `(call ms, its RM1 latency)`. What this node then
+    /// advertises as its upstream latency (offer-as-life at its children).
+    stale_seen: BTreeMap<StreamId, (u64, u64)>,
     /// Row ProbeAfterDrain — out legs that cannot read as drained now: their
     /// queue gauge is unmeasured (no `min_rtt` yet, or right after a path
     /// move) or a Channel message is still outstanding on them.
@@ -577,6 +581,7 @@ impl AlmState {
             draining_parent: BTreeMap::new(),
             last_primary: BTreeMap::new(),
             leg_queue_ms: BTreeMap::new(),
+            stale_seen: BTreeMap::new(),
             leg_busy: BTreeSet::new(),
             members: members.to_vec(),
             tier: ServiceTier::FullOps,
@@ -1704,14 +1709,40 @@ impl AlmState {
         Some(offset.saturating_sub(floor))
     }
 
+    /// 45.3 row AGE — a chunk of `stream` was dropped here as stale end to
+    /// end, `latency_ms` above its floor.
+    pub(super) fn note_stale_end_to_end(&mut self, stream: StreamId, latency_ms: i64) {
+        let now = self.now_ms();
+        let l = u64::try_from(latency_ms).unwrap_or(0);
+        self.stale_seen.insert(stream, (now, l));
+        self.sync_upstream(stream);
+    }
+
     fn sync_upstream(&mut self, stream: StreamId) {
         let view = self
             .sels
             .get(&stream)
             .and_then(ParentSelector::upstream_view);
+        // What this node drops as stale is as late as its upstream is: its
+        // offer says so while the drops are recent (offer-as-life's life), so
+        // a child of a relay with nothing fresh to pass on keeps it.
+        let now = self.now_ms();
+        let stale = self
+            .stale_seen
+            .get(&stream)
+            .filter(|(at, _)| {
+                now.saturating_sub(*at)
+                    <= crate::transport::realtime_av_alm::controller::selector::OFFER_IS_LIFE_MS
+            })
+            .map_or(0, |(_, l)| u32::try_from(*l).unwrap_or(u32::MAX));
         if let Some(a) = self.relays.get_mut(&stream) {
             match view {
-                Some(u) => a.set_upstream(Some(u.depth), u.ancestry, u.healthy, u.latency_ms),
+                Some(u) => a.set_upstream(
+                    Some(u.depth),
+                    u.ancestry,
+                    u.healthy,
+                    u.latency_ms.max(stale),
+                ),
                 None => a.set_upstream(None, Vec::new(), false, 0),
             }
         }
@@ -2050,6 +2081,7 @@ impl AlmState {
         self.readings.retain(|(s, _), _| *s != old);
         self.late_moved.remove(&old);
         self.late_noted.remove(&old);
+        self.stale_seen.remove(&old);
         self.last_primary.remove(&old);
         self.told_publisher.remove(&old);
         self.draining_parent.remove(&old);
@@ -2481,6 +2513,14 @@ impl AlmState {
             own_offer.upstream_latency_ms =
                 own_offer.upstream_latency_ms.max(queued.round() as u32);
         }
+        // 45.3 — the uplink's backlog (the send clock) is the queue too: a
+        // publisher past the stale budget sends no media (STALE), and its
+        // offer saying so is what keeps its children from reading that
+        // silence as death (the selector's offer-as-life rule).
+        let backlog = self
+            .uplink_backlog_ms()
+            .map_or(0, |b| u32::try_from(b).unwrap_or(u32::MAX));
+        own_offer.upstream_latency_ms = own_offer.upstream_latency_ms.max(backlog);
         own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
         own_offer.forwarder_headroom_bps =
             self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
