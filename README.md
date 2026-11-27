@@ -21,6 +21,50 @@ over the internet or over radio, and decides who may receive each one.
   and coordination reliable, secure, private, performant and efficient, and
   free and easy for all.
 
+## The most advanced open peer-to-peer stack we know of
+
+That is a strong claim. Here is what backs it:
+
+- **Every connection's states are written down and machine-checked.** A
+  connection between two devices is always in one of four states: *none*,
+  *relayed* (through a server), *upgrading* (trying to go direct) or *direct*.
+  Only six moves between them are allowed. A model checker
+  ([TLA+](https://lamport.azurewebsites.net/tla/tla.html)) tries every possible
+  order of events, across 45 pairings of router behaviour and 107 scenarios in
+  all (forged answers, a stranger in the way, lost packets, both sides starting
+  at once), and proves that:
+  - both sides go direct together, or neither does;
+  - a failed attempt leaves the relayed connection exactly as it was;
+  - a device never ends up talking to a stranger's address;
+  - the helper server never carries your data, and learns only the public
+    address of a device that asked it;
+  - an address learned along the way is never written into any record;
+  - every attempt ends.
+
+  The model and its results are in
+  [Leviculum's `docs/direct_link/`](https://github.com/CIRISAI/leviculum/tree/v0.34.0%2Bciris.4/docs/direct_link).
+- **It gets through hard routers.** Most home routers block incoming
+  connections. When either side's router is the well-behaved kind, both sides
+  sending toward each other at once is enough. For routers that
+  hand out ports in order, it predicts the next one. For routers that pick ports
+  at random, it opens many ports at once until two meet (the "birthday"
+  method), with fixed limits on how many. It does this only toward people you
+  share a room with. If nothing works, the relayed connection simply stays.
+- **Every connection is quantum-resistant.** Every signature, and every byte on
+  every connection, direct or relayed, is protected by a classical algorithm
+  and a post-quantum one together, so traffic recorded today stays unreadable
+  even to a future quantum computer. (The fact that two devices are connected is
+  not hidden this way; see AV-53 in the [threat model](docs/THREAT_MODEL.md).)
+- **Devices are addressed by their key, not by an IP address or a domain
+  name.** No naming authority sits in the middle, and the same messages travel
+  over the internet, a local network or radio.
+- **Calls are relayed by their own members**, not by a media server, and each
+  piece of media is signed, so a relay cannot fake anyone's stream.
+
+What is not proven yet is said plainly in [Not done yet](#not-done-yet) and
+[Status](#status). In particular, connections through real home and carrier
+routers have not yet been measured against the model.
+
 ## Where to go
 
 - [CIRISConstitution](https://github.com/CIRISAI/CIRISConstitution): the rules,
