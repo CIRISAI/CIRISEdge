@@ -406,7 +406,7 @@ There are three rules for the excuse:
 
 ### R30 PUNCH-TRUST (the edge policy layer)
 
-**Rule (3d0c95c, work/45.3-nat).** One address predicate is read on both sides: P(s) = s is not anonymous, and s sees standing for the peer (a shared room or a named contact) (`reticulum.rs:15932-15944`).
+**Rule, as built at 3d0c95c (work/45.3-nat).** One address predicate is read on both sides: P(s) = s is not anonymous, and s sees standing for the peer (a shared room or a named contact) (`reticulum.rs:15932-15944`).
 - Every proposal reads it (`reticulum.rs:15860-15879`, which also sets the link's escalation to true).
 - Every answer reads it (`reticulum.rs:20751-20787`, where the escalation takes the answer).
 - IdentifiedOnly follows it (`direct_path.rs:490, 658`).
@@ -430,6 +430,10 @@ One Tick is 1 s. A proposes and B answers. The event loop serves a notify, and t
 | fixed, one-way contacts | pass | FAIL (inherent) | FAIL / **FAIL** | FAIL / pass | pass / pass | FAIL / **FAIL** | 298,479 / 51,061 / 44 |
 | fixed, tier switched silently | pass | FAIL | FAIL / **FAIL** | FAIL / **FAIL** | FAIL / **FAIL** | FAIL / **FAIL** | 179,761 / 34,764 / 36 |
 | fixed + direct-up is a standing event | pass | FAIL | FAIL / pass | FAIL / pass | FAIL / pass | FAIL / **FAIL** | 100,744 / 23,399 / 35 |
+| fix: a reconcile on DirectLinkFailed, retry cleared level-triggered (silent tier, contacts in play) | FAIL (silent tier) | FAIL | FAIL / **FAIL** | FAIL / **FAIL** | FAIL / **FAIL** | FAIL / **FAIL** (silent tier) | 185,380 / 34,800 / 13 (first failure) |
+| fix: every may_reveal_address change notifies (same) | pass | FAIL | FAIL / **FAIL** | FAIL / pass | FAIL / pass | FAIL / **FAIL** | 1,726,988 / 222,537 / 44 |
+| fix: direct-up is a standing event (same) | FAIL (silent tier) | FAIL | FAIL / **FAIL** | FAIL / **FAIL** | FAIL / **FAIL** | FAIL / **FAIL** | 663,362 / 97,472 / 18 (first failure) |
+| **all three fixes** (same) | pass | FAIL (stated limits) | FAIL (race) / pass | FAIL (race) / pass | FAIL (race) / pass | FAIL (race) / pass | 1,550,379 / 197,824 / 44 |
 | as built, room_peers | pass | pass | FAIL / FAIL | FAIL / FAIL | FAIL / FAIL | FAIL / FAIL | 9,632 / 2,443 / 22 |
 | as built, identified_only | pass | **FAIL in the initial state** | FAIL / FAIL | FAIL / FAIL | FAIL / FAIL | FAIL / FAIL | 10,542 / 2,575 / 22 |
 
@@ -451,7 +455,16 @@ The counterexamples are 3 to 16 states long. **Bold** marks a structural failure
   - A's gate stays true, so a punch in flight can escalate.
 
   Edge's own proposals and answers read the tier fresh, so they are clean.
-- **The gates.** With equal inputs, both gates are equal after a re-read (GatesEqual passes everywhere). They differ by design when the inputs differ: anonymity is one side's, and a contact can be one-way. GatesEqualAlways holds only with room-only standing.
+- **The gates.** With equal inputs, both gates are equal after a re-read. GatesEqual passes everywhere except where a silent tier switch has left A's gate stale (bug 3).
+- **Stated limits, not failures.** GatesEqualAlways fails for two reasons, and these are inherent in the inputs, not defects:
+  - **a one-way contact:** A names B, and B does not name A;
+  - **anonymous against non-anonymous:** the tier is one side's own state, and it is never on the wire.
+
+  In both, each side's gate is right for its own predicate, and the gates differ only because the inputs do. With room-only standing and no anonymity, GatesEqualAlways passes.
+- **The three fixes sent to nat-reach,** modelled ahead of their SHAs (switches `FailNotify`, `TierNotify`, `DirectNotify`):
+  - Together they pass RetrySettled, DirectSettled, ProposalSettled and EscalationSettled with the silent tier and one-way contacts in play: 1,550,379 states, 197,824 distinct, depth 44.
+  - Each alone fixes only its own hole. The strict forms still fail only on the notify race.
+  - To be re-checked against the SHAs when they come.
 - **As built (6392b0a)** fails both earlier findings:
   - the gates differ from the initial state under identified_only (A: the default rule's true; B: false);
   - nothing retires the link (DirectBound);

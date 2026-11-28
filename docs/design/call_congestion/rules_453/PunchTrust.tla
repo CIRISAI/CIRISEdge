@@ -55,6 +55,10 @@ CONSTANTS Code, Accept,      \* "fixed"|"asbuilt"; "room"|"identified"
           Anon,              \* A's tier may switch on at all
           SilentTier,        \* ... without a notify
           DirectNotify,      \* proposed fix: a link going direct is a standing event
+          FailNotify,        \* proposed fix: DirectLinkFailed re-runs the reconcile,
+                             \* and a non-passing link's retry is cleared every
+                             \* pass (level-triggered), not only on the loss
+          TierNotify,        \* proposed fix: every may_reveal_address change notifies
           Period, Cap
 
 VARIABLES room, conA, conB, anonA,       \* the truth each side reads
@@ -101,7 +105,7 @@ FlipConB  == /\ Contacts /\ conB' = ~conB /\ notB' = Fixed /\ UNCHANGED <<notA, 
 FlipAnon  == /\ Anon
              /\ \E silent \in (IF SilentTier THEN BOOLEAN ELSE {FALSE}) :
                   /\ anonA' = ~anonA
-                  /\ notA' = (Fixed /\ (notA \/ ~silent))
+                  /\ notA' = (Fixed /\ (notA \/ ~silent \/ TierNotify))
              /\ UNCHANGED <<notB, room, conA, conB>> /\ Keep
 Env == (LeaveRoom \/ JoinRoom \/ FlipConA \/ FlipConB \/ FlipAnon)
        /\ lossAge' = (IF Both' THEN 0 ELSE lossAge) /\ ev' = "env"
@@ -148,7 +152,8 @@ Fail ==
     /\ gateB' = IF Fixed /\ ~BAccepts THEN FALSE ELSE gateB
     /\ retry' = IF ~retryOff /\ retry /= "none" THEN "armed" ELSE retry
     /\ ev' = "fail"
-    /\ UNCHANGED <<room, conA, conB, anonA, seenA, seenB, notA, notB, phase, gateA,
+    /\ notA' = (notA \/ (Fixed /\ FailNotify))
+    /\ UNCHANGED <<room, conA, conB, anonA, seenA, seenB, notB, phase, gateA,
                    retryOff, direct, lossAge, recA, recB>>
 
 \* ---- the re-read (fixed only), per side: on a notify or the 5 s cadence
@@ -158,6 +163,7 @@ ReconcileA ==
     /\ LET lost == gateA /\ ~PA
            want == ~anonA                         \* proposes /\ not anonymous
            tog  == lost \/ (retryOff = want)
+                   \/ (FailNotify /\ ~PA /\ retry \in {"armed", "ready"})
        IN /\ gateA' = PA /\ seenA' = PA /\ notA' = FALSE
           /\ direct' = (direct /\ PA)
           /\ retry' = CASE direct /\ ~PA -> "none"          \* retired: entry removed

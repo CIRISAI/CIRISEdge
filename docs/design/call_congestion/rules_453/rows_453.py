@@ -70,7 +70,7 @@ def register(add, B, S):
             invs=["TypeOK", "AdvOverParent", "AdvOverDrops", "AdvStillLate"])
     # ---------------------------------------------------------------- R30
     pt = dict(Period=5, Cap=12, Contacts=B(False), Anon=B(True), SilentTier=B(False),
-              DirectNotify=B(False))
+              DirectNotify=B(False), FailNotify=B(False), TierNotify=B(False))
     pinv = ["TypeOK", "GatesEqual", "GatesEqualAlways", "DirectBound",
             "NoEscalationWhileFalse", "NoProposalWhileAnonymous", "RetryStops",
             "EscalationSettled", "ProposalSettled", "RetrySettled", "DirectSettled"]
@@ -87,3 +87,12 @@ def register(add, B, S):
         dict(pt, Code=S("fixed"), Accept=S("room"), Anon=B(False)), invs=pinv)
     add("R30-fixed-room-directnotify", "PunchTrust",
         dict(pt, Code=S("fixed"), Accept=S("room"), DirectNotify=B(True)), invs=pinv)
+    # the three fixes sent to nat-reach, separately and together (with the
+    # silent tier and one-way contacts in play)
+    allin = dict(pt, Code=S("fixed"), Accept=S("room"), SilentTier=B(True), Contacts=B(True))
+    for tag, fx in (("failnotify", dict(FailNotify=B(True))),
+                    ("tiernotify", dict(TierNotify=B(True))),
+                    ("directnotify2", dict(DirectNotify=B(True))),
+                    ("allfixes", dict(FailNotify=B(True), TierNotify=B(True),
+                                      DirectNotify=B(True)))):
+        add(f"R30-fix-{tag}", "PunchTrust", dict(allin, **fx), invs=pinv)
