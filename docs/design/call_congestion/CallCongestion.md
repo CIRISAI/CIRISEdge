@@ -315,11 +315,83 @@ There are three rules for the excuse:
   - Any relay that holds a real, recent late stamp is excused, honest or not. That is correct: nothing fresh exists then.
 - **NotChargedAtOnce holds under every rule.** No failover happens before 9 ticks of silence have passed since both the last chunk and the last excused tick.
 
-**R29b, the advertised latency.** The as-built relay keeps only its LATEST stale drop (`alm.rs:1722-1726`, `stale_seen.insert` overwrites), not the largest drop of the last 2.5 s. So "advertised ≥ every recent drop's age" can fail: a 2.0 s drop followed by a 0.9 s drop advertises 0.9 s. Each recorded drop is already past 800 ms, so the excuse (> 800 ms) still holds (AdvStillLate). Result: see the R29b row of the table below.
+**R29b, the advertised latency.** The as-built relay keeps only its LATEST stale drop (`alm.rs:1722-1726`, `stale_seen.insert` overwrites), not the largest drop of the last 2.5 s. So "advertised ≥ every recent drop's age" can fail: a 2.0 s drop followed by a 0.9 s drop advertises 0.9 s. Each recorded drop is already past 800 ms, so the excuse (> 800 ms) still holds (AdvStillLate). Result: see the R29b rows in the R24–R28 table below.
 
 ### R24–R28
 
-The table and counterexamples for these rows follow.
+| Row | Run | Checks | States / distinct / depth | Result |
+|---|---|---|---|---|
+| R24 SENDCLOCK | sendclock (240 marks, seq mod 16, window 3) | SendClockExact (backlog = oldest unproved message's age from its send, to the tick); NeverOverReads | 295,675 / 98,589 / 9 | pass, pass |
+| R24 | sendclock-marks3 | SendClockExact, SendClockBounded, NeverOverReads | 295,675 / 98,589 / 9 | pass |
+| R24 | sendclock-seqmod8 (window 3 < 8/2) | SendClockExact, NeverOverReads | 295,675 / 98,589 / 9 | pass |
+| R24 | oldest-since (the G8 verdict's own age, `av_call.rs:7071-7081`) | SendClockExact | 33 / 28 / 4 | **FAIL** |
+| R25 BACKLOG | backlog-n1 (two-person call) | OwnQueueSeen, OwnStaleSeen | 38 / 20 / 3; 46 / 26 / 3 | **FAIL**, **FAIL** |
+| R25 | backlog-n1 | OnePeerIsNotOwn, BackloggedStalled, DrainStalled, NoRelayOfferStalled | 1,153 / 37 / 3 | pass |
+| R25 | backlog-n2 | OwnQueueSeen, OwnStaleSeen | 98 / 50 / 3; 106 / 56 / 3 | **FAIL**, **FAIL** |
+| R25 | backlog-n2 | OnePeerIsNotOwn, BackloggedStalled, DrainStalled, NoRelayOfferStalled | 324,253 / 1,802 / 14 | pass |
+| R25 | backlog-n3 | OwnQueueSeen, OwnStaleSeen | 278 / 140 / 3; 286 / 146 / 3 | **FAIL**, **FAIL** |
+| R25 | backlog-n3 | OnePeerIsNotOwn, BackloggedStalled, DrainStalled, NoRelayOfferStalled | 9,401,185 / 9,029 / 14 | pass |
+| R25 | backlog-n3-slowkept (only the kept child's peer queues) | DrainEnds (uplink clear for good ⇝ drain ends) | 128,401 / 1,125 / – | **FAIL** (lasso) |
+| R26 STALE | stale (C = 2/tick, FIFO 14, stale = > 3 ticks) | ControlNeverHeld; Drains (□◇ backlog ≤ budget) | 278,991 / 27,899 / 19 | pass, pass |
+| R26 | none (no STALE rule) | Drains | 70,191 / 17,916 / – | **FAIL** (lasso) |
+| R26 | stale-bound3 / -bound5 | ArrivalBound (media arrives ≤ N ticks old) | 14,168 / 3,944 / 8; 106,848 / 11,840 / 11 | **FAIL**, **FAIL** |
+| R26 | stale-bound6 / -bound7 | ArrivalBound | 278,991 / 27,899 / 19 | pass |
+| R27 AGE | age-current (one stepped chunk allowed, one roll) | NoFalseStale | 16,842 / 1,588 / 4 | **FAIL** |
+| R27 | age-current | NoFalseStaleHandout, StaleCaught, NeverForwardStale, HandedFresh | 4,960,512 / 26,343 / 7 | pass |
+| R27 | age-current-nostep | NoFalseStale, StaleCaught, HandedFresh | 817,842 / 5,242 / 7 | pass |
+| R27 | age-confirm (fix: a new minimum needs a second chunk within FLOOR_NEAR_MS) | NoFalseStale | 16,000 / 4,843 / 4 | **FAIL** |
+| R27 | age-confirm | NoFalseStaleHandout, StaleCaught, NeverForwardStale, HandedFresh | 7,825,442 / 37,383 / 7 | pass |
+| R27 | age-confirm-nostep | NoFalseStale, StaleCaught, HandedFresh | 1,482,497 / 9,452 / 7 | pass |
+| R27 | age-confirm0 (fix, and the epoch's first floor needs its pair too) | all five | 6,101,342 / 28,983 / 7 | pass |
+| R27 | age-confirm0-nostep | NoFalseStale, StaleCaught, HandedFresh | 1,526,702 / 9,662 / 6 | pass |
+| R28 BUDGET | budget-all (as built) | AudioBeforeVideo, VideoBeforeBulk, WithinRate, QueueBounded | 4,308,761 / 107,719 / 22–23 | pass |
+| R28 | budget-all | BulkServed (bulk waiting ⇝ served) | 4,308,761 / 107,719 / 23 | pass |
+| R28 | budget-all | BulkWaitBound (≤ 3 ticks), FloorDebtBounded | 2,192,547 / 64,721 / 13; 1,764,764 / 54,731 / 13 | **FAIL**, **FAIL** |
+| R28 | budget-all, budget-floor_only | FirstWireWait ≤ 3 ticks | 33,487 / 2,365 / 7; 33,487 / 2,205 / 7 | **FAIL** |
+| R28 | firstwait-k4 / -k5 | FirstWireWait ≤ 4 / ≤ 5 ticks | 799,567 / 29,333 / 10; 4,308,761 / 107,719 / 22 | **FAIL**, pass |
+| R28 | budget-floor_only (fix: only floor-path bulk debits the floor) | AudioBeforeVideo, VideoBeforeBulk, BulkWaitBound, FloorDebtBounded, WithinRate, QueueBounded, BulkServed | 1,688,041 / 42,201 / 17–18 | pass |
+| R28 | budget-nofloor (strict priority, before the CC review) | BulkWaitBound; BulkServed | 140,931 / 8,145 / 9; 438,841 / 17,378 / – | **FAIL**, **FAIL** (lasso) |
+| R29b | advert-last (as built) | AdvOverParent, AdvStillLate | 177,154 / 59,051 / 12 | pass |
+| R29b | advert-last | AdvOverDrops | 11 / 10 / 4 | **FAIL** |
+| R29b | advert-max (the max over 2.5 s) | all three | 177,154 / 59,051 / 12 | pass |
+
+**R24 SENDCLOCK.** The send clock ages the oldest unproved message from its send, to within a tick, and never over-reads. This holds across the sequence wrap and with only 3 marks, as long as the unproved messages fit in less than half the sequence space: the code has 65,536 sequences against a Channel window of a few dozen.
+- A first draft without the window constraint let the oldest jump by ≥ half the modulus in one tick, and the wrap comparison then kept a stale mark. That is a modelling artefact at 16 bits.
+- The verdict's age (oldest_since) under-reads in 3 states. One message is unproved since tick 1. When the older one is proved, its age restarts at 0. This is why DR moved to the send clock.
+
+**R25 BACKLOG.** One slow peer never reads as this uplink (OnePeerIsNotOwn). Backlogged ⇒ draining ⇒ stalled holds in the same tick, because the drain is folded before `set_uplink_stall` (`av_call.rs:7097-7108`). No relay offer goes out while stalled. Two failures:
+- **This uplink's own queue goes unseen while fewer than two legs have something outstanding** (before a drain starts). In a two-person call (n1) it is never seen: `uplink_backlog` returns None for ever (`av_call.rs:4209-4213`). So the drain, STALE (`sends_stale` reads the drain's reading) and the egress budget (`budget.observe(None)` reads clear) never engage. The constant's doc (`alm.rs:386-388`) says a one-child publisher "has nothing to shed". That covers G8, but not STALE or the budget. At n2 and n3 the same happens on any tick where only one leg is outstanding: 3 steps.
+- **A drain can outlive the queue that caused it.** Once draining, the kept leg's reading counts alone (`av_call.rs:4209-4211`). A kept child whose own uplink queues makes its proofs return late, so the reading stays ≥ 200 ms and resets the 1 s clear count. The other legs, outstanding only now and then, pull the minimum down for a tick but never for four in a row.
+  - The lasso: this uplink is clear for ever, and the kept leg reads 250–500 ms on every tick it is alone. The drain never ends, so media stays withheld.
+
+**R26 STALE.** Control is never held, and with STALE the FIFO keeps returning under the budget. Without STALE, media can hold it above the budget for ever (lasso).
+- **STALE does not bound arrival age by itself.** Its reading is the age of the head of the FIFO. A burst handed while the head is young waits behind the queue it builds.
+  - The worst case found: media handed at a reading ≤ 3 ticks arrives 6 ticks (1.5 s) old. That is the FIFO's depth over its drain rate.
+  - Only the egress budget (R28) keeps that depth short.
+
+**R27 AGE.** Relays never forward a chunk judged stale (NeverForwardStale), and the host is never handed one (HandedFresh, the hand-out re-judgement).
+- **The clock-step hole is real.**
+  - Under the current floor, one chunk from a publisher clock 2 s ahead lowers the (stream, epoch) floor by 2 s at once (`rxmove.rs:51-58`).
+  - Every on-time chunk after it then reads 2 s late and is dropped, on receipt and at hand-out.
+  - The drift re-anchor cannot repair it: it needs a sample within 50 ms of the floor, and none comes. The hole lasts until the epoch rolls (3 steps).
+- **The proposed fix** is that a new minimum must be confirmed by the next chunk landing within FLOOR_NEAR_MS of it. It closes the mid-epoch hole, but not on the epoch's first chunk: that chunk still sets the floor alone, so a stepped first chunk poisons the epoch (age-confirm, NoFalseStale, 3 steps).
+- **confirm0 closes that too.** The epoch's first floor also waits for its pair, and media passes unjudged until then, as before any chunk today. confirm0 passes every property.
+- **Take the lower of the pair.** A first draft that set the confirmed floor to the higher of the two missed a chunk 100 ms past the budget once a drift re-anchor added to it (7 steps).
+- **Abstractions.** The drift re-anchor is limited to one per epoch here, a 30 s floor age. Unlimited re-anchors creep the floor 50 ms each, which the code allows once per 30 s by design.
+
+**R28 BUDGET.** FIRST is never held by the budget: `take(Control)` is always true. Audio goes before video, and video before main-bucket bulk. What goes besides FIRST stays within R plus the buckets' depth, and the FIFO stays bounded. Three findings:
+- **The bulk floor runs into unbounded debt.** Every bulk take debits `floor_tokens`, including one served from the main bucket's room (`egress_budget.rs:228-233`). The floor's refill has no lower clamp.
+  - So while there is room, bulk drives the floor into debt. When media later takes the main bucket, bulk waits for that debt to repay at the floor rate (10 % of R).
+  - The trace shows bulk waiting ≥ 4 ticks behind video with the floor at −4, still repaying. In the code the debt grows with every second of room-served bulk.
+  - Bulk is still served eventually (BulkServed passes, with the model's debt clamped at 8), but the wait is not bounded.
+  - floor_only, debiting the floor only for floor-path sends, passes every property. Clamping the debt to one send would also do it.
+- **Strict priority starves bulk (the pre-review rule).** budget-nofloor has a lasso where bulk is never served. The floor is what fixes that.
+- **FIRST is never queued behind media in edge, but it is at the uplink.** Before the first cut, nothing is held, and the FIFO fills until the backlog reads over 400 ms. The first cut starts from 0.7 of what was handed, which can still exceed the uplink, and the next cut waits up to 1 s.
+  - FIRST sent then waits behind up to 5 ticks (1.25 s) of queued media in this model: k4 fails and k5 passes.
+  - "Never queued behind media" holds for edge's own hold only.
+- **Abstractions.** One unit is 64 kbit/s, so RMin = 2 units. The 8 kbit/s floor minimum rounds up to one unit. The backlog reading is the FIFO's wait, q div C, assumed exact with ≥ 2 legs (R24 and R25 check that separately). FAST-after and lift timers are scaled (8 and 12 ticks).
+
+**R29b.** As built, the advertised latency can be below a stale drop of the last 2.5 s (3 steps: a 1.0 s drop, then a 0.9 s drop). It is still always > 800 ms while any drop is recent, so the excuse is unaffected. Keeping the window's max passes.
 
 
 ## Decision table
