@@ -336,14 +336,18 @@ There are three rules for the excuse:
 | R26 | none (no STALE rule) | Drains | 70,191 / 17,916 / – | **FAIL** (lasso) |
 | R26 | stale-bound3 / -bound5 | ArrivalBound (media arrives ≤ N ticks old) | 14,168 / 3,944 / 8; 106,848 / 11,840 / 11 | **FAIL**, **FAIL** |
 | R26 | stale-bound6 / -bound7 | ArrivalBound | 278,991 / 27,899 / 19 | pass |
-| R27 AGE | age-current (one stepped chunk allowed, one roll) | NoFalseStale | 16,842 / 1,588 / 4 | **FAIL** |
-| R27 | age-current | NoFalseStaleHandout, StaleCaught, NeverForwardStale, HandedFresh | 4,960,512 / 26,343 / 7 | pass |
-| R27 | age-current-nostep | NoFalseStale, StaleCaught, HandedFresh | 817,842 / 5,242 / 7 | pass |
-| R27 | age-confirm (fix: a new minimum needs a second chunk within FLOOR_NEAR_MS) | NoFalseStale | 16,000 / 4,843 / 4 | **FAIL** |
+| R27 AGE | age-confirm, **the rule** (a new minimum replaces the floor only when the next chunk confirms it within FLOOR_NEAR_MS); one stepped chunk, one roll | NoFalseStale | 16,000 / 4,843 / 4 | **FAIL** (stepped first chunk of an epoch) |
 | R27 | age-confirm | NoFalseStaleHandout, StaleCaught, NeverForwardStale, HandedFresh | 7,825,442 / 37,383 / 7 | pass |
 | R27 | age-confirm-nostep | NoFalseStale, StaleCaught, HandedFresh | 1,482,497 / 9,452 / 7 | pass |
-| R27 | age-confirm0 (fix, and the epoch's first floor needs its pair too) | all five | 6,101,342 / 28,983 / 7 | pass |
+| R27 | age-current, the counterexample (6392b0a: a lower offset is the floor at once) | NoFalseStale | 15,580 / 1,589 / 4 | **FAIL** (mid-epoch step poisons) |
+| R27 | age-current | NoFalseStaleHandout, StaleCaught, NeverForwardStale, HandedFresh | 4,960,512 / 26,343 / 7 | pass |
+| R27 | age-current-nostep | NoFalseStale, StaleCaught, HandedFresh | 817,842 / 5,242 / 7 | pass |
+| R27 | age-confirm0 (the rule, and the epoch's first floor needs its pair too) | all five | 6,101,342 / 28,983 / 7 | pass |
 | R27 | age-confirm0-nostep | NoFalseStale, StaleCaught, HandedFresh | 1,526,702 / 9,662 / 6 | pass |
+| R27 | shift-ahead (clock 2 s ahead, stays), confirm / current / confirm0, no roll | LivesAtOnce, LivesAfterShift (12 chunks) | 150,781 / 15,086 / 28; 49,621 / 4,791 / 17; 151,801 / 15,183 / 29 | pass |
+| R27 | shift-back (clock 2 s back, stays), confirm / current / confirm0, no roll, up to 12 re-anchors | LivesAtOnce | 43 / 25 / 3; 43 / 24 / 3; 143 / 35 / 4 | **FAIL** |
+| R27 | shift-back, same | LivesAfterShift (12 chunks after) | 59,124 / 6,503 / 14; 51,844 / 5,810 / 14; 66,134 / 6,853 / 15 | **FAIL** |
+| R27 | shift-ahead / shift-back, one roll after the shift, each rule | LivesAfterRoll (from the new epoch's second chunk) | 3,036–7,475 states, depth 7–9 | pass |
 | R28 BUDGET | budget-all (as built) | AudioBeforeVideo, VideoBeforeBulk, WithinRate, QueueBounded | 4,308,761 / 107,719 / 22–23 | pass |
 | R28 | budget-all | BulkServed (bulk waiting ⇝ served) | 4,308,761 / 107,719 / 23 | pass |
 | R28 | budget-all | BulkWaitBound (≤ 3 ticks), FloorDebtBounded | 2,192,547 / 64,721 / 13; 1,764,764 / 54,731 / 13 | **FAIL**, **FAIL** |
@@ -369,15 +373,21 @@ There are three rules for the excuse:
   - The worst case found: media handed at a reading ≤ 3 ticks arrives 6 ticks (1.5 s) old. That is the FIFO's depth over its drain rate.
   - Only the egress budget (R28) keeps that depth short.
 
-**R27 AGE.** Relays never forward a chunk judged stale (NeverForwardStale), and the host is never handed one (HandedFresh, the hand-out re-judgement).
-- **The clock-step hole is real.**
-  - Under the current floor, one chunk from a publisher clock 2 s ahead lowers the (stream, epoch) floor by 2 s at once (`rxmove.rs:51-58`).
-  - Every on-time chunk after it then reads 2 s late and is dropped, on receipt and at hand-out.
-  - The drift re-anchor cannot repair it: it needs a sample within 50 ms of the floor, and none comes. The hole lasts until the epoch rolls (3 steps).
-- **The proposed fix** is that a new minimum must be confirmed by the next chunk landing within FLOOR_NEAR_MS of it. It closes the mid-epoch hole, but not on the epoch's first chunk: that chunk still sets the floor alone, so a stepped first chunk poisons the epoch (age-confirm, NoFalseStale, 3 steps).
-- **confirm0 closes that too.** The epoch's first floor also waits for its pair, and media passes unjudged until then, as before any chunk today. confirm0 passes every property.
-- **Take the lower of the pair.** A first draft that set the confirmed floor to the higher of the two missed a chunk 100 ms past the budget once a drift re-anchor added to it (7 steps).
-- **Abstractions.** The drift re-anchor is limited to one per epoch here, a 30 s floor age. Unlimited re-anchors creep the floor 50 ms each, which the code allows once per 30 s by design.
+**R27 AGE.** The rule is confirm-by-second-chunk, as ruled. The as-built floor (current, 6392b0a) is kept as the counterexample variant. Relays never forward a chunk judged stale (NeverForwardStale), and the host is never handed one (HandedFresh, the hand-out re-judgement), under every variant.
+- **The clock-step hole, in the counterexample.** One chunk from a publisher clock 2 s ahead lowers the (stream, epoch) floor by 2 s at once (`rxmove.rs:51-58`). Every on-time chunk after it reads 2 s late and is dropped, on receipt and at hand-out.
+  - The drift re-anchor cannot repair it: it needs a sample within 50 ms of the floor, and none comes.
+  - The hole lasts until the epoch rolls (3 steps).
+- **The rule closes it mid-epoch.** A lone stepped chunk is only a candidate, and the next on-time chunk is 2 s away from it, so it never confirms.
+  - The one hole left is the epoch's first chunk, which still sets the floor alone. A stepped first chunk poisons the epoch (age-confirm NoFalseStale, 3 steps).
+  - confirm0 (the first floor also waits for its pair; media passes unjudged until then, as before any chunk today) closes that and passes every property.
+- **The confirmed floor takes the lower of the pair.** A first draft that took the higher one missed a chunk 100 ms past the budget once a drift re-anchor added to it (7 steps).
+- **Clock steps AHEAD and stays.** The offsets drop by 2 s. Under the rule the first shifted chunk is a candidate and reads 0 above the old floor (not stale); the second confirms it, and the floor follows. The stream lives from the first chunk after the step, under every variant.
+- **Clock steps BACK and stays.** The offsets rise by 2 s, and every chunk reads 2 s above the old floor, so all of them are dropped as stale.
+  - The re-anchor (`FLOOR_REANCHOR_MS` 30 s) never fires. It needs a sample within 50 ms of the floor, and after the step no sample comes within 2 s of it. The model lets it fire on any chunk, up to 12 times, standing for any number of 30 s spans; TLC's trace still shows zero re-anchors.
+  - So **the stream does not recover without a roll, however long it runs**, under the rule and the counterexample alike. The RM1 floor (`min_offset`, the same `LatencyFloor`) is stuck the same way, so ReceiverMoves also reads this publisher as 2 s late.
+  - After a roll, the new epoch's floor is learnt again and the stream lives from the new epoch's first chunk (second chunk under confirm0).
+  - The ambiguity is fundamental to this rule. A clock that stepped back and stays looks exactly like a standing 2 s queue, which the re-anchor is built never to absorb (`rxmove.rs:26-29`). Recovering without a roll needs a signal the receiver can tell apart from queueing, such as the publisher announcing the step in a signed frame, or a fresh floor on the step.
+- **Abstractions.** The one-chunk step and the drift re-anchor are limited to one per epoch in the step runs, a 30 s floor age. Unlimited re-anchors creep the floor 50 ms each, which the code allows once per 30 s by design.
 
 **R28 BUDGET.** FIRST is never held by the budget: `take(Control)` is always true. Audio goes before video, and video before main-bucket bulk. What goes besides FIRST stays within R plus the buckets' depth, and the FIFO stays bounded. Three findings:
 - **The bulk floor runs into unbounded debt.** Every bulk take debits `floor_tokens`, including one served from the main bucket's room (`egress_budget.rs:228-233`). The floor's refill has no lower clamp.

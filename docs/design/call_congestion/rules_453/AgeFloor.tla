@@ -21,21 +21,33 @@
    floor's true value is 0. w = its wait in the reorder window / for its
    other fragments before hand-out.
 
-   Floor = "current"  : rxmove.rs:51-58 as built.
-   Floor = "confirm"  : the proposed fix: a lower offset becomes the floor
-                        only when a second chunk lands within Near of it;
-                        the epoch's first chunk still sets the floor alone.
-   Floor = "confirm0" : as confirm, and the first floor of an epoch also
-                        needs its second chunk (until then: no floor, media
-                        passes, as before the first chunk today).          *)
+   Floor = "confirm"  : THE RULE (ruled for 45.3): a lower offset becomes the
+                        floor only when a second chunk lands within Near of
+                        it; the epoch's first chunk still sets the floor
+                        alone.
+   Floor = "current"  : the counterexample variant, rxmove.rs:51-58 as built
+                        at 6392b0a: a lower offset is the floor at once.
+   Floor = "confirm0" : the rule, and the first floor of an epoch also needs
+                        its second chunk (until then: no floor, media passes,
+                        as before the first chunk today).
+
+   Shift = "ahead" / "back": the publisher's clock steps by Step at some
+   chunk and STAYS there (every later offset is Step lower / higher). The
+   drift re-anchor (rxmove.rs:51-58: a sample within FLOOR_NEAR_MS of a
+   floor older than FLOOR_REANCHOR_MS, 30 s) may fire on any chunk here, up
+   to MaxReanchor times: an over-approximation of any number of 30 s spans. *)
 EXTENDS Integers
 
 CONSTANTS Floor, Budget, Near, Step, DMax, WMax, MaxSteps, Rolls,
-          MaxReanchor   \* drift re-anchors per epoch (one per 30 s in the code)
+          MaxReanchor,  \* drift re-anchors per epoch (one per 30 s in the code)
+          Shift,        \* "none" | "ahead" | "back": a clock step that stays
+          SinceCap      \* chunks counted after the shift / after a roll
 
-VARIABLES floor, cand, steps, lastStep, rolls, anchored, ev, rean, prevOn
+VARIABLES floor, cand, steps, lastStep, rolls, anchored, ev, rean, prevOn,
+          shifted, since, rolledAfter, sinceRoll
 
-vars == <<floor, cand, steps, lastStep, rolls, anchored, ev, rean, prevOn>>
+vars == <<floor, cand, steps, lastStep, rolls, anchored, ev, rean, prevOn,
+          shifted, since, rolledAfter, sinceRoll>>
 None == -1000
 \* ev: the last chunk's verdicts, for the properties
 \*   <<d, step, latency, staleRx, forwarded, handed, w>>
@@ -47,16 +59,21 @@ Empty == <<0, FALSE, 0, FALSE, FALSE, TRUE, 0>>
 Init == /\ floor = None /\ cand = None /\ steps = 0 /\ lastStep = FALSE
         /\ rolls = 0 /\ anchored = FALSE /\ rean = 0 /\ prevOn = FALSE
         /\ ev = Empty
+        /\ shifted = FALSE /\ since = 0 /\ rolledAfter = FALSE /\ sinceRoll = 0
 
 Lat(off, f) == IF f = None THEN None ELSE IF off - f > 0 THEN off - f ELSE 0
 Stale(l) == l /= None /\ l > Budget
 
 \* One chunk of the current epoch arrives.
 Chunk ==
-    \E d \in 0..DMax, st \in BOOLEAN, w \in 0..WMax, old \in BOOLEAN :
+    \E d \in 0..DMax, st \in BOOLEAN, w \in 0..WMax, old \in BOOLEAN,
+      sh \in IF Shift /= "none" /\ ~shifted THEN BOOLEAN ELSE {shifted} :
       /\ st => (steps < MaxSteps /\ ~lastStep)      \* the step is one chunk
       /\ old => rean < MaxReanchor   \* a re-anchor needs a 30 s old floor
-      /\ LET off == IF st THEN d - Step ELSE d
+      /\ LET base == CASE sh /\ Shift = "ahead" -> d - Step
+                       [] sh /\ Shift = "back"  -> d + Step
+                       [] OTHER                -> d
+             off == IF st THEN base - Step ELSE base
              \* the floor after this sample. confirm / confirm0: a lower
              \* offset is a candidate; the NEXT chunk confirms it when it
              \* lands within Near of it (and below the floor too), and the
@@ -88,7 +105,10 @@ Chunk ==
             /\ anchored' = (anchored \/ (prevOn /\ ~st /\ d = 0))
             /\ ev' = <<d, st, l, srx, ~srx, hnd, w>>
             /\ rean' = IF reanch /\ f2 = off /\ ~lower THEN rean + 1 ELSE rean
-            /\ UNCHANGED rolls
+            /\ shifted' = sh
+            /\ since' = IF sh THEN (IF since < SinceCap THEN since + 1 ELSE since) ELSE 0
+            /\ sinceRoll' = IF rolledAfter /\ sinceRoll < SinceCap THEN sinceRoll + 1 ELSE sinceRoll
+            /\ UNCHANGED <<rolls, rolledAfter>>
 
 \* The room's epoch rolls: the floor starts again with the new epoch.
 Roll ==
@@ -96,7 +116,8 @@ Roll ==
     /\ rolls' = rolls + 1
     /\ floor' = None /\ cand' = None /\ anchored' = FALSE /\ lastStep' = FALSE /\ rean' = 0
     /\ prevOn' = FALSE /\ ev' = Empty
-    /\ UNCHANGED steps
+    /\ rolledAfter' = shifted /\ sinceRoll' = 0
+    /\ UNCHANGED <<steps, shifted, since>>
 
 Next == Chunk \/ Roll
 Spec == Init /\ [][Next]_vars
@@ -110,6 +131,15 @@ Handed == ev[6]
 Wt == ev[7]
 
 TypeOK == TRUE
+\* After a clock step that stays, and with no roll since: from the K-th
+\* chunk after it (K = SinceCap) an on-time chunk is not dropped. The
+\* stream lives without a roll.
+LivesAfterShift == (shifted /\ ~rolledAfter /\ since >= SinceCap /\ ~StepC /\ D <= Budget)
+                       => ~StaleRx
+\* The first on-time chunk after the shift already lives.
+LivesAtOnce == (shifted /\ ~rolledAfter /\ since >= 1 /\ ~StepC /\ D <= Budget) => ~StaleRx
+\* A roll after the shift: from the second chunk of the new epoch it lives.
+LivesAfterRoll == (rolledAfter /\ sinceRoll >= 2 /\ ~StepC /\ D <= Budget) => ~StaleRx
 \* An on-time chunk (not the stepped one) is never dropped as stale.
 NoFalseStale == (~StepC /\ D <= Budget) => ~StaleRx
 \* ... nor at hand-out, when its wait keeps it in budget.

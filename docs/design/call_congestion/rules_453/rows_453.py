@@ -33,13 +33,23 @@ def register(add, B, S):
         invs=["TypeOK", "ControlNeverHeld"], props=["Drains"])
     # ---------------------------------------------------------------- R27
     af = dict(Budget=16, Near=1, Step=40, DMax=20, WMax=4, MaxSteps=1, Rolls=1,
-              MaxReanchor=1)
+              MaxReanchor=1, Shift=S("none"), SinceCap=2)
     for fl in ("current", "confirm", "confirm0"):
         add(f"R27-age-{fl}", "AgeFloor", dict(af, Floor=S(fl)),
             invs=["TypeOK", "NoFalseStale", "NoFalseStaleHandout", "StaleCaught",
                   "NeverForwardStale", "HandedFresh"])
         add(f"R27-age-{fl}-nostep", "AgeFloor", dict(af, Floor=S(fl), MaxSteps=0),
             invs=["TypeOK", "NoFalseStale", "StaleCaught", "HandedFresh"])
+    # R27 clock steps that stay (no one-chunk step; re-anchor on any chunk)
+    for fl in ("confirm", "current", "confirm0"):
+        for sh in ("ahead", "back"):
+            c = dict(af, Floor=S(fl), MaxSteps=0, Shift=S(sh), Rolls=0,
+                     MaxReanchor=12, SinceCap=12, DMax=4, WMax=0)
+            add(f"R27-shift-{sh}-{fl}", "AgeFloor", c,
+                invs=["TypeOK", "LivesAtOnce", "LivesAfterShift"])
+            add(f"R27-shift-{sh}-{fl}-roll", "AgeFloor",
+                dict(c, Rolls=1, MaxReanchor=1, SinceCap=2),
+                invs=["TypeOK", "LivesAfterRoll"])
     # ---------------------------------------------------------------- R28
     eb = dict(C=4, RMin=2, RMax=8, VMax=4, S=2, LMax=24, FastT=8, LiftT=12,
               WMax=3, KWire=3, DebtMax=8, FloorDebit=S("all"))
