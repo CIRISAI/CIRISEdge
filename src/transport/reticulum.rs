@@ -881,7 +881,8 @@ async fn send_fragments_on_channel(
         };
         match tokio::time::timeout(
             CHANNEL_FRAGMENT_SEND_TIMEOUT,
-            node.link_handle(link_id).send(&sealed),
+            node.link_handle(link_id)
+                .send_as(&sealed, scheduler_class()),
         )
         .await
         {
@@ -912,6 +913,22 @@ async fn send_fragments_on_channel(
         stalled: None,
     }
 }
+/// 45.3 (leviculum ciris.5) — the scheduler class of a Channel send, from
+/// the edge send class in force ([`crate::transport::egress_budget::current_send_class`]):
+/// FIRST (unclassed included) is Control, never age-dropped, ahead of media;
+/// BULK is Bulk, inside the floor.
+fn scheduler_class() -> leviculum_std::EgressClass {
+    match crate::transport::egress_budget::current_send_class() {
+        crate::transport::egress_budget::SendClass::First => leviculum_std::EgressClass::Control,
+        crate::transport::egress_budget::SendClass::Bulk => leviculum_std::EgressClass::Bulk,
+    }
+}
+
+/// 45.3 (leviculum ciris.5) — the transport's egress scheduler is paced this
+/// much above the egress budget's rate: the budget is what edge admits, the
+/// scheduler only keeps the kernel's FIFO short behind it.
+const EGRESS_PACE_OVER_BUDGET: f64 = 1.10;
+
 /// A send refused because the frame is over the Channel's limit (leviculum
 /// 0.34 says so; it used to read `LinkFailed`). The link is alive: its MDU
 /// shrank under a frame cut earlier, on a move to a direct path.
@@ -8753,6 +8770,66 @@ impl ReticulumTransport {
         &self.egress_budget
     }
 
+    /// 45.3 (leviculum ciris.5) — the transport's egress scheduler follows
+    /// the budget: paced a little above the budget's rate R (edge's byte
+    /// estimate runs a few per cent under what leviculum frames, and the
+    /// scheduler must not become the bottleneck the budget is sized for),
+    /// unpaced when no budget is in force. The bulk floor and the media age
+    /// bound are edge's own ([`crate::transport::egress_budget::FLOOR_SHARE`],
+    /// [`crate::transport::av_call::MEDIA_STALE_BUDGET`]).
+    pub fn follow_egress_budget(&self) {
+        use crate::transport::egress_budget as eb;
+        let rate = self.egress_budget.rate_bps().map(|r| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let paced = (r * EGRESS_PACE_OVER_BUDGET).round() as u64;
+            paced.max(leviculum_std::egress::MIN_RATE_BPS)
+        });
+        if self.node.egress_rate() != rate {
+            self.node.set_egress_rate(rate);
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let min_bps = eb::FLOOR_MIN_BPS as u64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let share_percent = (eb::FLOOR_SHARE * 100.0).round() as u8;
+        self.node.set_egress_floor(leviculum_std::EgressFloor {
+            share_percent,
+            min_bps,
+        });
+        for kind in [
+            leviculum_std::MediaKind::Audio,
+            leviculum_std::MediaKind::Video,
+        ] {
+            self.node
+                .set_egress_media_age_bound(kind, crate::transport::av_call::MEDIA_STALE_BUDGET);
+        }
+    }
+
+    /// 45.3 (leviculum ciris.5) — the age of the oldest frame this node's
+    /// own egress scheduler holds for control, call control's proofs and
+    /// media (ms): the own uplink's queue read directly, not inferred from
+    /// proofs. Bulk is left out (its floor holds it by design). `None` while
+    /// no rate is set: unpaced, the scheduler queues nothing and the queue
+    /// is the kernel's, which only the send clock sees.
+    #[must_use]
+    pub fn egress_own_queue_age_ms(&self) -> Option<u64> {
+        use leviculum_std::EgressClass as C;
+        self.node.egress_rate()?;
+        let depth = self.node.egress_depth();
+        [C::Control, C::Proof, C::LinkSetup, C::Audio, C::Video]
+            .into_iter()
+            .map(|c| depth.class(c).oldest_age_ms)
+            .max()
+    }
+
+    /// 45.3 (leviculum ciris.5) — the egress scheduler's per-class counters
+    /// and depth, for the gauges.
+    #[must_use]
+    pub fn egress_scheduler_stats(
+        &self,
+    ) -> (leviculum_std::EgressStats, leviculum_std::EgressDepth) {
+        (self.node.egress_stats(), self.node.egress_depth())
+    }
+
     /// 45.3 — an identity-plane send (an envelope: replication rounds and
     /// replies, chat, anything not call control or call media) is BULK: it
     /// waits until the egress budget serves it, paced at the budget's rate
@@ -11542,6 +11619,17 @@ impl ReticulumTransport {
                 Some(side),
             );
             return Err(ShipError::Busy);
+        }
+        // 45.3 (leviculum ciris.5) — the scheduler takes every Resource as
+        // bulk: a FIRST envelope here waits behind media. Counted, so it is
+        // seen if it is ever more than the rare one past Channel-first's cap.
+        if matches!(
+            crate::transport::egress_budget::current_send_class(),
+            crate::transport::egress_budget::SendClass::First
+        ) {
+            if let Some(m) = self.metrics.get() {
+                m.inc_av_plane(crate::observability::EGRESS_FIRST_ON_RESOURCE);
+            }
         }
         // CC 5.3.3.5 E1 — the Resource carries the SEALED envelope; a link
         // with no keys ships nothing (and opens no Resource lane).
@@ -20324,10 +20412,13 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 });
         }
         // CIRISEdge#805 item 8 — direct links (leviculum#70).
+        // 45.3 (ciris.5) — `punch` (the punch's counts) is read by the
+        // probe adapter, not here.
         NodeEvent::DirectLinkEstablished {
             link_id,
             interface_index,
             proposed,
+            ..
         } => direct_link_established(ctx, link_id, interface_index, proposed).await,
         NodeEvent::DirectLinkRequested { link_id, .. } => {
             direct_link_requested(ctx, link_id).await;
@@ -20336,6 +20427,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             link_id,
             failure,
             proposed,
+            ..
         } => direct_link_failed(ctx, link_id, failure, proposed).await,
         NodeEvent::DirectLinkLost {
             link_id,

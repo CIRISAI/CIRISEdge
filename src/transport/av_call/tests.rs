@@ -1130,8 +1130,8 @@ fn media_is_stale_past_800_ms_above_its_floor_whatever_the_clock_skew() {
 }
 
 /// 45.3 row AGE — a stream already 9 s late when this receiver first hears
-/// it: its late offset is the floor (not known stale) until one faster chunk
-/// lowers it, and from then the late ones are stale. The floor never rises
+/// it: its late offset is the floor (not known stale) until a confirming pair
+/// of faster chunks lowers it, and from then the late ones are stale. The floor never rises
 /// on a late sample, so a queue that persists cannot teach itself away.
 #[test]
 fn a_stream_that_starts_late_is_judged_from_its_first_on_time_chunk() {
@@ -1145,9 +1145,12 @@ fn a_stream_that_starts_late_is_judged_from_its_first_on_time_chunk() {
     assert!(!super::is_stale_end_to_end(Some(
         floor.sample(late + 30, 60_000)
     )));
-    // The queue drains: one on-time chunk is the new floor at once...
+    // The queue drains: two on-time chunks confirm the new floor (confirm0)...
     assert!(!super::is_stale_end_to_end(Some(
         floor.sample(skew + 10, 61_000)
+    )));
+    assert!(!super::is_stale_end_to_end(Some(
+        floor.sample(skew + 12, 61_020)
     )));
     // ...and the queue coming back is stale.
     assert!(super::is_stale_end_to_end(Some(floor.sample(late, 62_000))));
@@ -1155,41 +1158,37 @@ fn a_stream_that_starts_late_is_judged_from_its_first_on_time_chunk() {
 
 /// 45.3 — `CallEvent::KeyframeWanted`: once per resume of an own stream's
 /// video after frames were held or dropped, never for audio, never for a
-/// stream that was not held, and not again until it is held once more; each
-/// own stream on its own.
+/// stream that was not held, not again until it is held once more, and at
+/// most once per KEYFRAME_WANTED_MIN_INTERVAL_MS: four resumes inside a
+/// second fire once, and the one still owed fires at the first frame out
+/// after the interval. Each own stream on its own. Mutation: dropping the
+/// interval fires on every resume and fails "inside the interval".
 #[test]
-fn a_keyframe_is_wanted_once_per_resume_of_held_video() {
+fn a_keyframe_is_wanted_once_per_resume_and_at_most_once_a_second() {
+    use super::KEYFRAME_WANTED_MIN_INTERVAL_MS as GAP;
     let (a, b) = (StreamId([1; 32]), StreamId([2; 32]));
-    let mut held = std::collections::HashSet::new();
+    let mut k = std::collections::HashMap::new();
+    let mut at = |s: StreamId, video: bool, sent: bool, t: u64| {
+        super::video_resumes(&mut k, s, video, sent, t)
+    };
+    assert!(!at(a, true, true, 0), "never held");
+    assert!(!at(a, false, false, 10), "audio held");
+    assert!(!at(a, false, true, 20), "audio resumes");
+    assert!(!at(a, true, false, 30), "held");
+    assert!(!at(a, true, false, 40), "still held");
+    assert!(!at(b, true, true, 50), "the other stream");
+    assert!(at(a, true, true, 60), "resumes: wanted");
+    assert!(!at(a, true, true, 70), "once");
+    // Three more resumes inside the interval: owed, not fired.
+    for t in [100, 300, 600] {
+        assert!(!at(a, true, false, t));
+        assert!(!at(a, true, true, t + 10), "inside the interval ({t})");
+    }
     assert!(
-        !super::video_resumes(&mut held, a, true, true),
-        "never held"
+        at(a, true, true, 60 + GAP),
+        "owed: fires once the interval ends"
     );
-    assert!(
-        !super::video_resumes(&mut held, a, false, false),
-        "audio held"
-    );
-    assert!(
-        !super::video_resumes(&mut held, a, false, true),
-        "audio resumes"
-    );
-    assert!(!super::video_resumes(&mut held, a, true, false), "held");
-    assert!(
-        !super::video_resumes(&mut held, a, true, false),
-        "still held"
-    );
-    assert!(
-        !super::video_resumes(&mut held, b, true, true),
-        "the other stream"
-    );
-    assert!(
-        super::video_resumes(&mut held, a, true, true),
-        "resumes: wanted"
-    );
-    assert!(!super::video_resumes(&mut held, a, true, true), "once");
-    assert!(!super::video_resumes(&mut held, a, true, false));
-    assert!(
-        super::video_resumes(&mut held, a, true, true),
-        "the next resume"
-    );
+    assert!(!at(a, true, true, 70 + GAP), "and only once");
+    assert!(!at(a, true, false, 3_000));
+    assert!(at(a, true, true, 3_010), "the next resume");
 }

@@ -1120,6 +1120,11 @@ pub const ALM_DRAIN_ENTERED: &str = "alm_drain_entered";
 /// 45.3 — an identity-plane send (an envelope) that waited on the node's
 /// egress budget as bulk.
 pub const AV_BULK_DEFERRED_DRAIN: &str = "av_bulk_deferred_budget";
+/// 45.3 (leviculum ciris.5) — a FIRST-class envelope (call control, a key,
+/// a removal) that went as a Resource: the transport schedules every
+/// Resource as bulk, so it waited behind media. Channel-first carries FIRST
+/// up to its fragment cap; this counts what fell past it.
+pub const EGRESS_FIRST_ON_RESOURCE: &str = "egress_first_on_resource";
 /// 45.3 — a media frame (own: every fragment; relayed: one chunk) the egress
 /// budget did not admit, so not sent.
 pub const AV_FRAME_HELD_BUDGET: &str = "av_frame_held_budget";
@@ -3065,6 +3070,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_UPLINK_STALL,
     ALM_DRAIN_ENTERED,
     AV_BULK_DEFERRED_DRAIN,
+    EGRESS_FIRST_ON_RESOURCE,
     AV_FRAME_HELD_BUDGET,
     AV_VIDEO_KEYFRAME_WANTED,
     AV_CHUNK_DROPPED_STALE_AT_SENDER,

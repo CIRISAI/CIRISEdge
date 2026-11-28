@@ -281,10 +281,14 @@ pub(super) struct AlmState {
     last_primary: BTreeMap<StreamId, Option<String>>,
     egress: EgressMeter,
     leg_queue_ms: BTreeMap<String, f64>,
-    /// 45.3 row AGE — per received stream, the last chunk this node dropped
-    /// as stale end to end: `(call ms, its RM1 latency)`. What this node then
-    /// advertises as its upstream latency (offer-as-life at its children).
-    stale_seen: BTreeMap<StreamId, (u64, u64)>,
+    /// 45.3 row AGE — per received stream, the chunks this node dropped as
+    /// stale end to end within offer-as-life's life: `(call ms, its RM1
+    /// latency)`, oldest first. The MOST late of them is what this node
+    /// advertises as its upstream latency (offer-as-life at its children):
+    /// the model's R29b row (`RelayAdvert.tla`, AdvOverDrops) fails when only
+    /// the last drop is kept, since a later, less-late drop then hides an
+    /// earlier, later one still inside the window.
+    stale_seen: BTreeMap<StreamId, StaleWindow>,
     /// Row ProbeAfterDrain — out legs that cannot read as drained now: their
     /// queue gauge is unmeasured (no `min_rtt` yet, or right after a path
     /// move) or a Channel message is still outstanding on them.
@@ -1565,14 +1569,14 @@ impl AlmState {
         let age_ms = self
             .age_floor
             .entry((stream, epoch))
-            .or_insert_with(|| LatencyFloor::new(offset, now))
+            .or_insert_with(|| LatencyFloor::empty(now))
             .sample(offset, now);
         // RM1: a better floor wins at once; only an on-time sample
         // re-anchors an old one (drift), never a queued one.
         let latency_ms = self
             .min_offset
             .entry(stream)
-            .or_insert_with(|| LatencyFloor::new(offset, now))
+            .or_insert_with(|| LatencyFloor::empty(now))
             .sample(offset, now);
         #[allow(clippy::cast_precision_loss)]
         let latency = latency_ms as f64;
@@ -1711,7 +1715,7 @@ impl AlmState {
     /// host: what the pump passed can still go stale waiting on its other
     /// fragments or the reorder window.
     pub(super) fn latency_now(&self, stream: StreamId, epoch: u64, source_ms: u64) -> Option<i64> {
-        let floor = self.age_floor.get(&(stream, epoch))?.floor();
+        let floor = self.age_floor.get(&(stream, epoch))?.confirmed()?;
         #[allow(clippy::cast_possible_wrap)]
         let offset = crate::transport::av_chunk_auth::unix_ms_now() as i64 - source_ms as i64;
         Some(offset.saturating_sub(floor))
@@ -1722,7 +1726,7 @@ impl AlmState {
     pub(super) fn note_stale_end_to_end(&mut self, stream: StreamId, latency_ms: i64) {
         let now = self.now_ms();
         let l = u64::try_from(latency_ms).unwrap_or(0);
-        self.stale_seen.insert(stream, (now, l));
+        self.stale_seen.entry(stream).or_default().note(now, l);
         self.sync_upstream(stream);
     }
 
@@ -1735,14 +1739,10 @@ impl AlmState {
         // offer says so while the drops are recent (offer-as-life's life), so
         // a child of a relay with nothing fresh to pass on keeps it.
         let now = self.now_ms();
-        let stale = self
-            .stale_seen
-            .get(&stream)
-            .filter(|(at, _)| {
-                now.saturating_sub(*at)
-                    <= crate::transport::realtime_av_alm::controller::selector::OFFER_IS_LIFE_MS
-            })
-            .map_or(0, |(_, l)| u32::try_from(*l).unwrap_or(u32::MAX));
+        let life = crate::transport::realtime_av_alm::controller::selector::OFFER_IS_LIFE_MS;
+        let stale = self.stale_seen.get_mut(&stream).map_or(0, |seen| {
+            u32::try_from(seen.max_within(now, life)).unwrap_or(u32::MAX)
+        });
         if let Some(a) = self.relays.get_mut(&stream) {
             match view {
                 Some(u) => a.set_upstream(
@@ -2764,6 +2764,35 @@ fn stream_label(s: StreamId) -> String {
     format!("{:02x}{:02x}", s.0[0], s.0[1])
 }
 
+/// 45.3 row AGE (R29b) — the stale drops of one received stream within a
+/// window, kept so the window's MOST late drop is read in O(1): latencies
+/// fall front to back, because a drop at least as late as those behind it
+/// replaces them (they can never be the maximum again while it is held).
+#[derive(Debug, Default)]
+struct StaleWindow(VecDeque<(u64, u64)>);
+
+impl StaleWindow {
+    /// A drop at `now`, `latency_ms` above the stream's floor.
+    fn note(&mut self, now: u64, latency_ms: u64) {
+        while self.0.back().is_some_and(|&(_, l)| l <= latency_ms) {
+            self.0.pop_back();
+        }
+        self.0.push_back((now, latency_ms));
+    }
+
+    /// The most late drop no older than `window_ms` at `now`; 0 for none.
+    fn max_within(&mut self, now: u64, window_ms: u64) -> u64 {
+        while self
+            .0
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_sub(at) > window_ms)
+        {
+            self.0.pop_front();
+        }
+        self.0.front().map_or(0, |&(_, l)| l)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2802,6 +2831,28 @@ mod tests {
         // Between the bounds it neither enters nor leaves.
         assert_eq!(d.observe(62_250, Some(300)), None);
         assert!(!d.active());
+    }
+
+    /// 45.3 R29b (`RelayAdvert.tla`, AdvOverDrops) — a relay advertises the
+    /// MOST late stale drop of the last 2.5 s, not the last one: a 1.0 s drop
+    /// then a 0.9 s drop reads 1.0 s while the first is in the window, then
+    /// 0.9 s once it leaves, then nothing. Mutation: keeping only the last
+    /// drop reads 0.9 s at once and fails the first assertion.
+    #[test]
+    fn a_relay_advertises_its_most_late_stale_drop_of_the_window() {
+        let life = crate::transport::realtime_av_alm::controller::selector::OFFER_IS_LIFE_MS;
+        let mut w = StaleWindow::default();
+        assert_eq!(w.max_within(0, life), 0);
+        w.note(0, 1_000);
+        w.note(500, 900);
+        assert_eq!(w.max_within(600, life), 1_000, "the earlier, later drop");
+        assert_eq!(w.max_within(life + 1, life), 900, "the first left");
+        assert_eq!(w.max_within(500 + life + 1, life), 0, "both left");
+        // A later drop at least as late replaces what it outlives.
+        w.note(10_000, 700);
+        w.note(10_100, 800);
+        assert_eq!(w.0.len(), 1);
+        assert_eq!(w.max_within(10_100, life), 800);
     }
 
     /// 45.3 row STALE — media is dropped at the sender only once the backlog
@@ -3840,16 +3891,17 @@ mod tests {
         n.min_offset[&stream].floor()
     }
 
-    /// 45.3 row AGE (CC review) — the AGE floor lives one (stream, epoch).
-    /// The publisher's clock steps 2 s ahead for ONE chunk: that chunk is the
-    /// floor's new minimum, so every on-time chunk after it reads 2 s late
-    /// and is dropped as stale; the drift re-anchor never takes it back (no
-    /// later chunk comes within FLOOR_NEAR_MS of it), however long. At the
-    /// next roll the floor starts again and the stream is fresh at once.
-    /// Mutation: a floor kept per stream across epochs drops the stream for
-    /// good.
+    /// 45.3 row AGE (CC review; R27 confirm0) — the AGE floor lives one
+    /// (stream, epoch), and a floor needs its confirming pair. The
+    /// publisher's clock steps 2 s ahead for ONE chunk: that chunk only
+    /// proposes a floor, no second chunk confirms it, and the on-time chunks
+    /// after it stay fresh, then and forty seconds on. The roll starts the
+    /// floor again: the new epoch's first chunk proposes, its second
+    /// confirms, and none is stale. Mutations: a lower offset taken at once
+    /// (45.3 before confirm0) reads every later chunk 2 s late; a floor kept
+    /// per stream across epochs carries a poisoned floor past the roll.
     #[test]
-    fn a_publisher_clock_step_for_one_chunk_is_forgotten_at_the_roll() {
+    fn a_publisher_clock_step_for_one_chunk_poisons_nothing() {
         let mut b = AlmState::new("b", s(2), &roster(), true, 2);
         b.on_caps("a", CAPS_THIS_BUILD);
         b.note_publisher(s(1), "a");
@@ -3866,29 +3918,22 @@ mod tests {
             assert!(!stale(chunk(&mut b, 1, seq, 0)), "on time");
             seq += 1;
         }
-        // One chunk stamped 2 s ahead: the floor falls to it.
+        // One chunk stamped 2 s ahead: it proposes a floor nobody confirms.
         assert!(!stale(chunk(&mut b, 1, seq, 2_000)));
         seq += 1;
         for _ in 0..30 {
             assert!(
-                stale(chunk(&mut b, 1, seq, 0)),
-                "read 2 s late after the step"
+                !stale(chunk(&mut b, 1, seq, 0)),
+                "the step poisoned the floor"
             );
             seq += 1;
         }
-        // Forty seconds on, still the same epoch: the re-anchor needs a chunk
-        // near the floor, and none comes.
         b.t0 = b.t0.checked_sub(Duration::from_secs(40)).expect("clock");
-        assert!(
-            stale(chunk(&mut b, 1, seq, 0)),
-            "no re-anchor from a late sample"
-        );
-        seq += 1;
+        assert!(!stale(chunk(&mut b, 1, seq, 0)), "forty seconds on");
         // The roll: the floor starts again, fresh from its first chunk.
         for k in 0..30 {
             assert!(!stale(chunk(&mut b, 2, k, 0)), "fresh in the new epoch");
         }
-        let _ = seq;
     }
 
     /// RM1 — observable: a chunk's signed `source_ts_ms` against the wall

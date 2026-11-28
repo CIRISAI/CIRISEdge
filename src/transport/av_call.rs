@@ -1927,9 +1927,10 @@ struct Shared {
     queue_age_ms: AtomicU64,
     /// 45.3 row DR — each out leg's [`alm::SendClock`].
     send_clocks: StdMutex<HashMap<[u8; 16], alm::SendClock>>,
-    /// 45.3 — the own streams whose video edge held or dropped since the
-    /// last frame of it that went out ([`video_resumes`]).
-    video_held: StdMutex<std::collections::HashSet<StreamId>>,
+    /// 45.3 — per own stream, the KeyframeWanted state
+    /// ([`video_resumes`]): owed since a video frame was held or dropped,
+    /// and when the event last fired.
+    video_held: StdMutex<HashMap<StreamId, KeyframeOwed>>,
     /// G8 — rung when a fan-out parks a chunk: the flusher retries it with
     /// the publisher lock taken briefly, never inside `publish`.
     parked_wake: tokio::sync::Notify,
@@ -2715,7 +2716,7 @@ impl Call {
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
             send_clocks: StdMutex::new(HashMap::new()),
-            video_held: StdMutex::new(std::collections::HashSet::new()),
+            video_held: StdMutex::new(HashMap::new()),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
             evidence_at: StdMutex::new(HashMap::new()),
@@ -4136,13 +4137,17 @@ async fn send_pieces(
         }
         // Row STALE drops every chunk of this frame in `send_own_chunk`: for
         // the keyframe rule that is a held frame too.
-        let stale = Shared::lock(&shared.alm).sends_stale();
+        let (stale, now) = {
+            let alm = Shared::lock(&shared.alm);
+            (alm.sends_stale(), alm.now_ms())
+        };
         let video = class == crate::transport::egress_budget::Class::Video;
         let resumed = video_resumes(
             &mut Shared::lock(&shared.video_held),
             stream,
             video,
             admitted && !stale,
+            now,
         );
         if resumed {
             shared.count(crate::observability::AV_VIDEO_KEYFRAME_WANTED);
@@ -4226,15 +4231,25 @@ fn uplink_backlog(shared: &Arc<Shared>, legs: &[(String, [u8; 16])]) {
     // outstanding message every tick, while the other legs' offers are at
     // the liveness minimum and go unmeasured as the queue shrinks.
     let draining = Shared::lock(&shared.alm).draining();
-    let reading = if all_ages.len() >= alm::UPLINK_STALL_LEGS || (draining && !all_ages.is_empty())
+    let inferred = if all_ages.len() >= alm::UPLINK_STALL_LEGS || (draining && !all_ages.is_empty())
     {
         all_ages.into_iter().min()
     } else {
         None
     };
+    // 45.3 (leviculum ciris.5) — the own egress scheduler's queue, read
+    // directly, whatever the number of legs; the send clock still sees the
+    // kernel's FIFO and the path behind it. The later of the two is the
+    // backlog.
+    let direct = shared.transport.egress_own_queue_age_ms();
+    let reading = match (inferred, direct) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
     let changed = Shared::lock(&shared.alm).observe_uplink_backlog(reading);
     let budget = shared.transport.egress_budget();
     budget.observe(reading);
+    shared.transport.follow_egress_budget();
     if let Some(m) = &shared.metrics {
         m.telemetry.set_uplink_backlog_ms(reading.unwrap_or(0));
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -4278,26 +4293,53 @@ const fn chunk_wire_bytes(plaintext: usize) -> usize {
         + 28
 }
 
+/// 45.3 — the least time between two `CallEvent::KeyframeWanted` for one
+/// stream. Under a short budget video frames are held and admitted in turn,
+/// and every resume asking for a keyframe (the W4 bench: ~4 a second) would
+/// spend the budget on keyframes; one a second keeps a freeze under about a
+/// second and costs at most one keyframe a second. A resume inside the
+/// interval is owed, not lost: the first frame out after it fires.
+pub(crate) const KEYFRAME_WANTED_MIN_INTERVAL_MS: u64 = 1_000;
+
+/// 45.3 — one own stream's KeyframeWanted state.
+#[derive(Debug, Clone, Copy, Default)]
+struct KeyframeOwed {
+    /// A video frame was held or dropped since the event last fired.
+    owed: bool,
+    /// When the event last fired (call ms).
+    fired_at: Option<u64>,
+}
+
 /// 45.3 — `CallEvent::KeyframeWanted`'s rule, for one own frame of `stream`
-/// (`video`: whether it is video; `sent`: whether it goes out, neither held
-/// by the budget nor dropped by row STALE). A video frame that does not go
-/// out marks the stream; the first one that does after that unmarks it and
-/// returns `true`, once per resume.
+/// at `now_ms` (`video`: whether it is video; `sent`: whether it goes out,
+/// neither held by the budget nor dropped by row STALE). A video frame that
+/// does not go out makes a keyframe owed; a frame that goes out while one is
+/// owed returns `true` (and clears it) unless the event fired within
+/// [`KEYFRAME_WANTED_MIN_INTERVAL_MS`], in which case it stays owed.
 fn video_resumes(
-    held: &mut std::collections::HashSet<StreamId>,
+    state: &mut HashMap<StreamId, KeyframeOwed>,
     stream: StreamId,
     video: bool,
     sent: bool,
+    now_ms: u64,
 ) -> bool {
     if !video {
         return false;
     }
-    if sent {
-        held.remove(&stream)
-    } else {
-        held.insert(stream);
-        false
+    let k = state.entry(stream).or_default();
+    if !sent {
+        k.owed = true;
+        return false;
     }
+    let spaced = k
+        .fired_at
+        .is_none_or(|at| now_ms.saturating_sub(at) >= KEYFRAME_WANTED_MIN_INTERVAL_MS);
+    if k.owed && spaced {
+        k.owed = false;
+        k.fired_at = Some(now_ms);
+        return true;
+    }
+    false
 }
 
 /// 45.3 — the egress budget's class of a media chunk.

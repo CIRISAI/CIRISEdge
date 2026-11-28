@@ -16,46 +16,92 @@ pub(super) const FLOOR_REANCHOR_MS: u64 = 30_000;
 /// sample that close is not late, so a queued stream never moves its floor.
 pub(super) const FLOOR_NEAR_MS: i64 = 50;
 
-/// RM1 — one stream's latency floor: the smallest clock offset
+/// RM1 — one stream's latency floor: the smallest CONFIRMED clock offset
 /// (`wall − source_ts_ms`) seen for it, with when it was set.
 ///
-/// Transition (RM1): observable, a verified chunk's signed `source_ts_ms`
-/// against this node's wall clock; state, the floor and its age; action, a
-/// lower offset replaces the floor at once, and a sample within
-/// [`FLOOR_NEAR_MS`] of a floor older than [`FLOOR_REANCHOR_MS`] re-anchors
-/// it (clock drift); the latency is the offset above the floor; must never,
-/// re-anchor from a late sample (45.2.0 before RM1 replaced a 30 s old floor
-/// with whatever came next, so after 30 s of queueing the latency read zero
-/// and the late signal was gone).
+/// Transition (RM1, 45.3 confirm0): observable, a verified chunk's signed
+/// `source_ts_ms` against this node's wall clock; state, the floor, its age
+/// and one unconfirmed candidate; action, an offset below the floor (or the
+/// first offset of an empty floor) becomes the candidate, and the NEXT
+/// offset within [`FLOOR_NEAR_MS`] of it confirms it, the floor becoming the
+/// LOWER of the pair; a sample within [`FLOOR_NEAR_MS`] above a floor older
+/// than [`FLOOR_REANCHOR_MS`] re-anchors it upward (clock drift); the
+/// latency is the offset above the floor (zero while none is confirmed);
+/// must never, (a) re-anchor from a late sample (45.2.0 before RM1 replaced
+/// a 30 s old floor with whatever came next, so after 30 s of queueing the
+/// latency read zero and the late signal was gone), nor (b) take a floor
+/// from one chunk alone: one chunk from a publisher clock stepped ahead
+/// would read every later chunk as late until the epoch rolled (model row
+/// R27 AGE, `AgeFloor.tla`, NoFalseStale; confirm0 is the variant that
+/// passes all five properties). A queue only raises offsets, so it can
+/// neither propose nor confirm a lower floor. Limit, stated: a clock that
+/// steps BACK and stays reads as a standing queue, which no receiver can
+/// tell apart; it is late until the epoch rolls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LatencyFloor {
-    floor: i64,
+    floor: Option<i64>,
     at_ms: u64,
+    candidate: Option<i64>,
 }
 
 impl LatencyFloor {
-    /// A floor at `offset`, set at `now_ms`.
+    /// A floor already confirmed at `offset`, set at `now_ms` (tests).
+    #[cfg(test)]
     pub(super) fn new(offset: i64, now_ms: u64) -> Self {
         Self {
-            floor: offset,
+            floor: Some(offset),
             at_ms: now_ms,
+            candidate: None,
         }
     }
 
-    /// The floor (ms of clock offset).
-    pub(super) fn floor(&self) -> i64 {
+    /// No floor yet: the stream's first chunk only proposes one.
+    pub(super) fn empty(now_ms: u64) -> Self {
+        Self {
+            floor: None,
+            at_ms: now_ms,
+            candidate: None,
+        }
+    }
+
+    /// The confirmed floor (ms of clock offset), if any.
+    pub(super) fn confirmed(&self) -> Option<i64> {
         self.floor
     }
 
+    /// The floor (ms of clock offset); 0 while none is confirmed (tests).
+    #[cfg(test)]
+    pub(super) fn floor(&self) -> i64 {
+        self.floor.unwrap_or(0)
+    }
+
     /// Fold one chunk's clock offset; returns its latency above the floor
-    /// (ms, never negative).
+    /// (ms, never negative; 0 while no floor is confirmed).
     pub(super) fn sample(&mut self, offset: i64, now_ms: u64) -> i64 {
-        let near = offset.saturating_sub(self.floor) <= FLOOR_NEAR_MS;
-        let old = now_ms.saturating_sub(self.at_ms) >= FLOOR_REANCHOR_MS;
-        if offset < self.floor || (near && old) {
-            *self = Self::new(offset, now_ms);
+        let below = |f: Option<i64>| f.is_none_or(|f| offset < f);
+        match self.candidate.take() {
+            Some(c) if offset.abs_diff(c) <= FLOOR_NEAR_MS.unsigned_abs() => {
+                let lo = c.min(offset);
+                if self.floor.is_none_or(|f| lo < f) {
+                    self.floor = Some(lo);
+                    self.at_ms = now_ms;
+                }
+            }
+            _ => {
+                if below(self.floor) {
+                    self.candidate = Some(offset);
+                }
+            }
         }
-        offset.saturating_sub(self.floor).max(0)
+        if let Some(f) = self.floor {
+            let near = offset >= f && offset.saturating_sub(f) <= FLOOR_NEAR_MS;
+            let old = now_ms.saturating_sub(self.at_ms) >= FLOOR_REANCHOR_MS;
+            if near && old {
+                self.floor = Some(offset);
+                self.at_ms = now_ms;
+            }
+        }
+        self.floor.map_or(0, |f| offset.saturating_sub(f).max(0))
     }
 }
 
@@ -174,13 +220,54 @@ pub(super) fn spared(stream: StreamId, me: &str, directs: &[String]) -> bool {
 mod tests {
     use super::*;
 
-    /// RM1 — a better floor wins at once.
+    /// RM1 (45.3 confirm0) — a better floor wins on its confirming pair,
+    /// taking the lower of the two: one chunk alone proposes, the next within
+    /// FLOOR_NEAR_MS confirms.
     #[test]
-    fn a_lower_offset_is_the_new_floor_at_once() {
+    fn a_lower_offset_is_the_new_floor_once_its_pair_confirms_it() {
         let mut f = LatencyFloor::new(100, 0);
         assert_eq!(f.sample(80, 10), 0);
-        assert_eq!(f.floor(), 80);
-        assert_eq!(f.sample(130, 20), 50);
+        assert_eq!(f.floor(), 100, "one chunk only proposes");
+        assert_eq!(f.sample(90, 20), 10);
+        assert_eq!(f.floor(), 80, "confirmed: the lower of the pair");
+        assert_eq!(f.sample(130, 30), 50);
+    }
+
+    /// R27 AGE (`AgeFloor.tla`, NoFalseStale under confirm0) — one chunk
+    /// from a publisher clock 2 s AHEAD (its offset 2 s low) poisons nothing:
+    /// not mid-stream, and not as the stream's FIRST chunk. Mutation: taking
+    /// a lower offset at once (45.2/45.3 before confirm0) reads every later
+    /// chunk 2 s late and fails both.
+    #[test]
+    fn one_chunk_from_a_stepped_clock_never_sets_the_floor() {
+        let mut f = LatencyFloor::new(1_000, 0);
+        assert_eq!(f.sample(-1_000, 10), 0, "the stepped chunk");
+        assert_eq!(f.sample(1_005, 20), 5, "the next is on time");
+        assert_eq!(f.floor(), 1_000);
+        // As an empty floor's first chunk.
+        let mut f = LatencyFloor::empty(0);
+        assert_eq!(f.sample(-1_000, 0), 0);
+        assert_eq!(f.confirmed(), None, "a first chunk only proposes");
+        assert_eq!(f.sample(1_005, 20), 0);
+        assert_eq!(f.sample(1_010, 40), 5);
+        assert_eq!(f.confirmed(), Some(1_005), "the on-time pair");
+    }
+
+    /// R27 AGE (LivesAfterShift) — a clock that steps AHEAD and stays: the
+    /// floor follows on the first pair after the step and the stream lives.
+    /// One that steps BACK and stays reads late until the epoch rolls (no
+    /// receiver can tell it from a standing queue): the stated limit.
+    #[test]
+    fn a_clock_stepped_ahead_is_followed_and_one_stepped_back_reads_late() {
+        let mut f = LatencyFloor::new(1_000, 0);
+        assert_eq!(f.sample(-1_000, 10), 0);
+        assert_eq!(f.sample(-995, 20), 5);
+        assert_eq!(f.floor(), -1_000, "followed");
+        assert_eq!(f.sample(-990, 30), 10, "lives");
+        let mut f = LatencyFloor::new(1_000, 0);
+        for t in (10..120_000).step_by(20) {
+            assert_eq!(f.sample(3_000, t), 2_000, "stepped back, at {t} ms");
+        }
     }
 
     /// RM1 — a queued stream never moves its floor, however long it queues;
