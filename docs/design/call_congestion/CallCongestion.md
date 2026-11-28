@@ -315,6 +315,39 @@ There are three rules for the excuse:
   - Any relay that holds a real, recent late stamp is excused, honest or not. That is correct: nothing fresh exists then.
 - **NotChargedAtOnce holds under every rule.** No failover happens before 9 ticks of silence have passed since both the last chunk and the last excused tick.
 
+**R29 against the CC-accepted wire shape** (Rule `wire`). The STAMP is its own C3 frame kind, 0x08:
+
+> stream_id[32] ‖ u64 epoch ‖ u64 sent_ms ‖ u32 backlog_ms ‖ u64 last_sealed_chunk_seq ‖ Ed25519 sig[64], signed by the bound chunk key of (stream, epoch).
+
+How each rule of the shape is modelled:
+- **Sending.** The publisher sends it only while its backlog is over 800 ms. A relay forwards its latest verified stamp byte for byte and never mints one.
+- **Sequence check.** A child takes the stamp only if `last_sealed_chunk_seq` ≥ its highest verified seq for (stream, epoch). Modelled as: the stamp left the publisher no earlier than the child's newest chunk was sealed, which is its arrival less the queue it waited in. A first draft compared against arrival time, and it rejected honest stamps, so judge the seq, not arrival.
+- **Freshness.** (now − sent_ms − AGE floor offset) − backlog_ms ≤ 2.5 s.
+- **Excuse.** A valid fresh late stamp while the parent forwards.
+- **Grace.** The valid stamp's backlog, capped at down_silence; otherwise 0.
+- **Clock error.** `ClockErr` ticks of floor error model a publisher clock that stepped back and stayed (R27).
+- **First chunk.** `FloorAtStart = FALSE` is the stamp before any chunk, with no AGE floor yet. `DrainOnly` admits the child into a draining queue (the kill witness), and the first chunk after the publisher resumes waits out the queue it joins.
+
+| Run | Checks | States / distinct / depth | Result |
+|---|---|---|---|
+| wire, liar | LiarWithinDown, LiarAfterCalm | 103,072 / 35,863 / 44 | pass |
+| wire, liar, publisher never late | LiarHeldTotal, LiarFailsOver | 171 / 67 / 10 | pass |
+| wire, honest | NeverFailsOver, NotChargedAtOnce | 1,018,191 / 325,934 / 56 | pass |
+| wire, offers stop | OffersStopBound, NotChargedAtOnce | 57,446,402 / 21,871,085 / 56 | pass |
+| wire, black hole | BlackHoleBound, NotChargedAtOnce | 103,072 / 35,863 / 44 | pass |
+| wire, honest, floor 1.5 / 2.0 / 2.5 s under the publisher's clock | NeverFailsOver | 1,065,507 / 341,110 / 56; 835,468 / 266,860 / 56; 413,297 / 131,887 / 56 | pass |
+| wire, honest, floor 2.75 s under | NeverFailsOver | 2,738 / 1,219 / 14 | **FAIL** |
+| first chunk, no floor, "plan" (no excuse, no grace), honest, depth 0 | NeverFailsOver | 371 / 246 / 7 | **FAIL** |
+| first chunk, "plan", honest, depth 1 | NeverFailsOver | 4,843 / 2,532 / 48 | pass |
+| first chunk, "graceraw" (no excuse; grace from a signed late stamp that passes the seq check), honest, depth 0 / 1 | NeverFailsOver | 4,843 / 2,532 / 48 | pass |
+| first chunk, plan / graceraw, liar, depth 0 / 1 | LiarAfterCalm | 2,752–22,113 states, depth 7–22 | pass |
+
+- **The wire shape holds every R29 case:** the liar, the honest relay, offers stopping, and the black hole.
+- **The floor's clock error is a stated limit.** If the AGE floor under-reads the publisher's clock by more than 2.5 s (R27: a clock stepped back and stayed, until the roll), every stamp is stale on arrival, and honest relays are failed over. Up to 2.5 s, each fresh stamp still excuses the tick it arrives on, and that resets the silence.
+- **The stamp before any chunk.** "plan" gives no excuse and no grace without a floor, which brings back the kill witness at depth 0.
+  - A direct child admitted into a 2.25 s queue is Suspected at 1.5 s, before its first chunk (7 states).
+  - "graceraw" passes, and the liar's gain stays bounded: one grace of at most down_silence, before any chunk.
+
 **R29b, the advertised latency.** The as-built relay keeps only its LATEST stale drop (`alm.rs:1722-1726`, `stale_seen.insert` overwrites), not the largest drop of the last 2.5 s. So "advertised ≥ every recent drop's age" can fail: a 2.0 s drop followed by a 0.9 s drop advertises 0.9 s. Each recorded drop is already past 800 ms, so the excuse (> 800 ms) still holds (AdvStillLate). Result: see the R29b rows in the R24–R28 table below.
 
 ### R24–R28

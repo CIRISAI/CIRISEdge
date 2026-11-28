@@ -40,7 +40,8 @@ def S(x):
 # ------------------------------------------------------------------- R29
 OAL = dict(OfferEvery=4, Life=10, StaleB=4, BMax=12, Depth=1, Suspect=6,
            DownSilence=20, Cap=40, GraceSigned=B(False), PubLate=B(True),
-           LoseOne=B(True))
+           LoseOne=B(True), FloorAtStart=B(True), FirstRule=S("plan"), ClockErr=0,
+           BInit=0, DrainOnly=B(False))
 
 
 def oal(kind, rule, **kw):
@@ -83,6 +84,31 @@ for rule, gs in (("current", False), ("signed_pubage", True), ("signed", True)):
 add("R29-honest-signed_pubage-gs-bmax8", "OfferAsLife",
     oal("honest", "signed_pubage", GraceSigned=B(True), BMax=8),
     invs=["TypeOK", "NeverFailsOver"])
+
+# R29 against the CC-accepted wire shape (Rule "wire"), every kind.
+for kind, invs, props in (
+        ("liar", ["TypeOK", "LiarWithinDown", "LiarAfterCalm"], []),
+        ("honest", ["TypeOK", "NeverFailsOver", "NotChargedAtOnce"], []),
+        ("gone", ["TypeOK", "OffersStopBound", "NotChargedAtOnce"], []),
+        ("blackhole", ["TypeOK", "BlackHoleBound", "NotChargedAtOnce"], [])):
+    add(f"R29w-{kind}", "OfferAsLife", oal(kind, "wire"), invs=invs, props=props)
+add("R29w-liar-ontime", "OfferAsLife", oal("liar", "wire", PubLate=B(False)),
+    invs=["TypeOK", "LiarHeldTotal"], props=["LiarFailsOver"])
+# the stamp before any chunk: a new subscription into a backlog, no floor yet
+for depth in (0, 1):
+    for fr in ("plan", "graceraw"):
+        c = oal("honest", "wire", FloorAtStart=B(False), FirstRule=S(fr), BInit=9,
+                Depth=depth, DrainOnly=B(True))
+        add(f"R29w-first-honest-d{depth}-{fr}", "OfferAsLife", c,
+            invs=["TypeOK", "NeverFailsOver"])
+        c = oal("liar", "wire", FloorAtStart=B(False), FirstRule=S(fr), BInit=9,
+                Depth=depth)
+        add(f"R29w-first-liar-d{depth}-{fr}", "OfferAsLife", c,
+            invs=["TypeOK", "LiarAfterCalm"])
+# a floor that under-reads the publisher's clock (R27: stepped back, stays)
+for ce in (6, 8, 10, 11):
+    add(f"R29w-honest-clockerr{ce}", "OfferAsLife", oal("honest", "wire", ClockErr=ce),
+        invs=["TypeOK", "NeverFailsOver"])
 
 # Rows R24-R28 register themselves from rows_453.py (kept apart so row 6 runs
 # on its own first).

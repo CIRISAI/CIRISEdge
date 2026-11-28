@@ -47,7 +47,16 @@ CONSTANTS
     Depth,         \* the relay's offered depth (1 = child of the publisher)
     Suspect,       \* 6   (suspect_silence_ms 1.5 s)
     DownSilence,   \* 20  (down_silence_ms 5 s)
-    Cap            \* age cap
+    Cap,           \* age cap
+    \* ---- Rule = "wire": the CC-accepted STAMP frame (C3 kind 0x08)
+    FloorAtStart,  \* the child already has an AGE floor for (stream, epoch)
+    FirstRule,     \* before any floor: "plan" (no excuse, no grace) |
+                   \* "graceraw" (no excuse; grace from a signed late stamp)
+    ClockErr,      \* ticks the floor under-reads the publisher's clock by
+                   \* (a clock stepped back and stayed, R27): stamps read older
+    BInit,         \* the publisher's backlog when the child subscribes
+    DrainOnly      \* the backlog only drains, a tick a tick while stale
+                   \* (the admitted-into-a-queue case, the kill witness)
 
 VARIABLES
     phase,      \* tick mod OfferEvery; offers and stamps move at phase 0
@@ -68,10 +77,16 @@ VARIABLES
                 \* (or since the subscription)
     attached,   \* R is still C's primary
     failRx,     \* at failover: rxAge, exAge (Cap+1 = no failover yet)
-    failEx
+    failEx,
+    sealAge,    \* ticks since the child's newest chunk was SEALED (Cap = none):
+                \* its arrival less the uplink wait it had
+    resume      \* DrainOnly runs: ticks until the first chunk after the publisher
+                \* resumes reaches the child (StaleB = stopped): it waits the
+                \* queue it joins
 
 vars == <<phase, b, relStAge, relStB, gone, goneAge, lostLast, offAge, offLate,
-          offStAge, offStB, rxAge, everRx, exAge, calmAge, attached, failRx, failEx>>
+          offStAge, offStB, rxAge, everRx, exAge, calmAge, attached, failRx, failEx,
+          sealAge, resume>>
 
 Min(x, y) == IF x < y THEN x ELSE y
 Inc(x) == Min(x + 1, Cap)
@@ -86,16 +101,23 @@ TypeOK ==
     /\ offAge \in Ages /\ offLate \in BOOLEAN /\ offStAge \in Ages /\ offStB \in 0..BMax
     /\ rxAge \in Ages /\ everRx \in BOOLEAN /\ exAge \in Ages /\ calmAge \in Ages
     /\ attached \in BOOLEAN /\ failRx \in 0..(Cap + 1) /\ failEx \in 0..(Cap + 1)
+    /\ sealAge \in Ages /\ resume \in 0..StaleB
 
 \* The child has just subscribed to R (R is admitted, its first offer seen,
 \* nothing delivered yet); the publisher is on time.
+Wire == Rule = "wire"
 Init ==
-    /\ phase = 0 /\ b = 0
-    /\ relStAge = 0 /\ relStB = 0
+    /\ phase = 0 /\ b \in 0..BInit
+    \* the latest stamp the relay holds: under "wire" one exists only if the
+    \* publisher was late (it sends none otherwise)
+    /\ relStAge = (IF Wire /\ b < StaleB THEN Cap ELSE b)
+    /\ relStB = b
     /\ gone = FALSE /\ goneAge = 0 /\ lostLast = FALSE
-    /\ offAge = 0 /\ offLate = (Kind = "liar") /\ offStAge = 0 /\ offStB = 0
+    /\ offAge = 0 /\ offLate = (Kind = "liar")
+    /\ offStAge = relStAge /\ offStB = relStB
     /\ rxAge = 0 /\ everRx = FALSE /\ exAge = Cap /\ calmAge = 0
-    /\ attached = TRUE /\ failRx = Cap + 1 /\ failEx = Cap + 1
+    /\ attached = TRUE /\ failRx = Cap + 1 /\ failEx = Cap + 1 /\ sealAge = Cap
+    /\ resume = IF DrainOnly /\ b >= StaleB THEN StaleB ELSE 0
 
 \* The relay's offer content. An honest relay's advertised upstream latency
 \* is >= its parent's + RTT/2 (selector.rs:429) and >= its recent stale drops
@@ -111,6 +133,15 @@ StampOK(sa, sb) ==
     /\ CASE Rule = "signed_pubage" -> sa <= Life
          [] Rule = "signed"        -> sa <= Life + sb
          [] OTHER                  -> TRUE
+\* "wire": the stamp verifies (any relayed one does: a relay forwards only
+\* what it verified, byte for byte), declares > 800 ms, is no older than
+\* the child's newest chunk (last_sealed_chunk_seq >= its highest seq), and
+\* is fresh NET of its backlog on the clock the AGE floor cancels.
+\* last_sealed_chunk_seq >= the child's highest seq: the stamp left the
+\* publisher no earlier than the newest chunk the child holds was sealed.
+SeqOK(sa, sl, ev) == ~ev \/ sa <= sl
+WireFresh(sa, sb) == sa < Cap /\ sb >= StaleB /\ (sa + ClockErr) <= Life + sb
+WireValid(sa, sb, sl, ev, fl) == fl /\ WireFresh(sa, sb) /\ SeqOK(sa, sl, ev)
 Excused(oa, ol, sa, sb) ==
     /\ oa <= Life                      \* the offer is fresh (forwarding: always)
     /\ IF Rule = "current" THEN ol ELSE StampOK(sa, sb)
@@ -127,7 +158,10 @@ Grace(ol, sb, ev) ==
 
 Tick ==
     /\ attached
-    /\ \E nb \in {x \in 0..BMax : x + 1 >= b /\ x <= b + 1 /\ (PubLate \/ x < StaleB)},
+    /\ \E nb \in {x \in 0..BMax : x + 1 >= b /\ x <= b + 1 /\ (PubLate \/ x < StaleB)
+                                 \* draining: with no media handed it (STALE), the
+                                 \* queue's wait falls at least a tick a tick
+                                 /\ (DrainOnly => (x <= b /\ (b >= StaleB => x < b)))},
           ng \in IF Kind = "gone" /\ ~gone THEN BOOLEAN ELSE {gone},
           lose \in IF LoseOne /\ ~lostLast /\ phase = 0 THEN BOOLEAN ELSE {FALSE} :
         LET at0     == phase = 0
@@ -135,23 +169,37 @@ Tick ==
             \* nb ticks in the publisher's uplink FIFO, so it is nb old). The
             \* liar keeps the freshest LATE stamp it ever saw and replays it.
             agedA   == Inc(relStAge)
-            keepNew == at0 /\ (Kind /= "liar" \/ nb >= StaleB)
+            keepNew == at0 /\ (IF Wire THEN nb >= StaleB    \* sent only while late
+                                ELSE (Kind /= "liar" \/ nb >= StaleB))
             rA      == IF keepNew THEN nb ELSE agedA
             rB      == IF keepNew THEN nb ELSE relStB
             \* media: a publisher past the budget sends none (STALE); an
             \* honest relay forwards what is fresh; liar and black hole none.
-            chunk   == /\ Kind \in {"honest", "gone"} /\ ~ng /\ nb < StaleB
+            rs      == IF ~DrainOnly THEN 0
+                       ELSE IF nb >= StaleB THEN StaleB
+                       ELSE IF resume = StaleB THEN nb       \* just resumed
+                       ELSE IF resume > 0 THEN resume - 1 ELSE 0
+            chunk   == /\ Kind \in {"honest", "gone"} /\ ~ng /\ nb < StaleB /\ rs = 0
             offered == at0 /\ ~ng /\ ~lose
             oA      == IF offered THEN 0 ELSE Inc(offAge)
             oL      == IF offered THEN Claim(rB) ELSE offLate
             sA      == IF offered THEN rA ELSE Inc(offStAge)
             sB      == IF offered THEN rB ELSE offStB
-            ex      == Excused(oA, oL, sA, sB)
             rx      == IF chunk THEN 0 ELSE Inc(rxAge)
+            \* (kept at Cap outside "wire", so the earlier rules' state spaces stand)
+            sl      == IF ~Wire THEN Cap ELSE IF chunk THEN nb ELSE Inc(sealAge)
             ev      == everRx \/ chunk
+            fl      == FloorAtStart \/ ev          \* an AGE floor exists
+            ex      == IF Wire THEN oA <= Life /\ WireValid(sA, sB, sl, ev, fl)
+                       ELSE Excused(oA, oL, sA, sB)
             exA     == IF ex THEN 0 ELSE Inc(exAge)
             since   == Min(rx, exA)
-            g       == Grace(oL, sB, ev)
+            g       == IF ~Wire THEN Grace(oL, sB, ev)
+                       ELSE IF ev THEN 0
+                       ELSE IF WireValid(sA, sB, sl, ev, fl) THEN Min(sB, DownSilence)
+                       ELSE IF ~fl /\ FirstRule = "graceraw" /\ sA < Cap /\ sB >= StaleB
+                            THEN Min(sB, DownSilence)
+                       ELSE 0
             fail    == ~ex /\ since >= g /\ (since - g) >= SuspTicks
         IN /\ phase' = (phase + 1) % OfferEvery
            /\ b' = nb
@@ -165,6 +213,8 @@ Tick ==
            /\ attached' = ~fail
            /\ failRx' = IF fail THEN rx ELSE failRx
            /\ failEx' = IF fail THEN exA ELSE failEx
+           /\ sealAge' = sl
+           /\ resume' = rs
 
 Spec == Init /\ [][Tick]_vars /\ WF_vars(Tick)
 
