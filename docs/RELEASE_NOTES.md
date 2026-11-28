@@ -1,8 +1,8 @@
 # CIRISEdge Release Notes
 
-# Unreleased — 45.3 (in progress): a capped uplink sends what will arrive in time
+# v45.3.0 — calls through a capped uplink stay live and come back
 
-Not yet released. Detail in CHANGELOG.md.
+Detail in CHANGELOG.md. Builds on leviculum v0.34.0+ciris.5; persist and Verify unchanged.
 
 - **A node reads its own uplink's backlog** and keeps one sending budget for everything it
   sends: call control first and never held, then audio, then video, then everything else. Room
@@ -13,8 +13,34 @@ Not yet released. Detail in CHANGELOG.md.
 - **A relay judges what it forwards chunk by chunk.** The marker that says where a video frame
   ends is sealed end to end, so a relay cannot see frame boundaries: when it must hold or drop
   media it does so per chunk, and one lost chunk can cost a listener the whole frame.
-- **Known:** on a capped uplink audio still misses its bar; the next step is scheduling inside
-  the Reticulum layer itself.
+- **Video recovers at once after a stall:** edge tells the app (`keyframe_wanted`) when its own
+  video resumes after held frames, and the app's encoder sends a fresh picture.
+- **More NATs connect directly:** a node now learns what kind of NAT it is behind from two
+  observers on the canonical (its dial port and the next one), so the direct-path punch can aim.
+  The canonical must publish and allow that second UDP port.
+- **A relay is kept only on the publisher's own word.** When a publisher's uplink queues, its
+  relays have nothing fresh to pass on; a listener keeps such a relay only while the publisher's
+  signed word says its media is late (a signed backlog stamp, or a stale chunk the publisher
+  signed). A relay's own claim counts for nothing, so a relay that lies about its upstream and
+  sends nothing is dropped within the usual silence bound, and one that holds media back to make
+  it look stale is dropped within seconds. Listeners that moved to a relay come back to the
+  publisher once its uplink clears.
+- **Scheduling inside the Reticulum layer** (leviculum ciris.5): control and removals leave
+  before media, audio before video, stale media is dropped in the queue, and bulk keeps a share.
+- **Logs that say why:** `RUST_LOG=ciris_edge::alm_decision=debug,ciris_edge::stamp=debug`
+  shows every relay decision and every backlog stamp (key ids only).
+- **Known:** audio on a capped uplink is not yet re-measured with the scheduler; a publisher
+  clock that steps back and stays reads late until the room's key changes; a small bulk row
+  behind large transfers waits for them at the bulk share.
+
+- **One address rule for direct links:** a node proposes, answers and escalates a direct path
+  only with a known peer that shares a room with it or that it names as a contact, and never
+  while anonymous, and it re-reads the rule whenever that standing changes. **Behaviour change:**
+  `direct_link_accept = identified_only` now behaves as `room_peers`.
+- **Peer reach.** `Edge::peer_reach(node_key_id)` answers whether this node can reach a peer
+  now, and how: `Live`, `Dialable`, `Unreachable` (exactly the #971 undialable check) or
+  `Unknown`, with the link's last inbound age, the path and its hops, the transit pair, and
+  whether the link is direct. Exposed through PyO3 and UniFFI.
 
 # v45.2.1 — a call follows its room, and every build lane compiles
 
