@@ -3926,7 +3926,20 @@ impl ReticulumTransport {
             // CIRISEdge#805 item 8 — always explicit, so the node never runs on
             // a leviculum default (or a stray config file's keys) edge did not
             // choose.
-            .direct_link(config.direct_links.leviculum_settings())
+            .direct_link({
+                // 45.3 — a serve node of the genesis bundle that serves a
+                // facilitator answers on its second port too: its probers
+                // derive the second observer from its dial hint.
+                let mut d = config.direct_links.clone();
+                if d.serve_facilitator.is_some()
+                    && crate::edge::baked_canonical_ip_dials()
+                        .iter()
+                        .any(|(k, _)| *k == config.local_key_id)
+                {
+                    d.serve_second_port = true;
+                }
+                d.leviculum_settings()
+            })
             .resource_window_policy(RESOURCE_WINDOW_POLICY);
         tracing::info!(
             proposes = config.direct_links.proposes(),
@@ -3934,6 +3947,8 @@ impl ReticulumTransport {
             // Whether, never where: no address in a log line.
             facilitator_named = config.direct_links.facilitator.is_some(),
             serves_facilitator = config.direct_links.serve_facilitator.is_some(),
+            // 45.3 — the second NAT observer by role, never an address.
+            second_observer = config.direct_links.second_observer_role(),
             accept = ?config.direct_links.accept,
             "reticulum direct links (CIRISEdge#805 item 8, leviculum#70)"
         );

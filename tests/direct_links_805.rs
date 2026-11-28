@@ -96,13 +96,68 @@ fn free_udp_port() -> u16 {
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_test_writer()
+        .with_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "warn,ciris_edge=info".into()),
-        )
-        .with_test_writer()
+        );
+    let _ = tracing_subscriber::registry()
+        .with(fmt)
+        .with(ProbeMappings)
         .try_init();
+}
+
+/// 45.3 — every leviculum facilitator-probe diagnostic's `mapping` word,
+/// in order (target `direct_link_diag`, `event = "probe"`): the NAT class
+/// the probing node arrived at. No address is ever in it.
+static PROBE_MAPPINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+struct ProbeMappings;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeMappings {
+    fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Fields {
+            event: Option<String>,
+            mapping: Option<String>,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                match f.name() {
+                    "event" => self.event = Some(v.to_owned()),
+                    "mapping" => self.mapping = Some(v.to_owned()),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.record_str(f, format!("{v:?}").trim_matches('"'));
+            }
+        }
+        if e.metadata().target() != "direct_link_diag" {
+            return;
+        }
+        let mut f = Fields {
+            event: None,
+            mapping: None,
+        };
+        e.record(&mut f);
+        if let (Some("probe"), Some(m)) = (f.event.as_deref(), f.mapping) {
+            PROBE_MAPPINGS.lock().expect("probe mappings").push(m);
+        }
+    }
+}
+
+/// How many probe diagnostics so far reported `mapping`.
+fn probes_reporting(mapping: &str) -> usize {
+    PROBE_MAPPINGS
+        .lock()
+        .expect("probe mappings")
+        .iter()
+        .filter(|m| *m == mapping)
+        .count()
 }
 
 /// A production-shaped identity (as `av_spine_live_node_805`): a hybrid
@@ -265,6 +320,10 @@ async fn try_transport_node(tcp_port: u16, facilitator_port: u16) -> Result<Reti
     // `DirectLinkSettings` is #[non_exhaustive]: from its default.
     let mut facilitator = leviculum_std::direct_link::DirectLinkSettings::default();
     facilitator.facilitator_port = Some(facilitator_port);
+    // 45.3 — T is the canonical's shape: it answers probes on the next UDP
+    // port too (the second NAT observer its probers derive). Nothing probes
+    // it unless a side names `facilitator2`.
+    facilitator.facilitator_second_port = true;
     let mut node = ReticulumNodeBuilder::new()
         .enable_transport(true)
         .add_interface_config(leviculum_std::config::InterfaceConfig {
@@ -519,6 +578,11 @@ async fn trio_shaped(
     let facilitator = format!("127.0.0.1:{f_port}");
     let fill = |c: DirectLinksConfig| DirectLinksConfig {
         facilitator: c.facilitator.map(|_| facilitator.clone()),
+        // A placeholder second observer is T's derived one.
+        facilitator2: c.facilitator2.map(|_| {
+            ciris_edge::transport::direct_path::second_observer_of(&facilitator)
+                .expect("T's next port")
+        }),
         ..c
     };
 
@@ -2449,6 +2513,65 @@ async fn a_send_to_a_room_peer_brings_the_link_direct_915() {
         .send(&p.b.key.key_id, b"room-915-3")
         .await
         .expect("a send with T gone rides the punched interface");
+}
+
+/// **45.3 — the second NAT observer** (Eric, 11-22: the canonical's UDP port
+/// dial + 1). `T` answers probes on its facilitator port and the next one.
+/// A room peer pair that probes both classifies its NAT: the probe
+/// diagnostic reports a mapping class (`endpoint_independent` on loopback:
+/// both observers saw the same mapping; leviculum never counts loopback as
+/// a host candidate), and the link comes up direct. A pair with no second
+/// observer still comes up direct as today and classifies nothing: no
+/// probe of it reports a class. Only a side naming `facilitator2` can
+/// produce a classified line, so the counts are this test's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_observer_on_the_facilitators_next_port_classifies_the_nat() {
+    let second = |c: DirectLinksConfig| DirectLinksConfig {
+        // Replaced by T's derived second observer in `trio`.
+        facilitator2: Some(String::new()),
+        ..c
+    };
+    let mut p = trio("nat2", second(proposer()), second(answerer())).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    let classified_before = probes_reporting("endpoint_independent");
+    p.a.transport
+        .send(&p.b.key.key_id, b"nat2-1")
+        .await
+        .expect("A's send to B ships through T");
+    next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the link comes up direct");
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            probes_reporting("endpoint_independent") > classified_before
+        })
+        .await,
+        "a probe with two observers reports a mapping class: {:?}",
+        PROBE_MAPPINGS.lock().expect("probe mappings")
+    );
+    drop(p);
+    // Settled: no classified line of the first pair still on its way.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let classified = probes_reporting("endpoint_independent");
+    let mut q = trio("nat1", proposer(), answerer()).await;
+    let (_spine, _b_addr) = open_call(&q).await;
+    q.a.transport
+        .send(&q.b.key.key_id, b"nat1-1")
+        .await
+        .expect("A's send to B ships through T");
+    next_event(&mut q.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("with no second observer the link still comes up direct");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        probes_reporting("endpoint_independent"),
+        classified,
+        "a node with no second observer classifies nothing"
+    );
 }
 
 /// **#915** — a send to a peer this node shares NO room with proposes

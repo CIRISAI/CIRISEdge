@@ -8428,6 +8428,10 @@ pub fn init_edge_runtime(
             })?,
         facilitator: direct_link_facilitator,
         serve_facilitator: direct_link_serve_port,
+        // 45.3 — derived from the bundle's facilitator at resolve; a serve
+        // seat's second port is the transport's to turn on.
+        facilitator2: None,
+        serve_second_port: false,
         accept: crate::transport::direct_path::DirectAccept::parse(direct_link_accept).ok_or_else(
             || {
                 PyValueError::new_err(format!(

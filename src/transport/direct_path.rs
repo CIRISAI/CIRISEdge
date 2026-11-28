@@ -296,6 +296,21 @@ pub struct DirectLinksConfig {
     /// Run a facilitator on this UDP port (a reachable node: a canonical or
     /// any transport node with a public address).
     pub serve_facilitator: Option<u16>,
+    /// 45.3 (Eric, 11-22) — the second observer this node probes from the
+    /// same session socket to classify its NAT, as `host:port`. Resolved
+    /// with the facilitator: when that is the genesis bundle's serve node,
+    /// the same host at its dial's port + 1 ([`second_observer_of`]: derived
+    /// from the bundle's signed dial hint, so not a new observer under CC
+    /// 5.4.6), UDP and probes only. A host-named facilitator has none unless
+    /// the host names one here. `None`: no NAT is classified (port
+    /// prediction never runs; the birthday spray starts only on the node's
+    /// own evidence).
+    pub facilitator2: Option<String>,
+    /// 45.3 — with [`Self::serve_facilitator`], also answer probes on the
+    /// next UDP port: a serve seat is both observers its probers derive.
+    /// The transport turns it on when this node is a serve node of the
+    /// genesis bundle; a host may set it.
+    pub serve_second_port: bool,
     /// Who this node accepts an upgrade from ([`DirectAccept`]; default room
     /// peers only).
     pub accept: DirectAccept,
@@ -366,6 +381,9 @@ impl DirectLinksConfig {
             }
             Proposing::On => {
                 self.facilitator = Self::bundle_facilitator();
+                if self.facilitator2.is_none() {
+                    self.facilitator2 = self.facilitator.as_deref().and_then(second_observer_of);
+                }
                 // No address in a log line: the source is the whole story.
                 if self.facilitator.is_some() {
                     tracing::info!(
@@ -436,6 +454,9 @@ impl DirectLinksConfig {
         }
         if baked_dials_allowed {
             if let Some(f) = bundle() {
+                if self.facilitator2.is_none() {
+                    self.facilitator2 = second_observer_of(&f);
+                }
                 self.facilitator = Some(f);
                 return (self, FacilitatorSource::Bundle);
             }
@@ -470,8 +491,36 @@ impl DirectLinksConfig {
         settings.facilitator.clone_from(&self.facilitator);
         settings.protocol = ProbeProtocol::Rnsp;
         settings.facilitator_port = self.serve_facilitator;
+        // 45.3 — the second observer, and on a serve seat the second port.
+        settings.facilitator2.clone_from(&self.facilitator2);
+        settings.protocol2 = ProbeProtocol::Rnsp;
+        settings.facilitator_second_port =
+            self.serve_facilitator.is_some() && self.serve_second_port;
         settings
     }
+
+    /// 45.3 — which second observer this node probes, as a log word (never
+    /// an address): `derived` (the bundle facilitator's dial port + 1),
+    /// `named` (by the host), `none`.
+    #[must_use]
+    pub fn second_observer_role(&self) -> &'static str {
+        match (&self.facilitator, &self.facilitator2) {
+            (_, None) => "none",
+            (Some(f), Some(s)) if second_observer_of(f).as_deref() == Some(s.as_str()) => "derived",
+            (_, Some(_)) => "named",
+        }
+    }
+}
+
+/// 45.3 (Eric, 11-22) — the second NAT observer a facilitator dial implies:
+/// the same host at the next UDP port, where a serve seat answers probes
+/// (`DirectLinkSettings::facilitator_second_port`). `None` when the dial is
+/// not `ip:port` or its port is the last one.
+#[must_use]
+pub fn second_observer_of(dial: &str) -> Option<String> {
+    let addr: std::net::SocketAddr = dial.parse().ok()?;
+    let port = addr.port().checked_add(1)?;
+    Some(std::net::SocketAddr::new(addr.ip(), port).to_string())
 }
 
 /// When a peer may be proposed to again, after a proposal ended without a
@@ -2044,5 +2093,67 @@ mod tests {
         );
         let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(false, || None, &[]);
         assert_eq!((src, d.facilitator), (FacilitatorSource::None, None));
+    }
+
+    /// 45.3 (Eric, 11-22) — the second NAT observer: the bundle's facilitator
+    /// at its dial port + 1, derived at resolve, UDP probes only; none for a
+    /// host-named facilitator or a bootstrap peer unless the host names one;
+    /// a host's own second is kept. On a serve seat (serving a facilitator,
+    /// the flag on) leviculum answers on the second port; never without a
+    /// facilitator served.
+    #[test]
+    fn the_second_observer_is_the_bundle_facilitators_next_port() {
+        assert_eq!(
+            second_observer_of("127.0.0.1:4242").as_deref(),
+            Some("127.0.0.1:4243")
+        );
+        assert_eq!(second_observer_of("127.0.0.1:65535"), None, "no next port");
+        assert_eq!(second_observer_of("not-an-addr"), None);
+        let boot: Vec<std::net::SocketAddr> = vec!["127.0.0.1:5000".parse().unwrap()];
+        let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(
+            true,
+            || Some("127.0.0.1:4242".to_owned()),
+            &boot,
+        );
+        assert_eq!(src, FacilitatorSource::Bundle);
+        assert_eq!(d.facilitator2.as_deref(), Some("127.0.0.1:4243"));
+        assert_eq!(d.second_observer_role(), "derived");
+        let s = d.leviculum_settings();
+        assert_eq!(s.facilitator2.as_deref(), Some("127.0.0.1:4243"));
+        assert_eq!(s.protocol2, ProbeProtocol::Rnsp);
+        assert!(!s.facilitator_second_port, "a prober serves no second port");
+        // Host-named: no derived second.
+        let (d, src) = DirectLinksConfig {
+            facilitator: Some("127.0.0.1:7000".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_facilitator_from(true, || Some("127.0.0.1:4242".to_owned()), &boot);
+        assert_eq!(src, FacilitatorSource::Host);
+        assert_eq!(d.facilitator2, None);
+        assert_eq!(d.second_observer_role(), "none");
+        // Bootstrap: none either.
+        let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(false, || None, &boot);
+        assert_eq!(src, FacilitatorSource::Bootstrap);
+        assert_eq!(d.facilitator2, None);
+        // A host's own second is kept, bundle or not.
+        let (d, _) = DirectLinksConfig {
+            facilitator2: Some("127.0.0.1:9000".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_facilitator_from(true, || Some("127.0.0.1:4242".to_owned()), &boot);
+        assert_eq!(d.facilitator2.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(d.second_observer_role(), "named");
+        // The serve seat's second port: only with a facilitator served.
+        let seat = DirectLinksConfig {
+            serve_facilitator: Some(4242),
+            serve_second_port: true,
+            ..DirectLinksConfig::default()
+        };
+        assert!(seat.leviculum_settings().facilitator_second_port);
+        let not_serving = DirectLinksConfig {
+            serve_second_port: true,
+            ..DirectLinksConfig::default()
+        };
+        assert!(!not_serving.leviculum_settings().facilitator_second_port);
     }
 }

@@ -13,6 +13,11 @@ Not yet released. Detail in CHANGELOG.md.
 - **A relay judges what it forwards chunk by chunk.** The marker that says where a video frame
   ends is sealed end to end, so a relay cannot see frame boundaries: when it must hold or drop
   media it does so per chunk, and one lost chunk can cost a listener the whole frame.
+- **Video recovers at once after a stall:** edge tells the app (`keyframe_wanted`) when its own
+  video resumes after held frames, and the app's encoder sends a fresh picture.
+- **More NATs connect directly:** a node now learns what kind of NAT it is behind from two
+  observers on the canonical (its dial port and the next one), so the direct-path punch can aim.
+  The canonical must publish and allow that second UDP port.
 - **Known:** on a capped uplink audio still misses its bar; the next step is scheduling inside
   the Reticulum layer itself.
 

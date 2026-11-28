@@ -25,9 +25,23 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
 - Offer-as-life: a parent still offering a stream whose upstream it reports past the budget is
   not failed over for silence; offers carry the publisher's backlog and a relay's real lateness.
 
+- `CallEvent::KeyframeWanted { stream }` (Python `keyframe_wanted`): once per resume of this
+  node's own video after edge held or dropped frames of it; the host's encoder sends a keyframe
+  next. On the W4 bench the picture's freeze after a resume fell from p50 3.8 s to 72 ms.
+- The second NAT observer: when the facilitator is the genesis bundle's serve node, a node also
+  probes the same host at its dial port + 1 (UDP, probes only), so it classifies its NAT, port
+  prediction runs, and the birthday spray no longer waits on the node's own evidence. A
+  host-named facilitator has none unless the host names one (`DirectLinksConfig::facilitator2`).
+  A serve node of the bundle that serves a facilitator answers on that second port.
+
 ### Fixed
 - A backlogged uplink counts as stalled (the verdict lapsed under a standing queue), and a
   stalled node sends no relay offers.
+
+### Operations (outside edge)
+- The bridge must publish the canonical's dial port + 1 over UDP, and canonical-1 needs the
+  firewall allow for it; until then the second observer does not answer and nodes fall back as
+  in 45.2.
 
 ### Known
 - A relay drops and admits per CHUNK, not per frame: the fragment marker that says where a frame

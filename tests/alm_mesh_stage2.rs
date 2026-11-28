@@ -7794,12 +7794,14 @@ async fn six_members_hear_a_publisher_whose_whole_uplink_is_capped() {
     let failed = uplink_cap_bars(&r);
     assert!(
         failed.is_empty(),
-        "W6 at {} kbit/s: {failed:?}; heard {:.3?} (within 800 ms {:.3?}, longest gap {:?}); first 10 s {:.3?}",
+        "W6 at {} kbit/s: {failed:?}; heard {:.3?} (within 800 ms {:.3?}, longest gap {:?}); first 10 s {:.3?}; decodable-video gap {:?}; KeyframeWanted (seen, honoured) {:?}",
         r.cap_kbit,
         r.capped,
         r.capped_fresh,
         r.longest_gap,
-        r.first_10s
+        r.first_10s,
+        r.video_decoded_gap,
+        r.keyframe_events
     );
 }
 
@@ -7814,12 +7816,14 @@ async fn four_members_hear_a_publisher_whose_whole_uplink_is_capped() {
     let failed = uplink_cap_bars(&r);
     assert!(
         failed.is_empty(),
-        "W4 at {} kbit/s: {failed:?}; heard {:.3?} (within 800 ms {:.3?}, longest gap {:?}); first 10 s {:.3?}",
+        "W4 at {} kbit/s: {failed:?}; heard {:.3?} (within 800 ms {:.3?}, longest gap {:?}); first 10 s {:.3?}; decodable-video gap {:?}; KeyframeWanted (seen, honoured) {:?}",
         r.cap_kbit,
         r.capped,
         r.capped_fresh,
         r.longest_gap,
-        r.first_10s
+        r.first_10s,
+        r.video_decoded_gap,
+        r.keyframe_events
     );
 }
 
