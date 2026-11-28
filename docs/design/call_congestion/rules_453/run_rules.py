@@ -161,6 +161,8 @@ def main():
             for inv in s["invs"]:
                 if inv == "TypeOK":
                     continue
+                if "--inv" in sys.argv and inv != sys.argv[sys.argv.index("--inv") + 1]:
+                    continue
                 run = f'{s["name"]}.{inv}'
                 r = tlc(outdir, run, cfg_text(s, inv="TypeOK " + inv), s["module"])
                 r["checked"] = inv

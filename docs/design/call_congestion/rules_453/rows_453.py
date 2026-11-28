@@ -68,3 +68,22 @@ def register(add, B, S):
     for keep in ("last", "max"):
         add(f"R29b-advert-{keep}", "RelayAdvert", dict(ra, Keep=S(keep)),
             invs=["TypeOK", "AdvOverParent", "AdvOverDrops", "AdvStillLate"])
+    # ---------------------------------------------------------------- R30
+    pt = dict(Period=5, Cap=12, Contacts=B(False), Anon=B(True), SilentTier=B(False),
+              DirectNotify=B(False))
+    pinv = ["TypeOK", "GatesEqual", "GatesEqualAlways", "DirectBound",
+            "NoEscalationWhileFalse", "NoProposalWhileAnonymous", "RetryStops",
+            "EscalationSettled", "ProposalSettled", "RetrySettled", "DirectSettled"]
+    for code in ("fixed", "asbuilt"):
+        for acc in ("room", "identified"):
+            add(f"R30-{code}-{acc}", "PunchTrust", dict(pt, Code=S(code), Accept=S(acc)),
+                invs=pinv)
+    add("R30-fixed-room-silent", "PunchTrust",
+        dict(pt, Code=S("fixed"), Accept=S("room"), SilentTier=B(True)), invs=pinv)
+    add("R30-fixed-room-contacts", "PunchTrust",
+        dict(pt, Code=S("fixed"), Accept=S("room"), Contacts=B(True), Anon=B(False)),
+        invs=pinv)
+    add("R30-fixed-room-roomonly", "PunchTrust",
+        dict(pt, Code=S("fixed"), Accept=S("room"), Anon=B(False)), invs=pinv)
+    add("R30-fixed-room-directnotify", "PunchTrust",
+        dict(pt, Code=S("fixed"), Accept=S("room"), DirectNotify=B(True)), invs=pinv)

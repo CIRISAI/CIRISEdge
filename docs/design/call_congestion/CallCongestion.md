@@ -257,7 +257,7 @@ The final run is in `results/` (`matrix.json`, `matrix.md`, `quality.md`). The t
 
 The 45.3 call-reliability rules as built on `work/45.3` (edge 6392b0a) are each checked by their own small spec in `rules_453/`, not folded into `CallCongestion.tla`. Each spec carries the code lines it models in its header.
 
-- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
+- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
 - **How to run.** `python3 docs/design/call_congestion/rules_453/run_rules.py OUTDIR --split [--only REGEX]`. `--split` runs each invariant alone, because with `-continue` a state that breaks two invariants is reported under the first only.
 - **The scheduler.** The same convention as `run_matrix.py`: `GRACE_SCHED_*` + `cargo_guard.sh` at priority low, nice 19, idle I/O class, `-Xmx2g`, 2 workers, declared peak 3 GB. Grace measured peaks of 0.78–1.7 GB.
 - **Tick.** One step is one watch tick (250 ms) unless a row says otherwise. Every timer is an age in ticks, capped, so most specs need no horizon.
@@ -403,6 +403,59 @@ There are three rules for the excuse:
 
 **R29b.** As built, the advertised latency can be below a stale drop of the last 2.5 s (3 steps: a 1.0 s drop, then a 0.9 s drop). It is still always > 800 ms while any drop is recent, so the excuse is unaffected. Keeping the window's max passes.
 
+
+### R30 PUNCH-TRUST (the edge policy layer)
+
+**Rule (3d0c95c, work/45.3-nat).** One address predicate is read on both sides: P(s) = s is not anonymous, and s sees standing for the peer (a shared room or a named contact) (`reticulum.rs:15932-15944`).
+- Every proposal reads it (`reticulum.rs:15860-15879`, which also sets the link's escalation to true).
+- Every answer reads it (`reticulum.rs:20751-20787`, where the escalation takes the answer).
+- IdentifiedOnly follows it (`direct_path.rs:490, 658`).
+- Each link's escalation is re-read from it by `reconcile_direct_standing` (`reticulum.rs:10907-10979`). That pass sets the gate, retires a link that no longer passes, and toggles leviculum's retry on a loss or a change of want.
+- The re-read runs on `notify_standing`, on the 5 s `DIRECT_STANDING_RECHECK` (`reticulum.rs:12154, 12714-12726`) and on the scope table's generation.
+
+Leviculum is abstract here: one gate per side, read when a punch is planned, plus the retry table (`direct_link.rs:503, 608-616, 684-705`) and `retire_direct_link` (`direct_link.rs:1519-1540`). The counterexample variant is as built at 6392b0a:
+- no reconcile;
+- leviculum's default gate rule (`direct_link.rs:580-596`);
+- IdentifiedOnly accepts any identified peer (`direct_path.rs:630`);
+- retry on for ever while proposing (`reticulum.rs:4269-4270`);
+- no retire.
+
+One Tick is 1 s. A proposes and B answers. The event loop serves a notify, and the 5 s slot, before the next second. The "settled" properties excuse only the race before it does: leviculum's tick runs in its own task, so that window exists whatever edge does.
+
+| Run | GatesEqual (same inputs) | GatesEqualAlways | DirectBound / DirectSettled | NoEscalationWhileFalse / Settled | NoProposalWhileAnonymous / ProposalSettled | RetryStops / RetrySettled | States / distinct / depth (full space) |
+|---|---|---|---|---|---|---|---|
+| fixed, room_peers | pass | FAIL (anonymity is one side's) | FAIL / **FAIL** | FAIL (race) / pass | FAIL (race) / pass | FAIL / **FAIL** | 102,778 / 24,038 / 35 |
+| fixed, identified_only | pass | FAIL | FAIL / **FAIL** | FAIL / pass | FAIL / pass | FAIL / **FAIL** | 102,778 / 24,038 / 35 |
+| fixed, room only (no anonymity, no contacts) | pass | pass | pass / pass | FAIL (race) / pass | pass / pass | FAIL / **FAIL** | 9,454 / 2,597 / 29 |
+| fixed, one-way contacts | pass | FAIL (inherent) | FAIL / **FAIL** | FAIL / pass | pass / pass | FAIL / **FAIL** | 298,479 / 51,061 / 44 |
+| fixed, tier switched silently | pass | FAIL | FAIL / **FAIL** | FAIL / **FAIL** | FAIL / **FAIL** | FAIL / **FAIL** | 179,761 / 34,764 / 36 |
+| fixed + direct-up is a standing event | pass | FAIL | FAIL / pass | FAIL / pass | FAIL / pass | FAIL / **FAIL** | 100,744 / 23,399 / 35 |
+| as built, room_peers | pass | pass | FAIL / FAIL | FAIL / FAIL | FAIL / FAIL | FAIL / FAIL | 9,632 / 2,443 / 22 |
+| as built, identified_only | pass | **FAIL in the initial state** | FAIL / FAIL | FAIL / FAIL | FAIL / FAIL | FAIL / FAIL | 10,542 / 2,575 / 22 |
+
+The counterexamples are 3 to 16 states long. **Bold** marks a structural failure, one the settled property does not excuse.
+
+- **Bug 1 (3d0c95c): the retry re-arms after a standing loss.** RetrySettled fails in 8 states. The sequence:
+  1. A proposes, so leviculum's retry entry exists.
+  2. B leaves the room.
+  3. The reconcile sets the gate to false, toggles the retry off and on, and does not retire, because the link is not direct.
+  4. The session still in flight fails. `set_direct_link_retry(false)` only cleared due times and kept the entries, so `schedule_direct_link_retry` re-arms the entry.
+  5. A tick later leviculum re-proposes to a peer without standing.
+
+  Later reconciles never toggle again, because `lost` needs the gate to have been true. This fails under every fixed configuration.
+- **Bug 2 (3d0c95c): going direct is not a standing event** (`reticulum.rs:12856-12868`: LinkEstablished, LinkIdentified, LinkClosed). A session in flight when A's predicate fails, with B still accepting (A turned anonymous, or a one-way contact withdrawn), reaches Direct and lives until the next 5 s tick: DirectSettled fails.
+  - Counting direct-up as a standing event (the `directnotify` variant) passes.
+  - With room-only standing it cannot happen: B refuses too.
+- **Bug 3 (3d0c95c): a silent tier switch.** The Anonymous Tier follows relay availability (`onion/runtime.rs:185-187`) without `onion_refresh`, so nothing notifies. For up to 5 s:
+  - leviculum's background retry can propose while A is anonymous;
+  - A's gate stays true, so a punch in flight can escalate.
+
+  Edge's own proposals and answers read the tier fresh, so they are clean.
+- **The gates.** With equal inputs, both gates are equal after a re-read (GatesEqual passes everywhere). They differ by design when the inputs differ: anonymity is one side's, and a contact can be one-way. GatesEqualAlways holds only with room-only standing.
+- **As built (6392b0a)** fails both earlier findings:
+  - the gates differ from the initial state under identified_only (A: the default rule's true; B: false);
+  - nothing retires the link (DirectBound);
+  - retry is on for ever (RetryStops, NoProposalWhileAnonymous).
 
 ## Decision table
 
