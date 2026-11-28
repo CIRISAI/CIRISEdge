@@ -110,3 +110,18 @@ def register(add, B, S):
                  SelfStamp=B(True))
         add(f"R31-{rule}-selfstamp", "RoomStamps", c,
             invs=["ChildKeepsRelay", "RelayKeepsP", "StandbyKept"])
+    # ---------------------------------------------------------------- R32
+    rb = dict(CapEnd=32, H=80, USet="{0, 1, 2, 3}", LSet="{0, 1, 2, 3, 4}", GSet="{1, 2}",
+              DSet="{1}", RunSet="{1}", PauseSet="{0}", LapseRestarts=B(True))
+    for thr in (2, 1):
+        add(f"R32-honest-thr{thr}", "RoomBuilt", dict(rb, Liar=B(False), ThrS=thr),
+            invs=["MovedKeepsRelay", "RelayKeepsP"])
+    add("R32-liar-only", "RoomBuilt", dict(rb, Liar=B(True), ThrS=2, CapEnd=0, H=120,
+        DSet="{1, 2}", RunSet="{4, 8, 12, 16, 20, 24, 40}", PauseSet="{0, 4, 8, 10, 11, 12, 14}",
+        USet="{0}", LSet="{0}", GSet="{1}"), invs=["LiarOnlyBound", "LiarGone"])
+    add("R32-liar-only-nolapse", "RoomBuilt", dict(rb, Liar=B(True), ThrS=2, CapEnd=0, H=120,
+        DSet="{1, 2}", RunSet="{4, 8, 12, 16, 20, 24, 40}", PauseSet="{0, 4, 8, 10, 11, 12, 14}",
+        USet="{0}", LSet="{0}", GSet="{1}", LapseRestarts=B(False)),
+        invs=["LiarOnlyBound", "LiarGone"])
+    add("R32-honest-thr2-nolapse", "RoomBuilt", dict(rb, Liar=B(False), ThrS=2,
+        LapseRestarts=B(False)), invs=["MovedKeepsRelay", "RelayKeepsP"])

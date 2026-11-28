@@ -257,7 +257,7 @@ The final run is in `results/` (`matrix.json`, `matrix.md`, `quality.md`). The t
 
 The 45.3 call-reliability rules as built on `work/45.3` (edge 6392b0a) are each checked by their own small spec in `rules_453/`, not folded into `CallCongestion.tla`. Each spec carries the code lines it models in its header.
 
-- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
+- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `RoomBuilt.tla` (R32), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
 - **How to run.** `python3 docs/design/call_congestion/rules_453/run_rules.py OUTDIR --split [--only REGEX]`. `--split` runs each invariant alone, because with `-continue` a state that breaks two invariants is reported under the first only.
 - **The scheduler.** The same convention as `run_matrix.py`: `GRACE_SCHED_*` + `cargo_guard.sh` at priority low, nice 19, idle I/O class, `-Xmx2g`, 2 workers, declared peak 3 GB. Grace measured peaks of 0.78–1.7 GB.
 - **Tick.** One step is one watch tick (250 ms) unless a row says otherwise. Every timer is an age in ticks, capped, so most specs need no horizon.
@@ -541,6 +541,42 @@ The phases, the lag, the under-read, the growth and the non-child interval are a
     - it declares max(estimate, 801 ms).
 
     Only the publisher can sign these, so they only bear on the publisher's own stream.
+
+### R32 ROOM-BUILT (the post-R31 rules as built)
+
+`rules_453/RoomBuilt.tla`, against CIRISEdge-453's working tree. TLC ran at grace priority critical. Four rules are modelled:
+1. A stale chunk is a witness, never an arrival.
+2. Stale witnesses alone excuse for at most `STALE_ONLY_EXCUSE_MS` = 5 s per run (`selector.rs:552-562`, 1426-1433). A delivered chunk ends the run (`selector.rs:585`).
+3. One witness is forwarded per period, each new by seq and no more than 6 s late (`alm.rs:56`, 1825-1855).
+4. P stamps from 300 ms. The first-chunk grace is the declared backlog; the excuse needs more than 800 ms.
+
+In the model, C starts as P's direct child and moves to R when it first reads P 300 ms late (RM2). The manufactured-stale liar holds fresh chunks and forwards them as witnesses on a pattern of its choosing.
+
+| Run | Checks | States / depth | Result |
+|---|---|---|---|
+| honest move, stamp from 300 ms / 250 ms | MovedKeepsRelay, RelayKeepsP | 51,840 / ~78 | pass |
+| honest move, stamps disabled (sanity) | MovedKeepsRelay | 21,329 | **FAIL**: the 5 s run lapses, so rule (2) bites |
+| honest move, stale-only cap 2.0 s / 2.5 s and up | MovedKeepsRelay | 51,840 | **FAIL** / pass: the first stamp over 800 ms lands within 2.0–2.5 s of the first witness |
+| honest move, growth 4× / 5× / 7× overload | MovedKeepsRelay | – | pass / pass / **FAIL** |
+| liar the only candidate, as built | LiarOnlyBound, LiarGone | 64,288 / 186,596 | **FAIL**, **FAIL**: held for ever |
+| liar the only candidate, the run restarted only by a delivered chunk | LiarOnlyBound, LiarGone | 189,728 / 121 | pass |
+| honest move with that fix | MovedKeepsRelay, RelayKeepsP | 51,840 / 81 | pass |
+
+- **The lapse restarts the run.** The liar sends one witness every 3.5 s (depth 1):
+  - each witness excuses it for 2.5 s;
+  - the 0.75 s gap after that is under the 2.25 s Suspected bound;
+  - the next witness arrives after the 2.5 s lapse, so `on_stale_witness` starts a new 5 s run.
+
+  The cap never bites. **Fix:** set `stale_since` only when it is None, so that only a delivered chunk restarts the budget.
+- **(a) A liar with a better candidate.** ReceiverMoves moves only the publisher's direct children. A relay child leaves through the voluntary score switch, and that switch is gated:
+  - the standby must have at least 2 windows (`selector.rs:1757`);
+  - the better score must hold for 3 windows (`selector.rs:1766`);
+  - the dwell is `min_dwell_ms` << k, that is 10, 20, 40 or 80 s, with k the switches in the last 120 s (`selector.rs:1785`).
+
+  So the lateness rule cannot leave the liar inside the 5 s excuse. With the fix, the silence rule leaves it at no more than 5 s plus the Suspected bound after its first witness. This is derived from the code; the voluntary switch is not modelled.
+- **(d) The come-back.** RM3 unsubscribes P once R admits C, so the come-back is a fresh standby pick of P plus the `to_direct` switch, gated by the dwell (at least 10 s after the move). That path is the same as at 1545ee18.
+  - The two gaps that broke it in the field are closed in R31/R32: the relay failed over, and the standby starved by the stall cadence.
+  - The compact models do not model P's headroom returning after the lift. That piece is CallCongestion.tla's.
 
 ## Decision table
 
