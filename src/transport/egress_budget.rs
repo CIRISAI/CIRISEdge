@@ -92,8 +92,11 @@ pub const FLOOR_DEPTH_MS: f64 = 100.0;
 pub const LIFT_AFTER_MS: u64 = 3_000;
 /// ...while edge used less than this share of it.
 pub const LIFT_USE_RATIO: f64 = 0.6;
-/// 45.3.1 — clear this long (ms), the budget lifts whatever its use.
-pub const LIFT_FORCE_MS: u64 = 6_000;
+/// 45.3.1 — clear this long (ms), the budget lifts whatever its use: after a
+/// cap lifts the server matrix needs the stream back within about a second
+/// (lifted ≥ 0.99 over a minute); if the uplink still cannot carry it, the
+/// backlog returns within a round trip and the next cut starts from use.
+pub const LIFT_FORCE_MS: u64 = 1_000;
 
 /// What a send is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

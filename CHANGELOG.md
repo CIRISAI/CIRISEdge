@@ -14,7 +14,7 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   (1.1 Mbit/s to 177 kbit/s), went congested and shed its children: listeners parentless for tens
   of seconds while capped, and half their video lost after the lift. A call with one leg still
   reads it.
-- A budget clear for 6 s lifts outright (`LIFT_FORCE_MS`). It lifted only when under-used, which a
+- A budget clear for 1 s lifts outright (`LIFT_FORCE_MS`). It lifted only when under-used, which a
   budget binding its own media never is, so after a cap it climbed from ~100 kbit/s in small
   steps.
 
