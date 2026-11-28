@@ -257,7 +257,7 @@ The final run is in `results/` (`matrix.json`, `matrix.md`, `quality.md`). The t
 
 The 45.3 call-reliability rules as built on `work/45.3` (edge 6392b0a) are each checked by their own small spec in `rules_453/`, not folded into `CallCongestion.tla`. Each spec carries the code lines it models in its header.
 
-- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `RoomBuilt.tla` (R32), `BulkPacers.tla` (R33), `ShedMovers.tla` (R34), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
+- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `RoomBuilt.tla` (R32), `BulkPacers.tla` (R33), `ShedMovers.tla` (R34), `budget_sim.py` (R35), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
 - **How to run.** `python3 docs/design/call_congestion/rules_453/run_rules.py OUTDIR --split [--only REGEX]`. `--split` runs each invariant alone, because with `-continue` a state that breaks two invariants is reported under the first only.
 - **The scheduler.** The same convention as `run_matrix.py`: `GRACE_SCHED_*` + `cargo_guard.sh` at priority low, nice 19, idle I/O class, `-Xmx2g`, 2 workers, declared peak 3 GB. Grace measured peaks of 0.78–1.7 GB.
 - **Tick.** One step is one watch tick (250 ms) unless a row says otherwise. Every timer is an age in ticks, capped, so most specs need no horizon.
@@ -639,6 +639,37 @@ TLC: ChatWithin 30 s **FAILS** for FIFO (800 states, depth 122) and passes for c
 - **"A shed relay tells its children at once" does not help.** The relay cannot know before the shed arrives, which takes about the same time.
 - **"P sheds the movers first" does not help.** With room for one, P still sheds past the movers onto their target.
 - **The fix:** P sheds the RM4-spared child last, computed the way the movers compute it.
+
+### R35 BUDGET (the egress budget for the best capped and lifted behaviour)
+
+`rules_453/budget_sim.py`, a discrete-time simulation, because TLC does not optimise. Run `python3 budget_sim.py [--sweep] [--signal=delivered|slope]`.
+
+The setup:
+- 10 ms steps. P's uplink is one FIFO at the cap.
+- P sends one copy (30 Hz × 12 kbit on the wire, 360 kbit/s) to its kept child, plus N × 3.2 kbit/s of control that is never held.
+- The budget is egress_budget.rs as at 851909ee, observed once per watch tick.
+- The reading is the kept leg's oldest unproved control message, less the RTT floor. A message is proved one return path after delivery.
+- STALE applies above 800 ms.
+- The phases are 45 s baseline, 90 s capped, 60 s lifted.
+
+"Heard" is the fraction of one copy's frames delivered within 800 ms. Its ceiling is about cap / 360 kbit/s.
+
+| Controller | 300 kbit, N=4 | 300 kbit, N=6 | 250 kbit, N=4 | 250 kbit, N=6 | Lift to demand |
+|---|---|---|---|---|---|
+| as built (45.3.1) | 0.71 (goodput 0.86) | 0.69 (0.83) | 0.56 (0.81), 1.0 % late | 0.51 (0.73), 4.3 % late | ≤ 1.5 s |
+| as built, no 1 s forced lift | 0.68 | 0.66 | 0.53, 2.2 % late | 0.53, 1.0 % late | 0.75–5.5 s |
+| **best (needs a delivered-rate signal)** | **0.80 (0.96)** | **0.78 (0.94)** | **0.66 (0.95)** | **0.63 (0.91)** | ≤ 0.75 s, 0 late |
+| best with no new signal (C estimated from the backlog slope) | 0.79 (0.95) | 0.77 (0.93) | 0.63 (0.91), 0.1 % late | 0.62 (0.89) | 0–1.5 s |
+
+- **As built, the 1 s forced lift fires during a held cap.** The budget sits below C, the queue drains, the reading stays clear, and the budget lifts. The queue then rebuilds, and the next cut starts from 0.7 × what was used. The budget is lifted for 33–49 % of the capped time, and its rate is 187 ± 47 kbit/s at a 300 kbit/s cap: the field's sawtooth.
+- **The best set:**
+  - Cut when the backlog reads over 200 ms, to 0.9 × the rate delivered over the last second.
+  - No forced lift.
+  - After 250 ms clear, multiply the rate by 1.5 each observe, capped at 1.1 × the delivered rate.
+
+  The rate holds at the cap (307 ± 29 kbit/s at 300). Goodput is 0.91–0.96 of the cap, nothing is delivered late after the cap's first 5 s, and the rate reaches demand within 0.75 s of the lift.
+- **The dependency.** Media datagrams prove nothing, so this needs the kept child's received rate, or C estimated from the backlog's slope. The slope estimate, cutting by 0.85 at 200 ms with a ×1.1 probe after 250 ms, gets within 0.02–0.04 of the best set but lifts in up to 1.5 s.
+- **Onset lateness (0.1–1.9 %)** is the cap's first seconds, before any budget is in force. STALE and AGE handle it at the receivers.
 
 ## Decision table
 
