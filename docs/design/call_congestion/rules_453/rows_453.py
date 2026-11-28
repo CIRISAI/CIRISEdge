@@ -145,3 +145,6 @@ def register(add, B, S):
     add("R32abc-liar-only", "RoomBuilt", dict(asb, Liar=B(True), ThrS=2, CapEnd=0, H=120,
         DSet="{1, 2}", RunSet="{4, 8, 12, 16, 20, 24, 40}", PauseSet="{0, 4, 8, 10, 11, 12, 14}",
         USet="{0}", LSet="{0}", GSet="{1}"), invs=["LiarOnlyBound", "LiarGone"])
+    # ---------------------------------------------------------------- R34
+    for rule in ("asbuilt", "moversFirst", "keepSpared"):
+        add(f"R34-{rule}", "ShedMovers", dict(Rule=S(rule)), invs=["MoversParented"])

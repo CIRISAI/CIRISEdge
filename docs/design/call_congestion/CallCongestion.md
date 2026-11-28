@@ -257,7 +257,7 @@ The final run is in `results/` (`matrix.json`, `matrix.md`, `quality.md`). The t
 
 The 45.3 call-reliability rules as built on `work/45.3` (edge 6392b0a) are each checked by their own small spec in `rules_453/`, not folded into `CallCongestion.tla`. Each spec carries the code lines it models in its header.
 
-- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `RoomBuilt.tla` (R32), `BulkPacers.tla` (R33), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
+- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `RoomBuilt.tla` (R32), `BulkPacers.tla` (R33), `ShedMovers.tla` (R34), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
 - **How to run.** `python3 docs/design/call_congestion/rules_453/run_rules.py OUTDIR --split [--only REGEX]`. `--split` runs each invariant alone, because with `-continue` a state that breaks two invariants is reported under the first only.
 - **The scheduler.** The same convention as `run_matrix.py`: `GRACE_SCHED_*` + `cargo_guard.sh` at priority low, nice 19, idle I/O class, `-Xmx2g`, 2 workers, declared peak 3 GB. Grace measured peaks of 0.78–1.7 GB.
 - **Tick.** One step is one watch tick (250 ms) unless a row says otherwise. Every timer is an age in ticks, capped, so most specs need no horizon.
@@ -616,6 +616,29 @@ TLC: ChatWithin 30 s **FAILS** for FIFO (800 states, depth 122) and passes for c
 - **The field's "a chat row behind bulk never arrives within 30 s" is this bound, not a liveness bug.** Ten 8 KB envelopes at R = 256 kbit/s give 32.75 s.
 - **The fix is ordering, not rate.** Serve a chat row (or any small interactive bulk row) ahead of queued transfers: its own FIFO, served first by the same floor. It then arrives in under 1 s at every rate.
 - **Starvation condition at leviculum.** Within the low tiers, announces outrank bulk. With announce load at or above leviculum's floor credit (about 0.11 R + 4 kbit/s), bulk starves. At 12 kbit/s of announces, R = 128 kbit/s gives 190 s (ChatArrives fails at its 100 s horizon).
+
+### R34 SHED-MOVERS (P sheds the relay its movers chose)
+
+`rules_453/ShedMovers.tla`, against CIRISEdge-453 release/45.3.0 (b5097907). The model is the shed decision alone, with every rank permutation, every relay-visibility pattern, applied or pending mover unsubscribes, and room for 1 or 2 primaries.
+
+| Rule | MoversParented | States / depth |
+|---|---|---|
+| as built | **FAIL** | 1,730 / 2 |
+| P sheds the movers first | **FAIL** | 1,730 / 2 |
+| P sheds the spared child last (the lowest-ranked primary whose fresh offer shows P at depth 1, the RM4 set) | pass | 3,456 / 2 |
+
+- **The counterexample.** Both sides rank by the same hash (`rxmove.rs:193`, `alm.rs:590`), but over different sets:
+  - The movers rank only the children visible in offers (`alm.rs:2773`), and move to the lowest of those (`alm.rs:2783-2792`).
+  - P ranks its whole ledger (`admission.rs:1325-1372`).
+  - A lower-ranked primary that offers no relay (not relay-capable, not forwarding, or its own uplink stalled, `alm.rs:2372`) is invisible to the movers but kept by P.
+  - With room for one, P sheds the movers and then their chosen relay, and keeps the invisible member.
+- **The gap.** This is reasoned from the code; the model has no timing.
+  - P sends the shed relay nothing from the shed on. The relay learns only when the shed crosses P's capped FIFO (+2.3 s in the field).
+  - It has no stale chunks to witness. P's stamps still reach it each second, but during an over-commit shed they declare under 800 ms: grace, but no excuse.
+  - Its children fail it over about 2.25 s after their last chunk.
+- **"A shed relay tells its children at once" does not help.** The relay cannot know before the shed arrives, which takes about the same time.
+- **"P sheds the movers first" does not help.** With room for one, P still sheds past the movers onto their target.
+- **The fix:** P sheds the RM4-spared child last, computed the way the movers compute it.
 
 ## Decision table
 
