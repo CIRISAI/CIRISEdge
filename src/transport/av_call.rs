@@ -4300,7 +4300,7 @@ enum LegBacklog {
 
 /// 45.3 row DR — how recent a leg's last send must be for "nothing
 /// unproved" to say this uplink is clear (the drain's own clear span).
-const UPLINK_CLEAR_EVIDENCE_MS: u64 = 1_000;
+const UPLINK_CLEAR_EVIDENCE_MS: u64 = 4_000;
 
 /// 45.3 rows DR / STALE / budget — **the uplink backlog reading** from the
 /// legs' send clocks: the LEAST over every leg with traffic, a leg that
@@ -4316,13 +4316,24 @@ const UPLINK_CLEAR_EVIDENCE_MS: u64 = 1_000;
 /// whose OWN uplink is slow cannot hold the drain on once this uplink is
 /// clear (R25's lasso). `None` with no leg with traffic.
 fn backlog_reading(legs: &[LegBacklog]) -> Option<u64> {
-    legs.iter()
+    let read: Vec<u64> = legs
+        .iter()
         .filter_map(|l| match *l {
             LegBacklog::Outstanding { age_ms, floor_ms } => Some(age_ms.saturating_sub(floor_ms)),
             LegBacklog::Clear => Some(0),
             LegBacklog::Idle => None,
         })
-        .min()
+        .collect();
+    // 45.3.1 — with two legs or more the reading needs two with evidence:
+    // a leg's age is a round trip, so ONE leg reading high is as likely its
+    // peer's slow uplink (its proofs queue there) as this one's. Read alone,
+    // every member of a call with a capped publisher read the publisher's
+    // queue as its own, throttled itself and shed its children (the server
+    // av_mesh matrix on 45.3.0). A call with one leg reads it (R25).
+    if legs.len() >= 2 && read.len() < 2 {
+        return None;
+    }
+    read.into_iter().min()
 }
 
 /// 45.3 row DR — read the uplink backlog this tick from every out leg's

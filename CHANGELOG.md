@@ -2,6 +2,22 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.3.1
+
+**A member no longer reads a capped peer's queue as its own.** Found by the server's av_mesh matrix
+(Docker, netem cap on one publisher).
+
+### Fixed
+- With two legs or more the uplink backlog reading needs two with evidence (a leg counts as
+  clear if it sent within 4 s, was 1 s). On 45.3.0 a relay whose other legs carried only the
+  once-a-second offers read the capped publisher's slow proofs as its own backlog, cut its budget
+  (1.1 Mbit/s to 177 kbit/s), went congested and shed its children: listeners parentless for tens
+  of seconds while capped, and half their video lost after the lift. A call with one leg still
+  reads it.
+- A budget clear for 6 s lifts outright (`LIFT_FORCE_MS`). It lifted only when under-used, which a
+  budget binding its own media never is, so after a cap it climbed from ~100 kbit/s in small
+  steps.
+
 ## 45.3.0
 
 **Calls through a capped uplink stay live and come back.** One additive C3 frame (`STAMP`,

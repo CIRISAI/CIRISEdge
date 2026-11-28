@@ -1199,17 +1199,21 @@ const fn out(age_ms: u64, floor_ms: u64) -> LegBacklog {
     LegBacklog::Outstanding { age_ms, floor_ms }
 }
 
-/// **R25, one leg** — a two-person call's one leg, or one busy leg beside
-/// idle ones, is read: before, the reading needed two outstanding legs and
-/// a two-person call never drained, held STALE media or engaged the budget.
-/// One slow leg beside a leg this uplink serves in time is still that peer
-/// (OnePeerIsNotOwn): the clear leg reads 0.
+/// **R25, one leg** — a two-person call's one leg is read: before, the
+/// reading needed two outstanding legs and a two-person call never drained,
+/// held STALE media or engaged the budget. With two legs or more it needs
+/// two with evidence (45.3.1): one slow leg beside idle ones is as likely
+/// its PEER's queue (the server av_mesh matrix on 45.3.0: every member of a
+/// capped publisher's call read the publisher's queue as its own and shed
+/// its children). One slow leg beside a leg this uplink serves in time is
+/// that peer (OnePeerIsNotOwn): the clear leg reads 0.
 #[test]
 fn one_leg_with_traffic_is_read_and_one_slow_peer_is_not_this_uplink() {
     assert_eq!(backlog_reading(&[out(900, 50)]), Some(850));
     assert_eq!(
         backlog_reading(&[out(900, 50), LegBacklog::Idle, LegBacklog::Idle]),
-        Some(850)
+        None,
+        "one slow leg among idle ones is not this uplink's evidence"
     );
     assert_eq!(backlog_reading(&[out(900, 50), LegBacklog::Clear]), Some(0));
     assert_eq!(backlog_reading(&[out(900, 50), out(700, 0)]), Some(700));

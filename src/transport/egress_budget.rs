@@ -92,6 +92,8 @@ pub const FLOOR_DEPTH_MS: f64 = 100.0;
 pub const LIFT_AFTER_MS: u64 = 3_000;
 /// ...while edge used less than this share of it.
 pub const LIFT_USE_RATIO: f64 = 0.6;
+/// 45.3.1 — clear this long (ms), the budget lifts whatever its use.
+pub const LIFT_FORCE_MS: u64 = 6_000;
 
 /// What a send is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,11 +218,17 @@ impl BudgetCore {
         } else if b < AI_BELOW_MS {
             let since = *self.clear_since.get_or_insert(now_ms);
             if let Some(r) = self.rate {
-                if now_ms.saturating_sub(since) >= LIFT_AFTER_MS
-                    && self
-                        .used_against
-                        .is_some_and(|was| self.used_bps < was * LIFT_USE_RATIO)
-                {
+                let clear_for = now_ms.saturating_sub(since);
+                let unused = self
+                    .used_against
+                    .is_some_and(|was| self.used_bps < was * LIFT_USE_RATIO);
+                // 45.3.1 — a budget that binds its own media reads "used" for
+                // ever, so it lifted only through slow additive steps: after a
+                // cap lifted the server matrix held video at ~100 kbit/s for
+                // the whole minute. Clear for LIFT_FORCE_MS it lifts anyway;
+                // if the uplink still cannot carry it, the backlog says so and
+                // the next cut starts from what was used.
+                if (clear_for >= LIFT_AFTER_MS && unused) || clear_for >= LIFT_FORCE_MS {
                     self.rate = None;
                     self.tokens = 0.0;
                 } else if now_ms.saturating_sub(since) >= FAST_AFTER_MS {
@@ -431,7 +439,8 @@ mod tests {
     }
 
     /// While the backlog reads high the rate falls, once per MD_EVERY_MS,
-    /// never under the floor; clear, it climbs; lifted once clear and unused.
+    /// never under the floor; clear, it climbs; lifted once clear and unused,
+    /// or clear for LIFT_FORCE_MS whatever its use (45.3.1).
     #[test]
     fn the_rate_falls_while_backlogged_climbs_when_clear_and_lifts_when_unused() {
         let mut b = BudgetCore::default();
@@ -464,14 +473,15 @@ mod tests {
             t += 250;
             assert!(t < 40_000);
         }
-        assert!(b.rate_bps().is_some(), "climbed, not lifted");
+        // 45.3.1 — clear and in use, it climbs to 600 kbit/s or, clear for
+        // LIFT_FORCE_MS, lifts outright; either way within LIFT_FORCE_MS.
         assert!(
-            t - 20_250 <= 10_000,
-            "found 600 kbit/s again in {} ms",
+            t - 20_250 <= LIFT_FORCE_MS + 250,
+            "back to 600 kbit/s or lifted in {} ms",
             t - 20_250
         );
-        // Clear and unused for LIFT_AFTER_MS: lifted.
-        for t in (t..t + 5_000).step_by(250) {
+        // Clear for long enough: lifted whatever its use.
+        for t in (t..t + LIFT_FORCE_MS + 500).step_by(250) {
             b.observe(t, None);
         }
         assert_eq!(b.rate_bps(), None);

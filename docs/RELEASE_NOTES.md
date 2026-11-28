@@ -1,5 +1,12 @@
 # CIRISEdge Release Notes
 
+# v45.3.1 — a member no longer reads a capped peer's queue as its own
+
+A relay in a call with a capped publisher read the publisher's slow confirmations as its own
+uplink backlog, throttled itself and dropped its listeners; after the cap lifted, budgets climbed
+back slowly. Now a node needs two of its links to agree before it calls its own uplink backed up,
+and a budget that has been clear for six seconds lifts. Found by the server's call matrix.
+
 # v45.3.0 — calls through a capped uplink stay live and come back
 
 Detail in CHANGELOG.md. Builds on leviculum v0.34.0+ciris.5; persist and Verify unchanged.
