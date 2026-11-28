@@ -136,7 +136,7 @@ def tlc(outdir, run, cfgtext, module, extra=()):
     open(cfg, "w").write(cfgtext)
     env = dict(os.environ, GRACE_SCHED_OWNER="edge",
                GRACE_SCHED_KIND="edge: call rules TLC", GRACE_SCHED_PEAK_GB="3",
-               GRACE_SCHED_PRIORITY="low")
+               GRACE_SCHED_PRIORITY=os.environ.get("RULES_PRIORITY", "low"))
     cmd = ["timeout", str(CAP_SECS), "nice", "-n", "19", "ionice", "-c3", GUARD,
            "java", "-Xmx2g", "-Xss64m", "-XX:+UseParallelGC", "-cp", JAR, "tlc2.TLC",
            "-workers", "2", *extra, "-config", cfg,
@@ -185,7 +185,7 @@ def main():
             continue
         if s["invs"] and "--split" in sys.argv:
             for inv in s["invs"]:
-                if inv == "TypeOK":
+                if inv == "TypeOK" and len(s["invs"]) > 1:
                     continue
                 if "--inv" in sys.argv and inv != sys.argv[sys.argv.index("--inv") + 1]:
                     continue

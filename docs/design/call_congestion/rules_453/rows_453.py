@@ -96,3 +96,17 @@ def register(add, B, S):
                     ("allfixes", dict(FailNotify=B(True), TierNotify=B(True),
                                       DirectNotify=B(True)))):
         add(f"R30-fix-{tag}", "PunchTrust", dict(allin, **fx), invs=pinv)
+    # ---------------------------------------------------------------- R31
+    for rule in ("e356", "c1545", "stale", "both"):
+        for liar in (False, True):
+            c = dict(Rule=S(rule), USet="{0, 1, 2, 3}", LSet="{0, 1, 2, 3, 4}", GSet="{1, 2}",
+                     CapEnd=32, H=90, Liar=B(liar),
+                     ChunkCap=24, NCSet="{4, 8, 14}", SelfStamp=B(False))
+            add(f"R31-{rule}{'-liar' if liar else ''}", "RoomStamps", c,
+                invs=["ChildKeepsRelay", "RelayKeepsP", "LiarBounded", "StandbyKept"])
+    for rule in ("e356", "both"):
+        c = dict(Rule=S(rule), USet="{0, 1, 2, 3}", LSet="{0, 1, 2, 3, 4}", GSet="{1, 2}",
+                 CapEnd=32, H=90, Liar=B(False), ChunkCap=24, NCSet="{4, 8, 14}",
+                 SelfStamp=B(True))
+        add(f"R31-{rule}-selfstamp", "RoomStamps", c,
+            invs=["ChildKeepsRelay", "RelayKeepsP", "StandbyKept"])

@@ -257,7 +257,7 @@ The final run is in `results/` (`matrix.json`, `matrix.md`, `quality.md`). The t
 
 The 45.3 call-reliability rules as built on `work/45.3` (edge 6392b0a) are each checked by their own small spec in `rules_453/`, not folded into `CallCongestion.tla`. Each spec carries the code lines it models in its header.
 
-- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
+- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
 - **How to run.** `python3 docs/design/call_congestion/rules_453/run_rules.py OUTDIR --split [--only REGEX]`. `--split` runs each invariant alone, because with `-continue` a state that breaks two invariants is reported under the first only.
 - **The scheduler.** The same convention as `run_matrix.py`: `GRACE_SCHED_*` + `cargo_guard.sh` at priority low, nice 19, idle I/O class, `-Xmx2g`, 2 workers, declared peak 3 GB. Grace measured peaks of 0.78–1.7 GB.
 - **Tick.** One step is one watch tick (250 ms) unless a row says otherwise. Every timer is an age in ticks, capped, so most specs need no horizon.
@@ -502,6 +502,45 @@ The counterexamples are 3 to 16 states long. **Bold** marks a structural failure
   - the gates differ from the initial state under identified_only (A: the default rule's true; B: false);
   - nothing retires the link (DirectBound);
   - retry is on for ever (RetryStops, NoProposalWhileAnonymous).
+
+### R31 ROOM-STAMPS (composed: the FIFO, its estimate, the stamp, the relay, two listeners)
+
+`rules_453/RoomStamps.tla`, against CIRISEdge-453 e356535f plus its working edits. One step is 250 ms, and the horizon is 22.5 s. TLC ran at grace priority critical.
+
+What it models:
+- P's real FIFO, growing 2× or 3× while P hands it media under the cap, and draining a tick a tick while STALE holds media back.
+- P's estimate (`own_queue_word_ms`), which lags 0–1 s while the queue grows and reads 0–0.75 s low while it drains. STALE and the stamp read the estimate.
+- Stamps sent with P's offers while max(estimate over 3.3 s) > 800 ms, riding the same FIFO.
+- The kept relay, which drops chunks older than 800 ms end to end and re-forwards its latest verified stamp with each 1 s offer.
+- The relay's child C (depth 1): Suspected at 2.25 s, then failed over.
+- Listener L2, which moved to the relay and keeps P as its standby. Under the stall P sends standbys nothing, and offers to non-children only every 2–3.5 s. A standby is dropped at Down (5 s).
+
+The phases, the lag, the under-read, the growth and the non-child interval are all nondeterministic.
+
+| Rule | ChildKeepsRelay | RelayKeepsP | LiarBounded | StandbyKept | States (depth 91) |
+|---|---|---|---|---|---|
+| e356 (as built: signed stamps only) | **FAIL** (8,333 states, depth 14) | pass | pass | **FAIL** at a 2–3.5 s offer interval; pass at 1 s | 58,240 / 174,720 |
+| c1545 (the relay's own advertised latency) | pass | pass | **FAIL** (the liar held for ever) | **FAIL** | 58,240 |
+| stale chunk as evidence | pass | pass | pass | **FAIL** (no relay in that path) | 58,240 |
+| stale chunk + stamp | pass | pass | pass | **FAIL** | 58,240 |
+| stamp + SelfStamp (P stamps while it withholds; stamps to its standbys every 1 s) | – | – | – | pass | 174,720 |
+| stale chunk + stamp + SelfStamp | pass | pass | – | pass | 174,720 |
+
+- **The onset gap (e356).** The stamp rides the very FIFO whose stale media it excuses, and it starts only once the lagging estimate passes 800 ms.
+  - At 3× overload with a 750 ms lag, the last fresh chunk reaches C at 0.75 s.
+  - P's first stamp leaves at 2.0 s, declaring 2.25 s, and waits 1.75 s in the FIFO, reaching the relay at 3.75 s.
+  - C goes Suspected at 3.0 s and fails the relay over at 3.25 s, before any stamp exists at the relay. That is the field's "listener parentless at about cap + 3.5 s".
+- **"A stale chunk is a stamp."** The relay forwards one publisher-signed chunk it dropped as stale each offer period. Its seq must be above the child's highest, so each chunk is usable once, and its age must be no more than ChunkCap.
+  - This closes the onset gap locally and at once, as 1545ee18's relay-side excuse did.
+  - It keeps the liar bounded: the liar can forward only real stale chunks, each once, and each expires after ChunkCap.
+- **The standby (the come-back).** Under the stall P sends its standbys no media at all, and offers (with its stamp) to non-children only every 2–3.5 s, through the FIFO. The moved listener's standby P is silent for 5 s and dropped at Down before a stamp lands. Once P is dropped, its failure count and backoff stand in the way of the come-back.
+  - At a 1 s offer cadence the stamp keeps the standby alive.
+  - SelfStamp passes:
+    - P stamps while it withholds anything (stalled or STALE);
+    - its stamps go to its standbys every offer period;
+    - it declares max(estimate, 801 ms).
+
+    Only the publisher can sign these, so they only bear on the publisher's own stream.
 
 ## Decision table
 
