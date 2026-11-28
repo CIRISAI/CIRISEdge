@@ -118,6 +118,14 @@ pub fn link_count() -> Result<u32, crate::EdgeBindingsError> {
     }
 }
 
+/// v45.3 — whether this node can reach `node_key_id` now, and how
+/// (`Edge::peer_reach`). `Unknown` with no Reticulum transport.
+pub fn peer_reach(node_key_id: String) -> Result<crate::EdgePeerReach, crate::EdgeBindingsError> {
+    let edge = current_edge_arc()?;
+    let reach = block_on(async move { Ok(edge.peer_reach(&node_key_id).await) })?;
+    Ok(crate::EdgePeerReach::from(&reach))
+}
+
 // ─── #32 Links — mutations ──────────────────────────────────────────
 
 pub fn link_open(

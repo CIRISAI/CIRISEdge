@@ -2543,6 +2543,21 @@ impl Edge {
         self.reticulum_transport.as_ref()?.local_nat_report()
     }
 
+    /// v45.3 — **whether this node can reach `node_key_id` now, and how**:
+    /// `Live` (a live identity link), `Dialable` (a path or a transit pair),
+    /// `Unreachable` (exactly the CIRISEdge#971 undialable: none of the
+    /// three) or `Unknown` (the pair read failed, or no Reticulum transport),
+    /// with the live link's last inbound age, the path's hops, and whether
+    /// the link rides a punched interface (`direct`).
+    pub async fn peer_reach(&self, node_key_id: &str) -> crate::transport::peer_reach::PeerReach {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            return t.peer_reach(node_key_id).await;
+        }
+        let _ = node_key_id;
+        crate::transport::peer_reach::PeerReach::unknown()
+    }
+
     /// E8 — what this node knows of `peer`'s shaping (§3.1): whether it
     /// shapes, as far as it has answered an offer here.
     #[cfg(feature = "_reticulum-module")]
@@ -8652,8 +8667,9 @@ async fn dispatch_inbound(
                     } else {
                         crate::transport::egress_budget::SendClass::First
                     };
-                    crate::transport::egress_budget::sending_as(
+                    crate::transport::egress_budget::sending_as_family(
                         class,
+                        crate::observability::AV_FIRST_BYTES_EPHEMERAL_REPLY,
                         ship_typed_ephemeral_reply(
                             reply_transport,
                             signer,

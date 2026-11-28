@@ -36,6 +36,37 @@ pub const FIRST_PREFIXES: &[&str] = &[
     "moderation:",
     "revocation:",
     "recants",
+    // 45.3 (constitution ruling): a withdrawal, a duty and an ownership row
+    // change who holds or answers for what; they do not wait behind media.
+    "withdraws",
+    "duty:",
+    "ownership:",
+];
+
+/// 45.3 — the `av_plane` label FIRST bytes are counted under, per
+/// [`FIRST_PREFIXES`] entry (the prefix only, never a row's content).
+pub const FIRST_FAMILIES: &[(&str, &str)] = &[
+    ("accord:", crate::observability::AV_FIRST_BYTES_ACCORD),
+    (
+        "membership:",
+        crate::observability::AV_FIRST_BYTES_MEMBERSHIP,
+    ),
+    ("key_grant:", crate::observability::AV_FIRST_BYTES_KEY_GRANT),
+    ("key:", crate::observability::AV_FIRST_BYTES_KEY),
+    ("session:", crate::observability::AV_FIRST_BYTES_SESSION),
+    ("consent:", crate::observability::AV_FIRST_BYTES_CONSENT),
+    (
+        "moderation:",
+        crate::observability::AV_FIRST_BYTES_MODERATION,
+    ),
+    (
+        "revocation:",
+        crate::observability::AV_FIRST_BYTES_REVOCATION,
+    ),
+    ("recants", crate::observability::AV_FIRST_BYTES_RECANTS),
+    ("withdraws", crate::observability::AV_FIRST_BYTES_WITHDRAWS),
+    ("duty:", crate::observability::AV_FIRST_BYTES_DUTY),
+    ("ownership:", crate::observability::AV_FIRST_BYTES_OWNERSHIP),
 ];
 
 /// Dimension prefixes positively known to be BULK: conversation and its
@@ -43,7 +74,6 @@ pub const FIRST_PREFIXES: &[&str] = &[
 pub const BULK_PREFIXES: &[&str] = &[
     "chat:",
     "file:",
-    "withdraws",
     "supersedes",
     "scores:",
     "trust:",
@@ -52,9 +82,7 @@ pub const BULK_PREFIXES: &[&str] = &[
     "substrate_health:",
     "provenance:build_manifest:",
     "trace:",
-    "duty:",
     "objection:",
-    "ownership:",
 ];
 
 /// The class of one Attestation row's dimension.
@@ -125,6 +153,35 @@ pub fn class_of(msg: &ReplicationMessage) -> SendClass {
     }
 }
 
+/// 45.3 — the `av_plane` label a FIRST message's bytes are counted under:
+/// the family prefix of its first FIRST row (an Attestation Deliver), or
+/// `first_bytes:unknown_dimension` for a row edge cannot place, or
+/// `first_bytes:other_kind` for a non-Attestation kind. Prefix labels only.
+#[must_use]
+pub fn family_of(msg: &ReplicationMessage) -> &'static str {
+    match msg {
+        ReplicationMessage::Deliver(d) if d.kind == EnvelopeKind::Attestation => {
+            for e in &d.envelopes {
+                let dim = serde_json::from_slice::<RowDimension>(e)
+                    .ok()
+                    .and_then(|r| r.attestation_envelope)
+                    .and_then(|a| a.dimension);
+                let Some(dim) = dim else {
+                    return crate::observability::AV_FIRST_BYTES_UNKNOWN_DIMENSION;
+                };
+                if let Some((_, label)) = FIRST_FAMILIES.iter().find(|(p, _)| dim.starts_with(p)) {
+                    return label;
+                }
+                if !BULK_PREFIXES.iter().any(|p| dim.starts_with(p)) {
+                    return crate::observability::AV_FIRST_BYTES_UNKNOWN_DIMENSION;
+                }
+            }
+            crate::observability::AV_FIRST_BYTES_UNKNOWN_DIMENSION
+        }
+        _ => crate::observability::AV_FIRST_BYTES_OTHER_KIND,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +245,44 @@ mod tests {
         assert_eq!(class_of_kind(EnvelopeKind::Revocation), SendClass::First);
         assert_eq!(class_of_kind(EnvelopeKind::KeyGrant), SendClass::First);
         assert_eq!(class_of_kind(EnvelopeKind::LocationProof), SendClass::Bulk);
+    }
+
+    /// 45.3 (constitution ruling) — withdraws, duty and ownership rows ride
+    /// FIRST (they were BULK).
+    #[test]
+    fn withdraws_duty_and_ownership_ride_first() {
+        for dim in ["withdraws:v1", "duty:serve:v1", "ownership:claim:v1"] {
+            assert_eq!(class_of(&deliver(&[dim])), SendClass::First, "{dim}");
+            assert_eq!(class_of_dimension(dim), SendClass::First, "{dim}");
+        }
+        assert_eq!(class_of(&deliver(&["supersedes:v1"])), SendClass::Bulk);
+    }
+
+    /// FIRST bytes are labelled by family prefix only; every FIRST prefix
+    /// has a label, and every label is a registered `av_plane` key.
+    #[test]
+    fn first_bytes_are_labelled_by_family_prefix() {
+        assert_eq!(FIRST_FAMILIES.len(), FIRST_PREFIXES.len());
+        for p in FIRST_PREFIXES {
+            assert!(FIRST_FAMILIES.iter().any(|(q, _)| q == p), "{p} labelled");
+        }
+        for (_, l) in FIRST_FAMILIES {
+            assert!(crate::observability::AV_PLANE_LABELS.contains(l), "{l}");
+        }
+        assert_eq!(
+            family_of(&deliver(&["chat:message:v1", "membership:removal:v1"])),
+            crate::observability::AV_FIRST_BYTES_MEMBERSHIP
+        );
+        assert_eq!(
+            family_of(&deliver(&["zzz:new_family:v1"])),
+            crate::observability::AV_FIRST_BYTES_UNKNOWN_DIMENSION
+        );
+        assert_eq!(
+            family_of(&ReplicationMessage::Deliver(DeliverMessage {
+                kind: EnvelopeKind::Key,
+                envelopes: vec![],
+            })),
+            crate::observability::AV_FIRST_BYTES_OTHER_KIND
+        );
     }
 }

@@ -455,6 +455,12 @@ const CHANNEL_FRAME_SEND_BUDGET: Duration = Duration::from_secs(15);
 /// frames keep the Resource path with the Channel as the busy fallback.
 const CHANNEL_FIRST_MAX_FRAGMENTS: usize = 8;
 
+/// 45.3 (leviculum ciris.5) — the most Channel fragments a FIRST envelope
+/// rides on a dialled lane before it falls back to a Resource (which the
+/// scheduler takes as bulk): FIRST rows are small (a removal, a key, a halt),
+/// and riding the Channel keeps them ahead of media.
+const FIRST_CHANNEL_MAX_FRAGMENTS: usize = 32;
+
 /// CIRISEdge#716 — the largest payload ONE link-Channel send accepts on a link
 /// whose packet MDU is `link_mdu`: leviculum's `Channel::mdu`, i.e. the link MDU
 /// minus the 6-byte channel envelope header (`CHANNEL_ENVELOPE_HEADER_SIZE`,
@@ -881,7 +887,8 @@ async fn send_fragments_on_channel(
         };
         match tokio::time::timeout(
             CHANNEL_FRAGMENT_SEND_TIMEOUT,
-            node.link_handle(link_id).send(&sealed),
+            node.link_handle(link_id)
+                .send_as(&sealed, scheduler_class()),
         )
         .await
         {
@@ -912,6 +919,28 @@ async fn send_fragments_on_channel(
         stalled: None,
     }
 }
+/// 45.3 (leviculum ciris.5) — the scheduler class of a Channel send, from
+/// the edge send class in force ([`crate::transport::egress_budget::current_send_class`]):
+/// FIRST (unclassed included) is Control, never age-dropped, ahead of media;
+/// BULK is Bulk, inside the floor.
+fn scheduler_class() -> leviculum_std::EgressClass {
+    match crate::transport::egress_budget::current_send_class() {
+        crate::transport::egress_budget::SendClass::First => leviculum_std::EgressClass::Control,
+        crate::transport::egress_budget::SendClass::Bulk => leviculum_std::EgressClass::Bulk,
+    }
+}
+
+/// 45.3 (leviculum ciris.5) — the transport's egress scheduler is paced this
+/// much above the egress budget's rate. The budget is what edge admits; the
+/// scheduler keeps its class order and media head-drop and bounds the
+/// kernel's FIFO behind it, and must never bind first. At 1.10× it did: its
+/// own queue (control, proofs, link setup and frames edge does not charge)
+/// read as this uplink's backlog, the budget cut on it, and the call never
+/// came back after the cap lifted (the come-back mesh witness, the
+/// admission ceiling stuck at "congested"). At 2× all three capped
+/// witnesses pass.
+const EGRESS_PACE_OVER_BUDGET: f64 = 2.0;
+
 /// A send refused because the frame is over the Channel's limit (leviculum
 /// 0.34 says so; it used to read `LinkFailed`). The link is alive: its MDU
 /// shrank under a frame cut earlier, on a move to a direct path.
@@ -3926,7 +3955,20 @@ impl ReticulumTransport {
             // CIRISEdge#805 item 8 — always explicit, so the node never runs on
             // a leviculum default (or a stray config file's keys) edge did not
             // choose.
-            .direct_link(config.direct_links.leviculum_settings())
+            .direct_link({
+                // 45.3 — a serve node of the genesis bundle that serves a
+                // facilitator answers on its second port too: its probers
+                // derive the second observer from its dial hint.
+                let mut d = config.direct_links.clone();
+                if d.serve_facilitator.is_some()
+                    && crate::edge::baked_canonical_ip_dials()
+                        .iter()
+                        .any(|(k, _)| *k == config.local_key_id)
+                {
+                    d.serve_second_port = true;
+                }
+                d.leviculum_settings()
+            })
             .resource_window_policy(RESOURCE_WINDOW_POLICY);
         tracing::info!(
             proposes = config.direct_links.proposes(),
@@ -3934,6 +3976,8 @@ impl ReticulumTransport {
             // Whether, never where: no address in a log line.
             facilitator_named = config.direct_links.facilitator.is_some(),
             serves_facilitator = config.direct_links.serve_facilitator.is_some(),
+            // 45.3 — the second NAT observer by role, never an address.
+            second_observer = config.direct_links.second_observer_role(),
             accept = ?config.direct_links.accept,
             "reticulum direct links (CIRISEdge#805 item 8, leviculum#70)"
         );
@@ -4254,6 +4298,10 @@ impl ReticulumTransport {
         let direct_link_retry = config.direct_links.proposes();
         if !direct_link_retry {
             node.set_direct_link_retry(false);
+        }
+        if config.direct_links.accept == crate::transport::direct_path::DirectAccept::IdentifiedOnly
+        {
+            tracing::info!("direct links: identified_only now follows the room/contact rule");
         }
 
         // Take the single event receiver before starting, then start
@@ -7294,6 +7342,7 @@ impl ReticulumTransport {
                 &self.node,
                 &self.direct_paths,
                 &self.onion,
+                self.scope_addresses.get().map(AsRef::as_ref),
                 self.metrics.get(),
                 destination_key_id,
                 link,
@@ -7343,6 +7392,7 @@ impl ReticulumTransport {
                 &node,
                 &direct_paths,
                 &onion,
+                table.as_deref(),
                 metrics.as_ref(),
                 &peer,
                 link,
@@ -7368,12 +7418,16 @@ impl ReticulumTransport {
         {
             return false;
         }
-        // CIRISEdge#1028 — an anonymous node accepts no upgrade.
-        self.onion.may_reveal_address().is_ok()
-            && crate::transport::direct_path::accepts_direct(
-                self.direct_paths.config.accept,
-                self.direct_standing(peer_key_id),
-            )
+        // v45.3 — the one address predicate (CIRISEdge#1028's anonymous
+        // check inside it), under the operator's accept switch.
+        let shows = may_show_address(
+            self.scope_addresses.get().map(AsRef::as_ref),
+            &self.direct_paths,
+            &self.onion,
+            peer_key_id,
+        )
+        .is_ok();
+        crate::transport::direct_path::accepts_direct(self.direct_paths.config.accept, shows)
     }
 
     /// v45.1 — this node's last NAT measurement
@@ -7631,6 +7685,19 @@ impl ReticulumTransport {
             Err(DirectPath::Unavailable { reason }) => reason.to_owned(),
             Err(other) => format!("{other:?}"),
         }
+    }
+
+    /// v45.3 test seam — turn the address predicate's cadence recheck off
+    /// (`true`), so only standing-change events re-read it.
+    pub fn set_standing_recheck_off_for_test(&self, off: bool) {
+        self.direct_paths.set_recheck_off_for_test(off);
+    }
+
+    /// v45.3 test seam — the escalation answer this node last handed
+    /// leviculum for `link` (`set_direct_link_escalation`), if any.
+    #[must_use]
+    pub fn direct_link_escalation_for_test(&self, link: [u8; 16]) -> Option<bool> {
+        self.direct_paths.escalation_of(&LinkId::new(link))
     }
 
     /// v44 — whether leviculum re-proposes this node's failed direct links in
@@ -8738,6 +8805,66 @@ impl ReticulumTransport {
         &self.egress_budget
     }
 
+    /// 45.3 (leviculum ciris.5) — the transport's egress scheduler follows
+    /// the budget: paced a little above the budget's rate R (edge's byte
+    /// estimate runs a few per cent under what leviculum frames, and the
+    /// scheduler must not become the bottleneck the budget is sized for),
+    /// unpaced when no budget is in force. The bulk floor and the media age
+    /// bound are edge's own ([`crate::transport::egress_budget::FLOOR_SHARE`],
+    /// [`crate::transport::av_call::MEDIA_STALE_BUDGET`]).
+    pub fn follow_egress_budget(&self) {
+        use crate::transport::egress_budget as eb;
+        let rate = self.egress_budget.rate_bps().map(|r| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let paced = (r * EGRESS_PACE_OVER_BUDGET).round() as u64;
+            paced.max(leviculum_std::egress::MIN_RATE_BPS)
+        });
+        if self.node.egress_rate() != rate {
+            self.node.set_egress_rate(rate);
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let min_bps = eb::FLOOR_MIN_BPS as u64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let share_percent = (eb::FLOOR_SHARE * 100.0).round() as u8;
+        self.node.set_egress_floor(leviculum_std::EgressFloor {
+            share_percent,
+            min_bps,
+        });
+        for kind in [
+            leviculum_std::MediaKind::Audio,
+            leviculum_std::MediaKind::Video,
+        ] {
+            self.node
+                .set_egress_media_age_bound(kind, crate::transport::av_call::MEDIA_STALE_BUDGET);
+        }
+    }
+
+    /// 45.3 (leviculum ciris.5) — the age of the oldest frame this node's
+    /// own egress scheduler holds for control, call control's proofs and
+    /// media (ms): the own uplink's queue read directly, not inferred from
+    /// proofs. Bulk is left out (its floor holds it by design). `None` while
+    /// no rate is set: unpaced, the scheduler queues nothing and the queue
+    /// is the kernel's, which only the send clock sees.
+    #[must_use]
+    pub fn egress_own_queue_age_ms(&self) -> Option<u64> {
+        use leviculum_std::EgressClass as C;
+        self.node.egress_rate()?;
+        let depth = self.node.egress_depth();
+        [C::Control, C::Proof, C::LinkSetup, C::Audio, C::Video]
+            .into_iter()
+            .map(|c| depth.class(c).oldest_age_ms)
+            .max()
+    }
+
+    /// 45.3 (leviculum ciris.5) — the egress scheduler's per-class counters
+    /// and depth, for the gauges.
+    #[must_use]
+    pub fn egress_scheduler_stats(
+        &self,
+    ) -> (leviculum_std::EgressStats, leviculum_std::EgressDepth) {
+        (self.node.egress_stats(), self.node.egress_depth())
+    }
+
     /// 45.3 — an identity-plane send (an envelope: replication rounds and
     /// replies, chat, anything not call control or call media) is BULK: it
     /// waits until the egress budget serves it, paced at the budget's rate
@@ -8749,13 +8876,23 @@ impl ReticulumTransport {
     /// charged like call control and never held; BULK waits its turn within
     /// the floor.
     async fn wait_egress(&self, bytes: usize) {
-        use crate::transport::egress_budget::{current_send_class, Class, SendClass};
+        use crate::transport::egress_budget::{
+            current_send_class, current_send_family, Class, SendClass,
+        };
         // An envelope rides a Resource or Channel parts: ~15 % more on the
         // wire, plus a packet header per MDU.
         let wire = bytes + bytes / 7 + 64;
         match current_send_class() {
             SendClass::First => {
                 let _ = self.egress_budget.take(Class::Control, wire);
+                // 45.3 — what rides FIRST, by family prefix.
+                if let Some(m) = self.metrics.get() {
+                    m.add_av_plane(
+                        current_send_family()
+                            .unwrap_or(crate::observability::AV_FIRST_BYTES_UNCLASSED),
+                        u64::try_from(wire).unwrap_or(u64::MAX),
+                    );
+                }
             }
             SendClass::Bulk => {
                 if self.egress_budget.wait_bulk(wire).await {
@@ -8942,6 +9079,8 @@ impl ReticulumTransport {
     pub fn onion_refresh(&self) {
         self.shapers.set_layer_peers(self.onion.layer_peers());
         self.shapers.set_relay_offering(self.onion.relay_offering());
+        // The tier is in the address predicate.
+        self.direct_paths.notify_standing();
     }
 
     /// CC 5.4.3 referrals — the free slots `peer` last reported here.
@@ -10787,7 +10926,8 @@ impl ReticulumTransport {
     ///
     /// 1. no live attributed identity-plane link to it ([`Self::live_link_to`],
     ///    the reverse path's own lookup, CIRISEdge#353), so nothing the peer
-    ///    opened can carry the frame;
+    ///    opened can carry the frame, and (v45.3) no live link this node
+    ///    dialled to it ([`Self::live_dialled_link_to`]);
     /// 2. no dial candidate this node holds a path to, so no dial can leave
     ///    (a pathed one with no pair is still dialled: E1's pre-seal route
     ///    fetch, `dial_transit_pair`);
@@ -10798,28 +10938,216 @@ impl ReticulumTransport {
     /// A pair read that ERRORS is not "no pair": the answer is `false` and the
     /// send runs as before. Nothing here is counted or changed.
     async fn undialable_now(&self, destination_key_id: &str, candidates: &[DialCandidate]) -> bool {
-        if self
+        self.reach_facts(
+            destination_key_id,
+            candidates,
+            crate::read_caller::Site::RoundCarriable,
+        )
+        .await
+        .1
+        .undialable()
+    }
+
+    /// **The facts behind [`Self::undialable_now`] and [`Self::peer_reach`]**,
+    /// read once, in the #971 order: the live attributed identity-plane link
+    /// (returned beside the facts), a path to any of `candidates`, and the
+    /// transit-pair read only when neither answers. The pair read is booked
+    /// under `site`.
+    async fn reach_facts(
+        &self,
+        destination_key_id: &str,
+        candidates: &[DialCandidate],
+        site: crate::read_caller::Site,
+    ) -> (Option<LinkId>, crate::transport::peer_reach::ReachFacts) {
+        // The peer's own link to this node first (the reverse path, #353),
+        // else one this node dialled to it that is still up: either carries
+        // a frame now, so neither direction is "no live link".
+        let live = match self
             .live_link_to(destination_key_id, LinkPlane::Identity)
             .await
-            .is_some()
         {
-            return false;
-        }
-        if candidates.iter().any(|c| self.node.has_path(&c.dest_hash)) {
-            return false;
-        }
-        // CIRISEdge#971 — the pair read runs before every round toward a peer
-        // with no live link or path; it is booked under its own caller label,
-        // not `other`.
-        let pair = crate::read_caller::scoped(
-            crate::read_caller::Site::RoundCarriable,
-            self.seals
-                .resolve_pair(self.rooting.as_deref(), destination_key_id, None),
+            Some(id) => Some(id),
+            None => self.live_dialled_link_to(candidates).await,
+        };
+        // In memory (leviculum's path table), so read whether or not a live
+        // link answered.
+        let has_path = candidates.iter().any(|c| self.node.has_path(&c.dest_hash));
+        let transit_pair = if live.is_none() && !has_path {
+            // CIRISEdge#971 — the pair read runs before every round toward a
+            // peer with no live link or path; it is booked under its own
+            // caller label, not `other`.
+            let pair = crate::read_caller::scoped(
+                site,
+                self.seals
+                    .resolve_pair(self.rooting.as_deref(), destination_key_id, None),
+            )
+            .await;
+            match pair {
+                Ok(_) => Some(true),
+                Err(crate::transport::av_transit_handshake::AvHandshakeError::NoTransitPair {
+                    ..
+                }) => Some(false),
+                // A pair read that ERRORS is not "no pair".
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        (
+            live,
+            crate::transport::peer_reach::ReachFacts {
+                live_link: live.is_some(),
+                has_path,
+                transit_pair,
+            },
         )
-        .await;
-        matches!(
-            pair,
-            Err(crate::transport::av_transit_handshake::AvHandshakeError::NoTransitPair { .. })
+    }
+
+    /// v45.3 — **re-read the address predicate on every link** with a known
+    /// peer ([`may_show_address`]) and hand leviculum the answer as the link's
+    /// escalation (`set_direct_link_escalation`), when it changed. A link
+    /// whose peer no longer passes is moved off its direct interface
+    /// (`retire_direct_link`), and pending background re-proposals are
+    /// dropped; leviculum's retry runs only while this node proposes and is
+    /// not anonymous. No store read: the table, the contacts and the tier are
+    /// in memory.
+    pub(crate) async fn reconcile_direct_standing(&self) {
+        let config = &self.direct_paths.config;
+        if config.accept == crate::transport::direct_path::DirectAccept::Off && !config.proposes() {
+            return;
+        }
+        let table = self.scope_addresses.get().map(AsRef::as_ref);
+        let mut links: HashMap<LinkId, String> = self.link_to_peer_key_id.lock().await.clone();
+        {
+            let dialled = self.dialed_link_dest.lock().await;
+            if !dialled.is_empty() {
+                let by_dest: HashMap<DestinationHash, String> = self
+                    .peers
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(k, p)| (p.peer.dest_hash, k.clone()))
+                    .collect();
+                for (link, dest) in dialled.iter() {
+                    if let Some(peer) = by_dest.get(dest) {
+                        links.entry(*link).or_insert_with(|| peer.clone());
+                    }
+                }
+            }
+        }
+        // Proposals of this node's that ended without a direct path since the
+        // last pass: leviculum re-arms its retry for them when they end, so a
+        // link among them whose peer fails the predicate has its retry
+        // cleared now, whatever the predicate read before (level, not edge).
+        let failed = self.direct_paths.take_failed();
+        let mut lost = failed.iter().any(|l| {
+            links.get(l).is_none_or(|peer| {
+                may_show_address(table, &self.direct_paths, &self.onion, peer).is_err()
+            })
+        });
+        for (link, peer) in links {
+            if !self.node.link_is_established(&link) {
+                self.direct_paths.forget_escalation(&link);
+                continue;
+            }
+            let shows = may_show_address(table, &self.direct_paths, &self.onion, &peer).is_ok();
+            let before = self.direct_paths.note_escalation(link, shows);
+            if before != Some(shows) {
+                self.node.set_direct_link_escalation(&link, Some(shows));
+            }
+            if shows {
+                continue;
+            }
+            lost |= before == Some(true);
+            if self.node.direct_link_interface(&link).is_some()
+                && self.node.retire_direct_link(&link).await.is_ok()
+            {
+                if let Some(m) = self.metrics.get() {
+                    m.inc_direct_link(crate::observability::DIRECT_LINK_RETIRED_NO_STANDING);
+                }
+                tracing::info!(
+                    key_id = %peer,
+                    link = %hex::encode(link.as_bytes()),
+                    "direct path: retired, the address predicate no longer holds (CC 5.4.6)"
+                );
+            }
+        }
+        // leviculum's background re-proposal: on only while this node
+        // proposes and is not anonymous. Turning it off drops every pending
+        // retry (there is no per-link cancel on v0.34.0+ciris.4), so a lost
+        // standing drops them and turns it back on; edge's own sends and
+        // dials still propose, under the predicate, to the peers that keep it.
+        let want = config.proposes() && self.onion.may_reveal_address().is_ok();
+        let had = self
+            .direct_link_retry
+            .swap(want, std::sync::atomic::Ordering::Relaxed);
+        if lost || had != want {
+            self.node.set_direct_link_retry(false);
+            if want {
+                self.node.set_direct_link_retry(true);
+            }
+            if lost {
+                if let Some(m) = self.metrics.get() {
+                    m.inc_direct_link(crate::observability::DIRECT_LINK_RETRIES_DROPPED);
+                }
+            }
+        }
+    }
+
+    /// v45.3 — an identity link THIS node dialled to one of `candidates` that
+    /// leviculum still holds up and the stall guard has not judged dead
+    /// (the pool, `reusable_dialed_link`). [`Self::live_link_to`]
+    /// sees only links the peer dialled.
+    async fn live_dialled_link_to(&self, candidates: &[DialCandidate]) -> Option<LinkId> {
+        let pools = self.reusable_dialed_link.lock().await;
+        candidates
+            .iter()
+            .filter_map(|c| pools.get(&c.dest_hash))
+            .flatten()
+            .copied()
+            .find(|id| {
+                self.node.link_is_established(id) && !self.stall_guard.is_dead(&id.into_bytes())
+            })
+    }
+
+    /// v45.3 — **whether this node can reach `node_key_id` now, and how**
+    /// ([`crate::transport::peer_reach::PeerReach`]): the #971 facts
+    /// ([`Self::reach_facts`], so `Unreachable` is exactly
+    /// [`Self::undialable_now`]), the live link's last inbound age and
+    /// whether it rides a punched interface (leviculum's `direct` state), and
+    /// the fewest hops to a dial candidate. Its store reads are booked under
+    /// `edge.transport.peer_reach`.
+    pub async fn peer_reach(&self, node_key_id: &str) -> crate::transport::peer_reach::PeerReach {
+        let site = crate::read_caller::Site::PeerReach;
+        let candidates =
+            crate::read_caller::scoped(site, self.resolve_dial_candidates(node_key_id)).await;
+        let (live, facts) = self.reach_facts(node_key_id, &candidates, site).await;
+        let hops = candidates
+            .iter()
+            .filter_map(|c| self.node.hops_to(&c.dest_hash))
+            .min();
+        let last_inbound_ms_ago = match live {
+            Some(id) => {
+                let stamp = self
+                    .link_last_inbound_at
+                    .lock()
+                    .await
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(0);
+                crate::transport::peer_reach::inbound_ms_ago(
+                    stamp,
+                    u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0),
+                )
+            }
+            None => None,
+        };
+        let direct = live.is_some_and(|id| self.node.direct_link_interface(&id).is_some());
+        crate::transport::peer_reach::PeerReach::from_facts(
+            &facts,
+            last_inbound_ms_ago,
+            hops,
+            direct,
         )
     }
 
@@ -11528,6 +11856,17 @@ impl ReticulumTransport {
             );
             return Err(ShipError::Busy);
         }
+        // 45.3 (leviculum ciris.5) — the scheduler takes every Resource as
+        // bulk: a FIRST envelope here waits behind media. Counted, so it is
+        // seen if it is ever more than the rare one past Channel-first's cap.
+        if matches!(
+            crate::transport::egress_budget::current_send_class(),
+            crate::transport::egress_budget::SendClass::First
+        ) {
+            if let Some(m) = self.metrics.get() {
+                m.inc_av_plane(crate::observability::EGRESS_FIRST_ON_RESOURCE);
+            }
+        }
         // CC 5.3.3.5 E1 — the Resource carries the SEALED envelope; a link
         // with no keys ships nothing (and opens no Resource lane).
         let sealed = self
@@ -11935,6 +12274,11 @@ impl Transport for ReticulumTransport {
 
 /// How often the event loop stamps its liveness.
 const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// v45.3 — how often the event loop re-reads the address predicate on every
+/// link without a standing-change call (the tier can change with its relays'
+/// liveness). Rooms, contacts and the host's tier switch wake it at once.
+const DIRECT_STANDING_RECHECK: Duration = Duration::from_secs(5);
 
 /// How often the node tick runs: the ladder's window.
 const NODE_TICK: Duration = Duration::from_secs(1);
@@ -12452,6 +12796,12 @@ impl ReticulumTransport {
         // event: an age that follows the frames would be a clock of them.
         let mut heartbeat = tokio::time::interval(HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut standing_tick = tokio::time::interval(DIRECT_STANDING_RECHECK);
+        standing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A room joined or left moves the scope table's generation.
+        let mut table_changes = self.scope_addresses.get().map(|t| t.changes());
+        // The anonymous tier turning on or off, from wherever it changes.
+        let mut reveal_changes = self.onion.reveal_changes();
         // v44 — off this loop, so a wedged event never holds the ladder, and
         // it ends with this run, so a parked node holds no timer.
         let node_tick = tokio::spawn(run_node_tick(self.node_tick()));
@@ -12486,6 +12836,26 @@ impl ReticulumTransport {
                     if let Some(m) = ctx.metrics {
                         m.telemetry.beat(LoopName::Event);
                     }
+                }
+                // v45.3 — the address predicate re-read on every link: on a
+                // standing change (room, contact, tier), and on a cadence for
+                // what changes without a call (the tier's relays).
+                () = self.direct_paths.standing_changed() => {
+                    self.reconcile_direct_standing().await;
+                }
+                _ = standing_tick.tick(), if !self.direct_paths.recheck_off_for_test() => {
+                    self.reconcile_direct_standing().await;
+                }
+                Ok(()) = reveal_changes.changed() => {
+                    self.reconcile_direct_standing().await;
+                }
+                Some(()) = async {
+                    match table_changes.as_mut() {
+                        Some(rx) => rx.changed().await.ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.reconcile_direct_standing().await;
                 }
                 _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution()
                     || ctx.seals.any_deferred() => {
@@ -12615,8 +12985,21 @@ impl ReticulumTransport {
                             tokio::time::sleep(delay).await;
                         }
                     }
+                    let standing_event = matches!(
+                        event,
+                        NodeEvent::LinkEstablished { .. }
+                            | NodeEvent::LinkIdentified { .. }
+                            | NodeEvent::LinkClosed { .. }
+                            | NodeEvent::DirectLinkEstablished { .. }
+                            | NodeEvent::DirectLinkFailed { .. }
+                    );
                     handle_event(event, &ctx).await;
                     observe(label, began);
+                    // v45.3 — a link came up, was attributed or closed: its
+                    // escalation is set (or forgotten) from the predicate.
+                    if standing_event {
+                        self.direct_paths.notify_standing();
+                    }
                     if let Some((link_id, up)) = direct_move {
                         let dial = self.dial_ctx();
                         tokio::spawn(async move {
@@ -12919,6 +13302,34 @@ impl ReticulumTransport {
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
         // hard cap (v13.6.1 progress-aware wait).
+        // 45.3 (leviculum ciris.5) — the scheduler takes every Resource as
+        // bulk, so a FIRST envelope (a removal, a key, a halt) goes on the
+        // Channel, scheduled as Control, ahead of media; a stall falls through
+        // to the Resource as before (and is counted there).
+        if matches!(
+            crate::transport::egress_budget::current_send_class(),
+            crate::transport::egress_budget::SendClass::First
+        ) {
+            let mdu = send_mdu(&self.node, &self.shapers, &link_id);
+            if let Some(fragments) = crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
+                .filter(|f| f.len() <= FIRST_CHANNEL_MAX_FRAGMENTS)
+            {
+                let outcome = self
+                    .send_channel_marked(
+                        link_id,
+                        crate::transport::link_shaping::Lane::of(envelope_bytes),
+                        &fragments,
+                    )
+                    .await;
+                if outcome.complete() {
+                    note_outbound_use(&self.link_last_outbound_at, link_id);
+                    claim.release().await;
+                    self.propose_direct_to_room_peer(destination_key_id, link_id, &candidates)
+                        .await;
+                    return Ok(TransportSendOutcome::Delivered);
+                }
+            }
+        }
         let reused = claim.reused;
         let shipped = self
             .ship_resource_on_link(
@@ -15588,10 +15999,12 @@ struct AnnounceCtx {
 /// place an anonymous node ([`crate::onion::runtime::OnionRuntime::may_reveal_address`])
 /// is stopped: nothing is sent, so leviculum opens no session and probes no
 /// facilitator, and the peer is backed off as for a refused proposal.
+#[allow(clippy::too_many_arguments)] // the predicate's inputs, then the proposal's
 async fn dispatch_proposal(
     node: &ReticulumNode,
     direct_paths: &crate::transport::direct_path::DirectPaths,
     onion: &crate::onion::runtime::OnionRuntime,
+    table: Option<&ScopeAddressTable>,
     metrics: Option<&crate::observability::EdgeMetrics>,
     peer: &str,
     link: LinkId,
@@ -15605,17 +16018,27 @@ async fn dispatch_proposal(
             m.inc_direct_link(label);
         }
     };
-    if let Err(token) = onion.may_reveal_address() {
-        onion.count(token);
+    // v45.3 — the one address predicate.
+    if let Err(token) = may_show_address(table, direct_paths, onion, peer) {
+        if token == crate::observability::DIRECT_LINK_SKIPPED_NO_STANDING {
+            count(token);
+        } else {
+            onion.count(token);
+        }
         direct_paths.tracker().propose_refused(peer, link, now);
         tracing::debug!(
             link = %hex::encode(link.as_bytes()),
-            "direct path: not proposing — this node's Anonymous Tier is active (CC 5.4.6)"
+            reason = token,
+            "direct path: not proposing (CC 5.4.6)"
         );
         return Err(crate::transport::direct_path::DirectPath::Unavailable {
             reason: "propose_refused",
         });
     }
+    // The link's escalation follows the same predicate, set before the
+    // session it governs (the event loop re-reads it on standing change).
+    node.set_direct_link_escalation(&link, Some(true));
+    direct_paths.note_escalation(link, true);
     // Registered BEFORE the dispatch, so the outcome cannot precede the
     // registration.
     let rx = direct_paths.wait_for(link);
@@ -15652,6 +16075,24 @@ fn direct_standing(
     peer: &str,
 ) -> bool {
     table.is_some_and(|t| t.shares_group_with(peer)) || direct_paths.is_contact(peer)
+}
+
+/// v45.3 — **the one address predicate**, read for every proposal, every
+/// answer and every link's escalation: a known peer that shares a room with
+/// this node or that it names as a contact, and this node not anonymous.
+/// `Err` is the refusal's token.
+fn may_show_address(
+    table: Option<&ScopeAddressTable>,
+    direct_paths: &crate::transport::direct_path::DirectPaths,
+    onion: &crate::onion::runtime::OnionRuntime,
+    peer: &str,
+) -> Result<(), &'static str> {
+    onion.may_reveal_address()?;
+    if direct_standing(table, direct_paths, peer) {
+        Ok(())
+    } else {
+        Err(crate::observability::DIRECT_LINK_SKIPPED_NO_STANDING)
+    }
 }
 
 struct EventCtx<'a> {
@@ -19907,6 +20348,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 // `vanished`, by the next reconciliation pass (#853).
                 return;
             }
+            ctx.direct_paths.forget_escalation(&link_id);
             // Every per-link map lets go; the close is counted under its
             // reason, on its side (CIRISEdge#853), unless this node's own
             // teardown already counted it.
@@ -20309,10 +20751,13 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 });
         }
         // CIRISEdge#805 item 8 — direct links (leviculum#70).
+        // 45.3 (ciris.5) — `punch` (the punch's counts) is read by the
+        // probe adapter, not here.
         NodeEvent::DirectLinkEstablished {
             link_id,
             interface_index,
             proposed,
+            ..
         } => direct_link_established(ctx, link_id, interface_index, proposed).await,
         NodeEvent::DirectLinkRequested { link_id, .. } => {
             direct_link_requested(ctx, link_id).await;
@@ -20321,6 +20766,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             link_id,
             failure,
             proposed,
+            ..
         } => direct_link_failed(ctx, link_id, failure, proposed).await,
         NodeEvent::DirectLinkLost {
             link_id,
@@ -20493,6 +20939,9 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
             link_id: link_id.into_bytes(),
             accepted,
         });
+        // v45.3 — the link's escalation is the same answer.
+        node.set_direct_link_escalation(&link_id, Some(accepted));
+        direct_paths.note_escalation(link_id, accepted);
         let answer = if accepted {
             node.accept_direct_link(&link_id).await
         } else {
@@ -20548,6 +20997,10 @@ async fn direct_link_failed(
         proposed,
         "direct link FAILED: the link keeps its relayed path (CIRISEdge#805 item 8)"
     );
+    if proposed {
+        // This node's proposal: leviculum may hold a retry for it now.
+        ctx.direct_paths.note_failed(link_id);
+    }
     ctx.direct_paths.resolve(
         link_id,
         crate::transport::direct_path::DirectOutcome::Failed(failure),
@@ -28564,8 +29017,12 @@ impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
         address: &MemberAddress,
         scope: &crate::cohort_scope::CohortScope,
     ) -> Result<(), String> {
-        self.register_scoped_destination(address, scope)
-            .map_err(|e| e.to_string())
+        let out = self
+            .register_scoped_destination(address, scope)
+            .map_err(|e| e.to_string());
+        // A room's addresses moved: a peer's standing may have.
+        self.direct_paths.notify_standing();
+        out
     }
 
     fn retire(
@@ -28573,8 +29030,11 @@ impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
         address: &MemberAddress,
         scope: &crate::cohort_scope::CohortScope,
     ) -> Result<(), String> {
-        self.retire_scoped_destination(address, scope)
-            .map_err(|e| e.to_string())
+        let out = self
+            .retire_scoped_destination(address, scope)
+            .map_err(|e| e.to_string());
+        self.direct_paths.notify_standing();
+        out
     }
 }
 

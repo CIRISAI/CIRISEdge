@@ -112,7 +112,8 @@ use crate::transport::realtime_av::{
     StreamId, AV_CHUNK_WIRE_OVERHEAD,
 };
 use crate::transport::realtime_av_alm::controller::wire::{
-    collides_with_control_frame, decode as decode_c3, is_control_frame, is_periodic, WireFrame,
+    collides_with_control_frame, decode as decode_c3, is_control_frame, is_periodic, is_stamp,
+    WireFrame,
 };
 use crate::transport::realtime_av_dispatcher::{
     open_hop_outer, AvDispatcherError, AvLinkReceiver as _, AvLinkSender as _, AvSubscriberLink,
@@ -449,6 +450,15 @@ pub enum CallEvent {
     LoadTier {
         /// `0`, `1` or `2`.
         tier: u8,
+    },
+    /// 45.3 — this node's own video on `stream` resumes after edge held or
+    /// dropped frames of it (the egress budget did not admit them, or row
+    /// STALE kept them off a backlogged uplink): the receivers' decoders lost
+    /// their reference, so the host's encoder should send a keyframe next.
+    /// Once per resume; not again until frames are held once more.
+    KeyframeWanted {
+        /// The own stream (the primary or a share).
+        stream: StreamId,
     },
     /// v45 — an attendee's stream left the call: once per (attendee,
     /// stream). `Left` and `Backgrounded` come only from the attendee's own
@@ -1918,9 +1928,10 @@ struct Shared {
     queue_age_ms: AtomicU64,
     /// 45.3 row DR — each out leg's [`alm::SendClock`].
     send_clocks: StdMutex<HashMap<[u8; 16], alm::SendClock>>,
-    /// 45.3 — the egress budget held one of this call's video frames since
-    /// the last one it admitted.
-    video_held: AtomicBool,
+    /// 45.3 — per own stream, the KeyframeWanted state
+    /// ([`video_resumes`]): owed since a video frame was held or dropped,
+    /// and when the event last fired.
+    video_held: StdMutex<HashMap<StreamId, KeyframeOwed>>,
     /// G8 — rung when a fan-out parks a chunk: the flusher retries it with
     /// the publisher lock taken briefly, never inside `publish`.
     parked_wake: tokio::sync::Notify,
@@ -1957,6 +1968,12 @@ struct Shared {
     /// Test seam: this many must-arrive C3 frames fail their FIRST send, as
     /// a congested link refuses them (their resends are untouched).
     test_fail_c3: AtomicU64,
+    /// 45.3 (R29) — per own stream, the highest `chunk_seq` sealed so far
+    /// (held or sent): what its backlog stamp names.
+    sealed_through: StdMutex<HashMap<StreamId, u64>>,
+    /// 45.3 (R29) — this node's own queue word over a window, for the most
+    /// its stamp declares.
+    own_word_window: StdMutex<alm::StaleWindow>,
 }
 
 /// This node's stream (it changes only at `Call::replace_stream`), its chunk
@@ -2706,7 +2723,7 @@ impl Call {
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
             send_clocks: StdMutex::new(HashMap::new()),
-            video_held: AtomicBool::new(false),
+            video_held: StdMutex::new(HashMap::new()),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
             evidence_at: StdMutex::new(HashMap::new()),
@@ -2723,6 +2740,8 @@ impl Call {
             c3_reported: AtomicU64::new(0),
             test_stall_until: StdMutex::new(None),
             test_fail_c3: AtomicU64::new(0),
+            sealed_through: StdMutex::new(HashMap::new()),
+            own_word_window: StdMutex::new(alm::StaleWindow::default()),
         });
         if let KeepOutcome::Refused(refused) = keep {
             shared.emit(CallEvent::KeepRefused {
@@ -4124,19 +4143,33 @@ async fn send_pieces(
         let admitted = bytes == 0 || shared.transport.egress_budget().take(class, bytes);
         if !admitted {
             shared.count(crate::observability::AV_FRAME_HELD_BUDGET);
-            if class == crate::transport::egress_budget::Class::Video {
-                shared.video_held.store(true, Ordering::Relaxed);
-            }
-        } else if class == crate::transport::egress_budget::Class::Video
-            && shared.video_held.swap(false, Ordering::Relaxed)
-        {
-            // Video resumes after frames were held: here a keyframe is
-            // wanted (the host event waits on the 45.x token set).
+        }
+        // Row STALE drops every chunk of this frame in `send_own_chunk`: for
+        // the keyframe rule that is a held frame too.
+        let (stale, now) = {
+            let alm = Shared::lock(&shared.alm);
+            (alm.sends_stale(), alm.now_ms())
+        };
+        let video = class == crate::transport::egress_budget::Class::Video;
+        let resumed = video_resumes(
+            &mut Shared::lock(&shared.video_held),
+            stream,
+            video,
+            admitted && !stale,
+            now,
+        );
+        if resumed {
             shared.count(crate::observability::AV_VIDEO_KEYFRAME_WANTED);
+            shared.emit(CallEvent::KeyframeWanted { stream });
         }
         !admitted
     };
     for (piece, (seq, inner)) in pieces.iter().zip(sealed) {
+        {
+            let mut through = Shared::lock(&shared.sealed_through);
+            let t = through.entry(stream).or_insert(seq.0);
+            *t = (*t).max(seq.0);
+        }
         if held {
             continue;
         }
@@ -4173,20 +4206,122 @@ async fn send_pieces(
     Ok(outcome.into_iter().collect())
 }
 
-/// 45.3 row DR — read the uplink backlog this tick and fold it into the
-/// drain: per leg, the oldest unproved Channel message's age FROM ITS SEND
-/// ([`alm::SendClock`]) past the leg's RTT floor; the reading is the LEAST
-/// over every leg with something outstanding, and only with at least
-/// [`alm::UPLINK_STALL_LEGS`] of them (the stall verdict's rule). A leg's
-/// age is a round trip: it reads high when THIS node's uplink queues, and
-/// equally when the PEER's does (its proofs wait behind its own queue), so
-/// one slow leg is that peer, and only a backlog every leg sees is this
-/// node's uplink. (Reading the kept leg alone, every member of a room whose
-/// publisher was capped read the publisher's queue as its own and drained.)
-/// `None` when fewer legs than that have anything outstanding.
-fn uplink_backlog(shared: &Arc<Shared>, legs: &[(String, [u8; 16])]) {
+/// 45.3 (R29) — the backlog from which a publisher stamps its offers. A
+/// child reads its parent late at 300 ms (`rxmove::LATE_MS`) and moves to a
+/// relay; the relay is then silent until its upstream's queue drains (it
+/// forwards nothing stale), and only the publisher's word may grant that
+/// first chunk its grace. Stamping from 800 ms left the move uncovered for
+/// the second or more the queue took to grow past the budget and the stamp
+/// to cross it (the mesh witness: children failed their new relay 2.5 s
+/// after the move, before its first stamp). The excuse itself still needs a
+/// stamp declaring more than the stale budget.
+const STAMP_FROM_MS: u64 = 300;
+
+/// 45.3 (R29 OFFER-AS-LIFE) — while this node's own uplink is past the
+/// stale budget its own stream's offers carry its signed backlog word (the
+/// chunk key of the stream's epoch signs it): the only thing that excuses
+/// its children's silence. Under the budget, none.
+fn stamp_own_backlog(shared: &Arc<Shared>) {
+    let budget = u64::try_from(MEDIA_STALE_BUDGET.as_millis()).unwrap_or(u64::MAX);
+    // The chunks still in flight were queued when the backlog was higher:
+    // the word declared is the most the queue held within the last
+    // offer-as-life span plus that backlog, so a relay still dropping them as
+    // stale keeps its excuse until they have drained (and not past it).
+    let (word, withholding) = {
+        let a = Shared::lock(&shared.alm);
+        let now = a.now_ms();
+        let w = a.own_queue_word_ms();
+        let mut held = Shared::lock(&shared.own_word_window);
+        held.note(now, w);
+        let word = held.max_within(
+            now,
+            crate::transport::realtime_av_alm::controller::selector::OFFER_IS_LIFE_MS
+                .saturating_add(budget),
+        );
+        (word, a.withholding_media())
+    };
+    // R31 SelfStamp — while this node withholds any of its own media
+    // (stalled, draining, or STALE) its children hear no chunk to excuse
+    // them by: it stamps, declaring at least past the budget, since the
+    // media it holds back would be stale (only it can sign this word, and
+    // it concerns only its own stream).
+    let word = if withholding {
+        word.max(budget + 1)
+    } else {
+        word
+    };
+    let frame = Some(word)
+        .filter(|b| *b > STAMP_FROM_MS)
+        .and_then(|backlog| {
+            let key = Shared::lock(&shared.own_key);
+            let through = Shared::lock(&shared.sealed_through)
+                .get(&key.stream)
+                .copied()
+                .unwrap_or(0);
+            key.signer
+                .stamp_backlog(
+                    crate::transport::av_chunk_auth::unix_ms_now(),
+                    u32::try_from(backlog).unwrap_or(u32::MAX),
+                    through,
+                )
+                .ok()
+                .map(|st| crate::transport::realtime_av_alm::controller::wire::encode_stamp(&st))
+        });
+    tracing::debug!(target: "ciris_edge::stamp", node = %shared.own, word, stamped = frame.is_some(), "own backlog");
+    Shared::lock(&shared.alm).set_own_stamp(frame);
+}
+
+/// 45.3 rows DR / G8 — one out leg's send clock this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegBacklog {
+    /// Something is unproved: the oldest message's age FROM ITS SEND (ms)
+    /// and the leg's RTT floor.
+    Outstanding { age_ms: u64, floor_ms: u64 },
+    /// Nothing unproved, and the leg sent within
+    /// [`UPLINK_CLEAR_EVIDENCE_MS`]: this uplink delivered to it.
+    Clear,
+    /// Nothing unproved and nothing sent lately: no evidence either way.
+    Idle,
+}
+
+/// 45.3 row DR — how recent a leg's last send must be for "nothing
+/// unproved" to say this uplink is clear (the drain's own clear span).
+const UPLINK_CLEAR_EVIDENCE_MS: u64 = 1_000;
+
+/// 45.3 rows DR / STALE / budget — **the uplink backlog reading** from the
+/// legs' send clocks: the LEAST over every leg with traffic, a leg that
+/// proved everything it sent lately reading 0. A leg's age is a round trip
+/// (it reads high when this node's uplink queues, and equally when the
+/// PEER's does), so with two legs or more one slow peer is out-read by a leg
+/// this uplink serves in time; with ONE leg with traffic (a two-person call,
+/// or one leg busy while the others are idle) that leg's reading is the
+/// only evidence there is, and it is used (45.3 model R25: before, the
+/// reading needed two outstanding legs and a two-person call never drained,
+/// held STALE media or engaged the budget). The same rule ends a drain: the
+/// other legs' liveness offers, proved in time, read 0, so a kept child
+/// whose OWN uplink is slow cannot hold the drain on once this uplink is
+/// clear (R25's lasso). `None` with no leg with traffic.
+fn backlog_reading(legs: &[LegBacklog]) -> Option<u64> {
+    legs.iter()
+        .filter_map(|l| match *l {
+            LegBacklog::Outstanding { age_ms, floor_ms } => Some(age_ms.saturating_sub(floor_ms)),
+            LegBacklog::Clear => Some(0),
+            LegBacklog::Idle => None,
+        })
+        .min()
+}
+
+/// 45.3 row DR — read the uplink backlog this tick from every out leg's
+/// send clock ([`alm::SendClock`], [`backlog_reading`]: the `inferred`
+/// reading) and from the own egress scheduler's queue (`direct`), and fold
+/// the later of the two into the drain, row STALE and the egress budget.
+/// Returns each leg's send clock, which the G8 verdict reads too.
+fn uplink_backlog(
+    shared: &Arc<Shared>,
+    legs: &[(String, [u8; 16])],
+) -> HashMap<[u8; 16], LegBacklog> {
     let now = Shared::lock(&shared.alm).now_ms();
-    let mut all_ages: Vec<u64> = Vec::new();
+    let mut per_leg: HashMap<[u8; 16], LegBacklog> = HashMap::new();
     {
         let mut clocks = Shared::lock(&shared.send_clocks);
         clocks.retain(|l, _| legs.iter().any(|(_, x)| x == l));
@@ -4198,29 +4333,43 @@ fn uplink_backlog(shared: &Arc<Shared>, legs: &[(String, [u8; 16])]) {
             if let Some(last) = st.last_sent_seq {
                 clock.note(now, last);
             }
-            let Some(oldest) = st.oldest_unacked_seq else {
-                continue;
+            let leg = match st.oldest_unacked_seq {
+                Some(oldest) => match clock.age_of(now, oldest) {
+                    Some(age_ms) => LegBacklog::Outstanding {
+                        age_ms,
+                        floor_ms: st.min_rtt_ms.unwrap_or(0),
+                    },
+                    None => LegBacklog::Idle,
+                },
+                None if clock
+                    .last_send_ms()
+                    .is_some_and(|t| now.saturating_sub(t) <= UPLINK_CLEAR_EVIDENCE_MS) =>
+                {
+                    LegBacklog::Clear
+                }
+                None => LegBacklog::Idle,
             };
-            let Some(age) = clock.age_of(now, oldest) else {
-                continue;
-            };
-            all_ages.push(age.saturating_sub(st.min_rtt_ms.unwrap_or(0)));
+            per_leg.insert(*link, leg);
         }
     }
-    // Entering needs the uplink's verdict (every leg, at least two). Once
-    // draining, the kept leg's own reading counts alone: it carries an
-    // outstanding message every tick, while the other legs' offers are at
-    // the liveness minimum and go unmeasured as the queue shrinks.
-    let draining = Shared::lock(&shared.alm).draining();
-    let reading = if all_ages.len() >= alm::UPLINK_STALL_LEGS || (draining && !all_ages.is_empty())
-    {
-        all_ages.into_iter().min()
-    } else {
-        None
+    // One leg with traffic is read, and a drain ends on every leg's
+    // evidence, not the kept leg's alone (45.3 model R25).
+    let readings: Vec<LegBacklog> = per_leg.values().copied().collect();
+    let inferred = backlog_reading(&readings);
+    // 45.3 (leviculum ciris.5) — the own egress scheduler's queue, read
+    // directly, whatever the number of legs; the send clock still sees the
+    // kernel's FIFO and the path behind it. The later of the two is the
+    // backlog.
+    let direct = shared.transport.egress_own_queue_age_ms();
+    let reading = match (inferred, direct) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     };
     let changed = Shared::lock(&shared.alm).observe_uplink_backlog(reading);
     let budget = shared.transport.egress_budget();
     budget.observe(reading);
+    shared.transport.follow_egress_budget();
+    stamp_own_backlog(shared);
     if let Some(m) = &shared.metrics {
         m.telemetry.set_uplink_backlog_ms(reading.unwrap_or(0));
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -4241,6 +4390,7 @@ fn uplink_backlog(shared: &Arc<Shared>, legs: &[(String, [u8; 16])]) {
         ),
         None => {}
     }
+    per_leg
 }
 
 /// 45.3 row STALE — whether a media chunk is held back because it would
@@ -4262,6 +4412,55 @@ const fn chunk_wire_bytes(plaintext: usize) -> usize {
         + 25
         + 75
         + 28
+}
+
+/// 45.3 — the least time between two `CallEvent::KeyframeWanted` for one
+/// stream. Under a short budget video frames are held and admitted in turn,
+/// and every resume asking for a keyframe (the W4 bench: ~4 a second) would
+/// spend the budget on keyframes; one a second keeps a freeze under about a
+/// second and costs at most one keyframe a second. A resume inside the
+/// interval is owed, not lost: the first frame out after it fires.
+pub(crate) const KEYFRAME_WANTED_MIN_INTERVAL_MS: u64 = 1_000;
+
+/// 45.3 — one own stream's KeyframeWanted state.
+#[derive(Debug, Clone, Copy, Default)]
+struct KeyframeOwed {
+    /// A video frame was held or dropped since the event last fired.
+    owed: bool,
+    /// When the event last fired (call ms).
+    fired_at: Option<u64>,
+}
+
+/// 45.3 — `CallEvent::KeyframeWanted`'s rule, for one own frame of `stream`
+/// at `now_ms` (`video`: whether it is video; `sent`: whether it goes out,
+/// neither held by the budget nor dropped by row STALE). A video frame that
+/// does not go out makes a keyframe owed; a frame that goes out while one is
+/// owed returns `true` (and clears it) unless the event fired within
+/// [`KEYFRAME_WANTED_MIN_INTERVAL_MS`], in which case it stays owed.
+fn video_resumes(
+    state: &mut HashMap<StreamId, KeyframeOwed>,
+    stream: StreamId,
+    video: bool,
+    sent: bool,
+    now_ms: u64,
+) -> bool {
+    if !video {
+        return false;
+    }
+    let k = state.entry(stream).or_default();
+    if !sent {
+        k.owed = true;
+        return false;
+    }
+    let spaced = k
+        .fired_at
+        .is_none_or(|at| now_ms.saturating_sub(at) >= KEYFRAME_WANTED_MIN_INTERVAL_MS);
+    if k.owed && spaced {
+        k.owed = false;
+        k.fired_at = Some(now_ms);
+        return true;
+    }
+    false
 }
 
 /// 45.3 — the egress budget's class of a media chunk.
@@ -5318,7 +5517,8 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
         if !Shared::lock(&shared.alm).speaks_c3(&o.to) {
             continue;
         }
-        if is_periodic(&o.frame) {
+        // 45.3 — a stamp goes in order with the period's offers, after them.
+        if is_periodic(&o.frame) || is_stamp(&o.frame) {
             offers.entry(o.to.clone()).or_default().push(o);
             continue;
         }
@@ -5635,6 +5835,41 @@ async fn send_offers_paced(shared: &Arc<Shared>, frames: Vec<alm::Outgoing>) {
     }
 }
 
+/// 45.3 (R29 OFFER-AS-LIFE) — a backlog STAMP heard from `peer`: checked as
+/// a chunk is (the stream's bound chunk key, not behind the highest chunk
+/// verified), its age judged net of the backlog it declares, with the
+/// publisher's clock offset cancelled by the stream's latency floor (raw
+/// when no floor is confirmed yet). A stamp that fails is dropped and
+/// counted with the chunks; one that holds goes to the selector and, for a
+/// relay, on to its children byte for byte.
+fn on_backlog_stamp(
+    shared: &Arc<Shared>,
+    peer: &str,
+    frame: &[u8],
+    st: &crate::transport::av_chunk_auth::BacklogStamp,
+) {
+    if let Err(e) = shared.auth.check_stamp(st) {
+        shared.count(crate::observability::AV_BACKLOG_STAMP_REFUSED);
+        tracing::debug!(target: "ciris_edge::stamp", node = %shared.own, peer = %peer, error = %e, "stamp refused");
+        return;
+    }
+    let mut a = Shared::lock(&shared.alm);
+    // No floor yet (nothing of the stream heard): the stamp is not judged
+    // for freshness, it excuses nothing, and it owes a first chunk its
+    // backlog only (`OfferAsLife.tla` "graceraw").
+    let age = a.stamp_age_ms(st.stream, st.epoch, st.sent_ms);
+    let net =
+        age.map(|age| u64::try_from(age.saturating_sub(i64::from(st.backlog_ms))).unwrap_or(0));
+    tracing::debug!(target: "ciris_edge::stamp", node = %shared.own, peer = %peer, ?age, backlog = st.backlog_ms, ?net, "stamp heard");
+    a.on_stamp(
+        peer,
+        st.stream,
+        frame.to_vec(),
+        u64::from(st.backlog_ms),
+        net,
+    );
+}
+
 /// One C3 frame from `peer`. A dialler hearing the responder's CAPS on its
 /// own leg answers with its own (`reply_caps`); a peer that takes timed
 /// frames gets its media timed from now on.
@@ -5689,6 +5924,11 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
                     bump_layer_view(shared, cf.stream);
                 }
                 (a.on_control(peer, cf, rtt), None, false, false, false)
+            }
+            Ok(WireFrame::Stamp(st)) => {
+                drop(a);
+                on_backlog_stamp(shared, peer, bytes, &st);
+                return;
             }
             Err(e) => {
                 a.note_malformed(e);
@@ -5950,23 +6190,37 @@ async fn pump(
         // queue made it so. Dropped and counted like a per-hop stale chunk,
         // never delivered and never relayed on. The per-hop queue test above
         // stands beside it.
-        if is_stale_end_to_end(latency_ms) && !Shared::lock(&shared.alm).queue_rules_off() {
-            let mut a = Shared::lock(&shared.alm);
-            a.counts.stale_dropped += 1;
-            a.note_stale_end_to_end(stream, latency_ms.unwrap_or_default());
-            drop(a);
-            shared.count(crate::observability::AV_FRAME_STALE_DROPPED);
-            continue;
-        }
-        // Forward as an admitted media parent (ALM), and first-hand copies to
-        // pre-C3 members when this node relays (the legacy relay). The
-        // signature travels with the chunk.
         let job = ForwardJob {
             stream,
             link_stream: own_stream,
             publisher: publisher.to_string(),
             base_or_audio,
         };
+        if is_stale_end_to_end(latency_ms) && !Shared::lock(&shared.alm).queue_rules_off() {
+            // R31 — a stale chunk is the publisher's signed word that its
+            // media is late: `peer` is excused by it, and one a period goes on
+            // to this node's children as theirs (never delivered there either:
+            // it is stale by their floor too).
+            let witness = {
+                let mut a = Shared::lock(&shared.alm);
+                a.counts.stale_dropped += 1;
+                a.note_stale_end_to_end(
+                    stream,
+                    peer,
+                    signed.chunk_seq().0,
+                    latency_ms.unwrap_or_default(),
+                )
+            };
+            shared.count(crate::observability::AV_FRAME_STALE_DROPPED);
+            if witness {
+                shared.count(crate::observability::AV_STALE_WITNESS_FORWARDED);
+                forward(shared, &signed, peer, &job).await;
+            }
+            continue;
+        }
+        // Forward as an admitted media parent (ALM), and first-hand copies to
+        // pre-C3 members when this node relays (the legacy relay). The
+        // signature travels with the chunk.
         let delay = shared.test_relay_delay_ms.load(Ordering::Relaxed);
         if delay == 0 {
             forward(shared, &signed, peer, &job).await;
@@ -6795,7 +7049,6 @@ async fn watch_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(WATCH_TICK);
     let mut n: u64 = 0;
     let mut sent_expired: HashMap<[u8; 16], LegCounters> = HashMap::new();
-    let mut unproved: HashMap<[u8; 16], (u16, Instant)> = HashMap::new();
     let mut roll_failure: Option<(String, Instant)> = None;
     loop {
         tick.tick().await;
@@ -6822,7 +7075,7 @@ async fn watch_loop(shared: Arc<Shared>) {
         }
         reconcile_legs(&shared);
         let _ = apply_pending_replace(&shared, false).await;
-        alm_tick(&shared, &mut sent_expired, &mut unproved).await;
+        alm_tick(&shared, &mut sent_expired).await;
         settle_ends(&shared);
         check_lost(&shared);
     }
@@ -7053,50 +7306,32 @@ struct LegCounters {
 }
 
 #[allow(clippy::too_many_lines)] // the watch tick's ALM pass, in order
-async fn alm_tick(
-    shared: &Arc<Shared>,
-    sent_expired: &mut HashMap<[u8; 16], LegCounters>,
-    unproved: &mut HashMap<[u8; 16], (u16, Instant)>,
-) {
+async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], LegCounters>) {
     let legs: Vec<(String, [u8; 16])> = Shared::lock(&shared.out_legs)
         .iter()
         .map(|(p, l)| (p.clone(), l.link_id))
         .collect();
-    // G8 — how long each leg's oldest unproved Channel message has waited.
-    let now = Instant::now();
+    // G8 — how long each leg's oldest unproved Channel message has waited,
+    // FROM ITS SEND (the send clock, 45.3 model R24: the verdict's own
+    // "oldest since" age restarted whenever an older message was proved, so
+    // under a standing queue it read near zero).
+    let clocks = uplink_backlog(shared, &legs);
     let mut stalled_legs = 0usize;
     let mut measurable = 0usize;
     let mut backlogged: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut worst_ms = 0u64;
     for (peer, link) in &legs {
-        let st = shared.transport.av_link_stats(link);
-        match st.and_then(|st| st.oldest_unacked_seq) {
-            Some(seq) => {
-                measurable += 1;
-                let (since, carried) = match unproved.get(link) {
-                    Some((s, t)) if *s == seq => (*t, true),
-                    _ => {
-                        unproved.insert(*link, (seq, now));
-                        (now, false)
-                    }
-                };
-                let age = u64::try_from(now.duration_since(since).as_millis()).unwrap_or(u64::MAX);
-                worst_ms = worst_ms.max(age);
-                if age >= alm::UPLINK_STALL_MS {
-                    stalled_legs += 1;
-                }
-                let floor = st.and_then(|st| st.min_rtt_ms).unwrap_or(0);
-                if carried && age.saturating_sub(floor) >= alm::UPLINK_BACKLOG_MS {
-                    backlogged.insert(peer.clone());
-                }
+        if let Some(LegBacklog::Outstanding { age_ms, floor_ms }) = clocks.get(link) {
+            measurable += 1;
+            worst_ms = worst_ms.max(*age_ms);
+            if *age_ms >= alm::UPLINK_STALL_MS {
+                stalled_legs += 1;
             }
-            None => {
-                unproved.remove(link);
+            if age_ms.saturating_sub(*floor_ms) >= alm::UPLINK_BACKLOG_MS {
+                backlogged.insert(peer.clone());
             }
         }
     }
-    unproved.retain(|l, _| legs.iter().any(|(_, x)| x == l));
-    uplink_backlog(shared, &legs);
     {
         let ins: Vec<[u8; 16]> = Shared::lock(&shared.in_links).keys().copied().collect();
         Shared::lock(&shared.evidence_at)

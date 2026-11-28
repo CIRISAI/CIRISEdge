@@ -1315,8 +1315,9 @@ impl ReplicationCoordinator {
         self.book_wire_built(msg, bytes.len());
         // 45.3 — the egress class from the message's row family (CC
         // review: FIRST unless every row is positively bulk).
-        crate::transport::egress_budget::sending_as(
+        crate::transport::egress_budget::sending_as_family(
             super::egress_class::class_of(msg),
+            super::egress_class::family_of(msg),
             self.transport.send(&self.peer_key_id, &bytes),
         )
         .await
@@ -1543,8 +1544,9 @@ impl ReplicationCoordinator {
         self.book_wire_built(msg, bytes.len());
         // 45.3 — the egress class from the message's row family (CC
         // review: FIRST unless every row is positively bulk).
-        crate::transport::egress_budget::sending_as(
+        crate::transport::egress_budget::sending_as_family(
             super::egress_class::class_of(msg),
+            super::egress_class::family_of(msg),
             self.transport.send(&self.peer_key_id, &bytes),
         )
         .await
@@ -1801,8 +1803,9 @@ impl ReplicationCoordinator {
         self.book_wire_built(msg, bytes.len());
         // 45.3 — the egress class from the message's row family (CC
         // review: FIRST unless every row is positively bulk).
-        crate::transport::egress_budget::sending_as(
+        crate::transport::egress_budget::sending_as_family(
             super::egress_class::class_of(msg),
+            super::egress_class::family_of(msg),
             self.transport.send(&self.peer_key_id, &bytes),
         )
         .await

@@ -496,7 +496,8 @@ pub use ffi::uniffi_types::{
 };
 #[cfg(feature = "ffi-uniffi")]
 pub use ffi::uniffi_types::{
-    EdgeDeviceState, EdgeNatReport, EdgeOnionStatus, EdgeShapingClassInfo, EdgeShapingStatus,
+    EdgeDeviceState, EdgeNatReport, EdgeOnionStatus, EdgePeerReach, EdgeReachState,
+    EdgeShapingClassInfo, EdgeShapingStatus,
 };
 
 // UDL function bodies live in `ffi::uniffi_impl` — re-exported here
@@ -524,7 +525,9 @@ pub use ffi::uniffi_impl::{
 // these up by bare name at the crate root, the same pattern v0.13.0
 // established for the #25 / #26 / #28 / #31 reads cut.
 #[cfg(feature = "ffi-uniffi")]
-pub use ffi::uniffi_impl_links::{link_count, link_list, link_open, link_request, link_teardown};
+pub use ffi::uniffi_impl_links::{
+    link_count, link_list, link_open, link_request, link_teardown, peer_reach,
+};
 
 // v0.15.0 (CIRISEdge#33) — Routing-table FFI bodies. Same crate-root
 // bare-name discipline; the scaffolding's marshalling shells look up

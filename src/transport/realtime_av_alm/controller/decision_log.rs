@@ -98,6 +98,19 @@ impl DecisionLog {
         value: i64,
         reason: &'static str,
     ) {
+        // 45.3 — every ALM decision, readable in a field log
+        // (`RUST_LOG=ciris_edge::alm_decision=debug`): which node chose what
+        // about whom and why. Key ids only, never an address.
+        tracing::debug!(
+            target: "ciris_edge::alm_decision",
+            at_ms,
+            node = ?node,
+            ?kind,
+            subject = ?subject,
+            value,
+            reason,
+            "ALM decision"
+        );
         self.buf.clear();
         self.buf.extend_from_slice(&at_ms.to_be_bytes());
         node.encode(&mut self.buf);

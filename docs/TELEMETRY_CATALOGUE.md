@@ -308,7 +308,13 @@ counts handshakes whose link closed in the queue: they cost no crypto.
 3. `av_frame_held_budget` counts media frames the budget did not admit
    (whole frames of own media; single chunks a relay forwards);
    `av_video_keyframe_wanted` counts each video resume after held frames;
-   `av_bulk_deferred_budget` counts identity-plane sends that waited.
+   `av_bulk_deferred_budget` counts identity-plane sends that waited;
+   `egress_first_on_resource` counts FIRST-class envelopes that went as a
+   Resource (the transport schedules a Resource as bulk);
+   `av_backlog_stamp_refused` counts publishers' backlog stamps refused
+   (no bound key, a bad signature, or behind the highest chunk verified);
+   `av_stale_witness_forwarded` counts stale chunks a relay passed on to its
+   children as their excuse (one a stream per offer period).
 4. Over 800 ms, `av_chunk_dropped_stale_at_sender` counts media (audio
    included) not sent because it would arrive stale (row STALE).
    `alm_drain_entered` counts backlog episodes (400 ms in, under 200 ms for a

@@ -585,8 +585,8 @@ pub struct ScopeAddressTable {
     deriver: Arc<dyn DestinationDeriver>,
     inner: RwLock<Inner>,
     /// 45.1.1 — bumped by every write that can make an address appear
-    /// (install, refresh, install-next, activate-next), after the write
-    /// lock is released. The blob puller reads it to wake a pull parked on
+    /// (install, refresh, install-next, activate-next), and (v45.3) by a
+    /// group's removal, after the write lock is released. The blob puller reads it to wake a pull parked on
     /// a group that was not installed when it ran.
     generation: std::sync::atomic::AtomicU64,
     /// CIRISEdge#1029 F5 — the generation, announced: a write's bump is
@@ -945,6 +945,9 @@ impl ScopeAddressTable {
     /// Forget a group entirely — every epoch, every member, both
     /// indexes. Returns the number of addresses removed.
     pub fn remove_group(&self, scope: &CohortScope, group_id: &str) -> usize {
+        // v45.3 — a removal is announced too: a peer's standing
+        // (`shares_group_with`) can end with it. A reader woken by it re-reads.
+        let _bump = BumpOnDrop(&self.generation, &self.changes);
         let mut guard = self.inner.write();
         let inner = &mut *guard;
         let reverse = &mut inner.reverse;

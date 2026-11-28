@@ -118,11 +118,30 @@ pub enum SendClass {
 
 tokio::task_local! {
     static SEND_CLASS: SendClass;
+    static SEND_FAMILY: &'static str;
 }
 
 /// Run `send` as a `class` send: the transport reads it at the send.
 pub async fn sending_as<F: std::future::Future>(class: SendClass, send: F) -> F::Output {
     SEND_CLASS.scope(class, send).await
+}
+
+/// [`sending_as`], naming the send's family: the `av_plane` label its bytes
+/// are counted under when it rides FIRST (a family prefix, never content).
+pub async fn sending_as_family<F: std::future::Future>(
+    class: SendClass,
+    family: &'static str,
+    send: F,
+) -> F::Output {
+    SEND_CLASS
+        .scope(class, SEND_FAMILY.scope(family, send))
+        .await
+}
+
+/// The family of the send in progress, as [`sending_as_family`] named it.
+#[must_use]
+pub fn current_send_family() -> Option<&'static str> {
+    SEND_FAMILY.try_with(|f| *f).ok()
 }
 
 /// The class of the send in progress: what [`sending_as`] said, else FIRST
@@ -219,18 +238,28 @@ impl BudgetCore {
     /// Control is always taken.
     pub fn take(&mut self, now_ms: u64, class: Class, bits: f64) -> bool {
         self.refill(now_ms);
+        // Whether a bulk send goes through the floor (the main bucket has no
+        // room past audio's and video's reserve). Only those debit the
+        // floor: a bulk send the main bucket serves owes the floor nothing,
+        // so the floor's debt is bounded by one send (45.3 model R28).
+        let mut via_floor = false;
         let ok = match (self.rate, class) {
             (None, _) | (_, Class::Control) => true,
             (Some(r), Class::Audio) => self.tokens >= 0.0 || self.tokens + r * 0.02 >= bits,
             (Some(r), Class::Video) => self.tokens - bits >= r * VIDEO_RESERVE_MS / 1_000.0,
             (Some(r), Class::Bulk) => {
-                self.tokens - bits >= r * BULK_RESERVE_MS / 1_000.0 || self.floor_tokens >= 0.0
+                if self.tokens - bits >= r * BULK_RESERVE_MS / 1_000.0 {
+                    true
+                } else {
+                    via_floor = self.floor_tokens >= 0.0;
+                    via_floor
+                }
             }
         };
         if ok {
             if self.rate.is_some() {
                 self.tokens -= bits;
-                if class == Class::Bulk {
+                if via_floor {
                     self.floor_tokens -= bits;
                 }
             }
@@ -336,6 +365,55 @@ impl EgressBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 45.3 model R28 — the floor's debt is bounded: a long bulk burst the
+    /// main bucket serves (no media) owes the floor nothing, so when media
+    /// then takes the main bucket bulk still goes within one floor refill of
+    /// a send, not after repaying the burst at the floor's rate. Before the
+    /// fix every bulk take debited the floor, and bulk waited seconds.
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a ms bound
+    fn bulk_waits_one_floor_refill_after_a_long_burst_not_its_debt() {
+        let mut b = BudgetCore::default();
+        // A budget in force at 1 Mbit/s.
+        for t in (0..1_100).step_by(10) {
+            assert!(b.take(t, Class::Video, 10_000.0));
+        }
+        b.observe(1_100, Some(1_000));
+        let r = b.rate_bps().expect("a budget");
+        // A long bulk burst with no media: ten seconds of 1.2 kB sends, as
+        // fast as the main bucket serves them.
+        let send = 9_600.0;
+        let mut t = 1_100;
+        while t < 11_100 {
+            let _ = b.take(t, Class::Bulk, send);
+            t += 5;
+        }
+        assert!(
+            b.floor_tokens >= -send,
+            "the floor owes at most one send: {} under rate {r}",
+            b.floor_tokens
+        );
+        // Full media from now: video takes all the main bucket allows every
+        // 5 ms. Bulk asks every 5 ms; how long until it goes?
+        let started = t;
+        let mut served_at = None;
+        while t < started + 10_000 {
+            while b.take(t, Class::Video, 4_000.0) {}
+            if b.take(t, Class::Bulk, send) {
+                served_at = Some(t);
+                break;
+            }
+            t += 5;
+        }
+        let waited = served_at.map(|s| s - started);
+        // One send at the floor's rate, and a refill tick.
+        let bound = (send / BudgetCore::floor_of(r) * 1_000.0) as u64 + 10;
+        assert!(
+            waited.is_some_and(|w| w <= bound),
+            "bulk waited {waited:?} ms behind full media (bound {bound} ms)"
+        );
+    }
 
     /// Uncapped there is no budget and nothing is held; the first reading
     /// over the bound starts one from what edge was sending, decreased.

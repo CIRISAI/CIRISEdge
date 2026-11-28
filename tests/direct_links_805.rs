@@ -96,13 +96,124 @@ fn free_udp_port() -> u16 {
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_test_writer()
+        .with_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "warn,ciris_edge=info".into()),
-        )
-        .with_test_writer()
+        );
+    let _ = tracing_subscriber::registry()
+        .with(fmt)
+        .with(ProbeMappings)
+        .with(ProposalLines)
         .try_init();
+}
+
+/// 45.3 — the links leviculum proposed on (its `direct link: proposing`
+/// line, link id in hex), in order: the witness of a background
+/// re-proposal, which edge does not see.
+static PROPOSALS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+struct ProposalLines;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProposalLines {
+    fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        #[derive(Default)]
+        struct Fields {
+            message: Option<String>,
+            link: Option<String>,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                if f.name() == "link" {
+                    self.link = Some(v.to_owned());
+                }
+            }
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                match f.name() {
+                    "message" => self.message = Some(format!("{v:?}")),
+                    "link" => self.link = Some(format!("{v:?}")),
+                    _ => {}
+                }
+            }
+        }
+        if !e.metadata().target().starts_with("leviculum_core") {
+            return;
+        }
+        let mut f = Fields::default();
+        e.record(&mut f);
+        if f.message.as_deref() == Some("direct link: proposing") {
+            if let Some(link) = f.link {
+                PROPOSALS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(link);
+            }
+        }
+    }
+}
+
+/// leviculum's `direct link: proposing` lines seen so far for `link`.
+fn proposing_lines(link: [u8; 16]) -> usize {
+    let want = hex::encode(link);
+    PROPOSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|l| **l == want)
+        .count()
+}
+
+/// 45.3 — every leviculum facilitator-probe diagnostic's `mapping` word,
+/// in order (target `direct_link_diag`, `event = "probe"`): the NAT class
+/// the probing node arrived at. No address is ever in it.
+static PROBE_MAPPINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+struct ProbeMappings;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeMappings {
+    fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Fields {
+            event: Option<String>,
+            mapping: Option<String>,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                match f.name() {
+                    "event" => self.event = Some(v.to_owned()),
+                    "mapping" => self.mapping = Some(v.to_owned()),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.record_str(f, format!("{v:?}").trim_matches('"'));
+            }
+        }
+        if e.metadata().target() != "direct_link_diag" {
+            return;
+        }
+        let mut f = Fields {
+            event: None,
+            mapping: None,
+        };
+        e.record(&mut f);
+        if let (Some("probe"), Some(m)) = (f.event.as_deref(), f.mapping) {
+            PROBE_MAPPINGS.lock().expect("probe mappings").push(m);
+        }
+    }
+}
+
+/// How many probe diagnostics so far reported `mapping`.
+fn probes_reporting(mapping: &str) -> usize {
+    PROBE_MAPPINGS
+        .lock()
+        .expect("probe mappings")
+        .iter()
+        .filter(|m| *m == mapping)
+        .count()
 }
 
 /// A production-shaped identity (as `av_spine_live_node_805`): a hybrid
@@ -265,6 +376,10 @@ async fn try_transport_node(tcp_port: u16, facilitator_port: u16) -> Result<Reti
     // `DirectLinkSettings` is #[non_exhaustive]: from its default.
     let mut facilitator = leviculum_std::direct_link::DirectLinkSettings::default();
     facilitator.facilitator_port = Some(facilitator_port);
+    // 45.3 — T is the canonical's shape: it answers probes on the next UDP
+    // port too (the second NAT observer its probers derive). Nothing probes
+    // it unless a side names `facilitator2`.
+    facilitator.facilitator_second_port = true;
     let mut node = ReticulumNodeBuilder::new()
         .enable_transport(true)
         .add_interface_config(leviculum_std::config::InterfaceConfig {
@@ -518,7 +633,15 @@ async fn trio_shaped(
     };
     let facilitator = format!("127.0.0.1:{f_port}");
     let fill = |c: DirectLinksConfig| DirectLinksConfig {
-        facilitator: c.facilitator.map(|_| facilitator.clone()),
+        // A placeholder facilitator is `T`'s; one a test named is kept.
+        facilitator: c
+            .facilitator
+            .map(|f| if f.is_empty() { facilitator.clone() } else { f }),
+        // A placeholder second observer is T's derived one.
+        facilitator2: c.facilitator2.map(|_| {
+            ciris_edge::transport::direct_path::second_observer_of(&facilitator)
+                .expect("T's next port")
+        }),
         ..c
     };
 
@@ -2449,6 +2572,395 @@ async fn a_send_to_a_room_peer_brings_the_link_direct_915() {
         .send(&p.b.key.key_id, b"room-915-3")
         .await
         .expect("a send with T gone rides the punched interface");
+}
+
+/// **45.3 — the second NAT observer** (Eric, 11-22: the canonical's UDP port
+/// dial + 1). `T` answers probes on its facilitator port and the next one.
+/// A room peer pair that probes both classifies its NAT: the probe
+/// diagnostic reports a mapping class (`endpoint_independent` on loopback:
+/// both observers saw the same mapping; leviculum never counts loopback as
+/// a host candidate), and the link comes up direct. A pair with no second
+/// observer still comes up direct as today and classifies nothing: no
+/// probe of it reports a class. Only a side naming `facilitator2` can
+/// produce a classified line, so the counts are this test's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_observer_on_the_facilitators_next_port_classifies_the_nat() {
+    let second = |c: DirectLinksConfig| DirectLinksConfig {
+        // Replaced by T's derived second observer in `trio`.
+        facilitator2: Some(String::new()),
+        ..c
+    };
+    let mut p = trio("nat2", second(proposer()), second(answerer())).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    let classified_before = probes_reporting("endpoint_independent");
+    p.a.transport
+        .send(&p.b.key.key_id, b"nat2-1")
+        .await
+        .expect("A's send to B ships through T");
+    next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the link comes up direct");
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            probes_reporting("endpoint_independent") > classified_before
+        })
+        .await,
+        "a probe with two observers reports a mapping class: {:?}",
+        PROBE_MAPPINGS.lock().expect("probe mappings")
+    );
+    drop(p);
+    // Settled: no classified line of the first pair still on its way.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let classified = probes_reporting("endpoint_independent");
+    let mut q = trio("nat1", proposer(), answerer()).await;
+    let (_spine, _b_addr) = open_call(&q).await;
+    q.a.transport
+        .send(&q.b.key.key_id, b"nat1-1")
+        .await
+        .expect("A's send to B ships through T");
+    next_event(&mut q.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("with no second observer the link still comes up direct");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        probes_reporting("endpoint_independent"),
+        classified,
+        "a node with no second observer classifies nothing"
+    );
+}
+
+/// **v45.3 `peer_reach`** — before any send B is pathed through `T` with no
+/// live link (Dialable, two hops); once a room send has brought the link
+/// direct, B is Live over a punched interface, and the pair is not read
+/// (the live link answers first).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_reach_reads_dialable_then_live_and_direct() {
+    use ciris_edge::transport::peer_reach::ReachState;
+    let mut p = trio("pr453", proposer(), answerer()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    let relayed = p.a.transport.peer_reach(&p.b.key.key_id).await;
+    assert_eq!(relayed.state, ReachState::Dialable, "{relayed:?}");
+    assert!(relayed.has_path && !relayed.live_link && !relayed.direct);
+    assert_eq!(relayed.path_hops, Some(2), "through T");
+    p.a.transport
+        .send(&p.b.key.key_id, b"reach-453")
+        .await
+        .expect("A's send to B ships through T");
+    let up = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await;
+    assert!(up.is_some(), "the link comes up direct");
+    let direct = p.a.transport.peer_reach(&p.b.key.key_id).await;
+    assert_eq!(direct.state, ReachState::Live, "{direct:?}");
+    assert!(direct.live_link && direct.direct, "{direct:?}");
+    assert_eq!(
+        direct.transit_pair, None,
+        "a live link answers before the pair"
+    );
+}
+
+// ─── v45.3: one address predicate on both sides ────────────────────────
+
+/// The call's group id on the scope table (`open_call`'s stream).
+fn call_group() -> String {
+    let stream = StreamId(sha2::Sha256::digest(b"av-stream-805-direct").into());
+    av_addressing::stream_group_id(stream)
+}
+
+/// [`answerer`] on the `identified_only` accept setting.
+fn identified_only_answerer() -> DirectLinksConfig {
+    DirectLinksConfig {
+        accept: DirectAccept::IdentifiedOnly,
+        ..answerer()
+    }
+}
+
+/// **v45.3** — `identified_only` follows the room/contact rule: B on it,
+/// sharing no room with A and not naming A a contact, refuses A's proposal
+/// (A names B a contact, so A proposes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identified_only_refuses_a_stranger_453() {
+    let mut p = trio("i453", proposer(), identified_only_answerer()).await;
+    assert!(p.a.transport.allow_direct_contact(&p.b.key.key_id));
+    assert!(!p.b.transport.should_accept_direct(&p.a.key.key_id));
+    p.a.transport
+        .send(&p.b.key.key_id, b"stranger-453")
+        .await
+        .expect("A's send to B ships through T");
+    let asked = next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Requested { .. })
+    })
+    .await
+    .expect("B is asked: identified_only is answered by edge");
+    assert!(
+        matches!(
+            asked,
+            DirectPathEvent::Requested {
+                accepted: false,
+                ..
+            }
+        ),
+        "B refuses a stranger: {asked:?}"
+    );
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_refused"), 1);
+    assert_eq!(p.b.metrics.direct_links_active(), 0);
+    assert_eq!(p.a.metrics.direct_links_active(), 0);
+}
+
+/// Bring A↔B direct over a room send; the identity link.
+async fn direct_over_a_room(p: &mut Trio) -> [u8; 16] {
+    p.a.transport
+        .send(&p.b.key.key_id, b"room-453")
+        .await
+        .expect("A's send to B ships through T");
+    let up = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the link comes up direct");
+    let DirectPathEvent::Established { link_id, .. } = up else {
+        unreachable!()
+    };
+    link_id
+}
+
+/// **v45.3, the answering side** — a direct link's escalation is the address
+/// predicate on both ends (true for room peers), and it is re-read when
+/// standing ends: B leaves the room, so B hands leviculum `false` for the
+/// link and moves it back onto the relay, and A sees the direct path lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_leaves_the_room_loses_the_direct_path_on_both_ends_453() {
+    let mut p = trio("l453", proposer(), answerer()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    let link = direct_over_a_room(&mut p).await;
+    let b_has = wait_until(Duration::from_secs(5), || async {
+        p.b.transport.direct_link_escalation_for_test(link) == Some(true)
+    })
+    .await;
+    assert!(b_has, "B's escalation on the link is the predicate's true");
+    assert_eq!(
+        p.a.transport.direct_link_escalation_for_test(link),
+        Some(true)
+    );
+
+    let _ = p.b.lifecycle.leave(&scope(), &call_group());
+    assert!(!p.b.transport.should_accept_direct(&p.a.key.key_id));
+    let lost = next_event(&mut p.a.events, Duration::from_secs(10), |e| {
+        matches!(e, DirectPathEvent::Lost { .. })
+    })
+    .await;
+    assert!(lost.is_some(), "A sees the direct path lost");
+    assert_eq!(
+        p.b.transport.direct_link_escalation_for_test(link),
+        Some(false)
+    );
+    assert_eq!(dl(&p.b.metrics, "direct_link_retired_no_standing"), 1);
+    assert!(p.b.transport.direct_link_interface(link).is_none());
+}
+
+/// **v45.3, the proposing side** — the anonymous tier activating is a
+/// standing change: A hands leviculum `false` for its direct link, moves it
+/// back onto the relay, and turns leviculum's background re-proposal off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anonymous_initiator_gives_up_its_direct_path_453() {
+    let mut p = trio("t453", proposer(), answerer()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    let link = direct_over_a_room(&mut p).await;
+    assert!(p.a.transport.direct_link_retry_enabled());
+    anonymous(&p.a);
+    p.a.transport.onion_refresh();
+    let gone = wait_until(Duration::from_secs(10), || async {
+        p.a.transport.direct_link_interface(link).is_none()
+    })
+    .await;
+    assert!(gone, "A moved the link back onto the relay");
+    assert_eq!(
+        p.a.transport.direct_link_escalation_for_test(link),
+        Some(false)
+    );
+    assert_eq!(dl(&p.a.metrics, "direct_link_retired_no_standing"), 1);
+    assert!(
+        !p.a.transport.direct_link_retry_enabled(),
+        "no background re-proposal while anonymous"
+    );
+}
+
+/// **v45.3, the background re-proposal** — A's proposal fails on its probe
+/// (its facilitator never answers), which leviculum re-proposes after its
+/// first backoff (60 s, up to a quarter more). A then leaves the room: its
+/// standing toward B ends, the pending re-proposal is dropped, and nothing
+/// proposes on the link past the backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_standing_stops_the_background_re_proposal_453() {
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the silent facilitator");
+    let silent_at = format!("127.0.0.1:{}", silent.local_addr().expect("addr").port());
+    let mut p = trio(
+        "b453",
+        DirectLinksConfig {
+            facilitator: Some(silent_at),
+            ..proposer()
+        },
+        answerer(),
+    )
+    .await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"probe-fails-453")
+        .await
+        .expect("A's send to B ships through T");
+    let failed = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Failed { .. })
+    })
+    .await
+    .expect("the proposal fails on its probe");
+    let DirectPathEvent::Failed { link_id: link, .. } = failed else {
+        unreachable!()
+    };
+    assert_eq!(proposing_lines(link), 1, "one proposal so far");
+
+    let _ = p.a.lifecycle.leave(&scope(), &call_group());
+    let dropped = wait_until(Duration::from_secs(5), || async {
+        dl(&p.a.metrics, "direct_link_retries_dropped") >= 1
+    })
+    .await;
+    assert!(dropped, "the lost standing dropped the pending re-proposal");
+    assert_eq!(
+        p.a.transport.direct_link_escalation_for_test(link),
+        Some(false)
+    );
+    // leviculum's first backoff, jittered up to a quarter more, and margin.
+    tokio::time::sleep(Duration::from_secs(80)).await;
+    assert_eq!(
+        proposing_lines(link),
+        1,
+        "nothing re-proposed on the link after the standing ended"
+    );
+    drop(silent);
+}
+
+// ─── v45.3 model R30: the predicate re-read at every step ───────────────
+
+/// **R30 (RetrySettled)** — A's proposal is still running (its probe toward
+/// a facilitator that never answers) when A's standing toward B ends. The
+/// proposal then fails, and leviculum re-arms its retry for it as it
+/// fails. Nothing proposes on the link past the retry's backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proposal_failing_after_the_standing_ended_is_not_retried_453() {
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the silent facilitator");
+    let silent_at = format!("127.0.0.1:{}", silent.local_addr().expect("addr").port());
+    let mut p = trio(
+        "r453",
+        DirectLinksConfig {
+            facilitator: Some(silent_at),
+            ..proposer()
+        },
+        answerer(),
+    )
+    .await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"in-flight-453")
+        .await
+        .expect("A's send to B ships through T");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            dl(&p.a.metrics, "direct_link_proposed") == 1
+        })
+        .await,
+        "A proposed"
+    );
+    // The standing ends while the probe is still waiting on its answers.
+    let _ = p.a.lifecycle.leave(&scope(), &call_group());
+    let failed = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Failed { .. })
+    })
+    .await
+    .expect("the proposal fails on its probe, after the standing ended");
+    let DirectPathEvent::Failed { link_id: link, .. } = failed else {
+        unreachable!()
+    };
+    assert_eq!(proposing_lines(link), 1, "one proposal so far");
+    // leviculum's first backoff, jittered up to a quarter more, and margin.
+    tokio::time::sleep(Duration::from_secs(80)).await;
+    assert_eq!(
+        proposing_lines(link),
+        1,
+        "nothing re-proposed on the link after the standing ended"
+    );
+    drop(silent);
+}
+
+/// **R30 (going direct is a standing event)** — B accepts A's proposal,
+/// then leaves the room while the session is still punching (B's signals
+/// reach A late). When the link goes direct anyway, B moves it back onto the
+/// relay at once, not at the next cadence recheck (off here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_goes_direct_after_the_standing_ended_is_retired_at_once_453() {
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut p = trio_uplink(
+        "d453",
+        proposer(),
+        answerer(),
+        None,
+        Some(Arc::clone(&held)),
+    )
+    .await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    p.b.transport.set_standing_recheck_off_for_test(true);
+    held.store(800, std::sync::atomic::Ordering::Relaxed);
+    p.a.transport
+        .send(&p.b.key.key_id, b"slow-session-453")
+        .await
+        .expect("A's send to B ships through T");
+    let asked = next_event(&mut p.b.events, Duration::from_secs(30), |e| {
+        matches!(e, DirectPathEvent::Requested { accepted: true, .. })
+    })
+    .await
+    .expect("B accepts A's proposal");
+    let DirectPathEvent::Requested { link_id: link, .. } = asked else {
+        unreachable!()
+    };
+    let _ = p.b.lifecycle.leave(&scope(), &call_group());
+    // The session goes direct anyway (the witness needs it to).
+    let _up = next_event(&mut p.b.events, Duration::from_secs(30), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the session still goes direct");
+    let retired = wait_until(Duration::from_secs(2), || async {
+        p.b.transport.direct_link_interface(link).is_none()
+    })
+    .await;
+    assert!(retired, "B moved the link back onto the relay at once");
+    assert_eq!(dl(&p.b.metrics, "direct_link_retired_no_standing"), 1);
+}
+
+/// **R30 (a silent tier switch)** — A's anonymous tier turns on through the
+/// tier's own state (its policy, deal and relays' liveness), with no call
+/// that tells the transport. A moves its direct link back onto the relay at
+/// once, not at the next cadence recheck (off here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tier_that_turns_on_by_itself_retires_the_direct_path_at_once_453() {
+    let mut p = trio("q453", proposer(), answerer()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    let link = direct_over_a_room(&mut p).await;
+    p.a.transport.set_standing_recheck_off_for_test(true);
+    anonymous(&p.a);
+    let gone = wait_until(Duration::from_secs(2), || async {
+        p.a.transport.direct_link_interface(link).is_none()
+    })
+    .await;
+    assert!(gone, "A moved the link back onto the relay at once");
+    assert_eq!(
+        p.a.transport.direct_link_escalation_for_test(link),
+        Some(false)
+    );
+    assert!(!p.a.transport.direct_link_retry_enabled());
 }
 
 /// **#915** — a send to a peer this node shares NO room with proposes

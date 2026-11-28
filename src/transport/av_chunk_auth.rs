@@ -750,6 +750,136 @@ impl ChunkSigner {
     }
 }
 
+// ─── the backlog stamp (45.3, R29 OFFER-AS-LIFE) ────────────────────
+
+/// The domain of a backlog stamp's signature.
+const BACKLOG_STAMP_DOMAIN: &[u8] = b"ciris-edge:av-backlog-stamp:v1";
+
+/// A backlog stamp's encoding: `stream_id[32] ‖ u64_be(epoch) ‖
+/// u64_be(sent_ms) ‖ u32_be(backlog_ms) ‖ u64_be(last_sealed_seq) ‖
+/// signature[64]`.
+pub const BACKLOG_STAMP_LEN: usize = 32 + 8 + 8 + 4 + 8 + CHUNK_SIG_LEN;
+
+/// 45.3 — a publisher's signed word that its own uplink is `backlog_ms`
+/// behind, at `sent_ms` (its clock), having sealed up to `last_sealed_seq`
+/// of `(stream, epoch)`. Signed by the stream's bound chunk key for that
+/// epoch (the key that signs each chunk's trailer), so a member relay checks
+/// it without the DEK, forwards it byte for byte, and can never mint one: a
+/// child excuses its parent's silence only on this word, never on a relay's
+/// own (CC Part 5; model row R29 OFFER-AS-LIFE). The limit: a publisher
+/// that lies about its own backlog delays failover only for its own stream.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BacklogStamp {
+    /// The stream.
+    pub stream: StreamId,
+    /// Its epoch.
+    pub epoch: u64,
+    /// The publisher's clock when it stamped (UNIX ms).
+    pub sent_ms: u64,
+    /// Its uplink's backlog then (ms).
+    pub backlog_ms: u32,
+    /// The highest `chunk_seq` it had sealed then.
+    pub last_sealed_seq: u64,
+    /// The chunk key's signature over the rest.
+    pub sig: [u8; CHUNK_SIG_LEN],
+}
+
+impl std::fmt::Debug for BacklogStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BacklogStamp")
+            .field("epoch", &self.epoch)
+            .field("sent_ms", &self.sent_ms)
+            .field("backlog_ms", &self.backlog_ms)
+            .field("last_sealed_seq", &self.last_sealed_seq)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BacklogStamp {
+    fn message(&self) -> Vec<u8> {
+        let mut m = Vec::with_capacity(BACKLOG_STAMP_DOMAIN.len() + 60);
+        m.extend_from_slice(BACKLOG_STAMP_DOMAIN);
+        m.extend_from_slice(&self.stream.0);
+        m.extend_from_slice(&self.epoch.to_be_bytes());
+        m.extend_from_slice(&self.sent_ms.to_be_bytes());
+        m.extend_from_slice(&self.backlog_ms.to_be_bytes());
+        m.extend_from_slice(&self.last_sealed_seq.to_be_bytes());
+        m
+    }
+
+    /// The stamp's encoding ([`BACKLOG_STAMP_LEN`] bytes).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(BACKLOG_STAMP_LEN);
+        v.extend_from_slice(&self.stream.0);
+        v.extend_from_slice(&self.epoch.to_be_bytes());
+        v.extend_from_slice(&self.sent_ms.to_be_bytes());
+        v.extend_from_slice(&self.backlog_ms.to_be_bytes());
+        v.extend_from_slice(&self.last_sealed_seq.to_be_bytes());
+        v.extend_from_slice(&self.sig);
+        v
+    }
+
+    /// Parse an encoding; `None` unless exactly [`BACKLOG_STAMP_LEN`] bytes.
+    #[must_use]
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() != BACKLOG_STAMP_LEN {
+            return None;
+        }
+        let u64_at = |i: usize| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&b[i..i + 8]);
+            u64::from_be_bytes(a)
+        };
+        let mut stream = [0u8; 32];
+        stream.copy_from_slice(&b[..32]);
+        let mut bl = [0u8; 4];
+        bl.copy_from_slice(&b[48..52]);
+        let mut sig = [0u8; CHUNK_SIG_LEN];
+        sig.copy_from_slice(&b[60..]);
+        Some(Self {
+            stream: StreamId(stream),
+            epoch: u64_at(32),
+            sent_ms: u64_at(40),
+            backlog_ms: u32::from_be_bytes(bl),
+            last_sealed_seq: u64_at(52),
+            sig,
+        })
+    }
+}
+
+impl ChunkSigner {
+    /// 45.3 — this key's [`BacklogStamp`]: its uplink is `backlog_ms` behind
+    /// at `sent_ms`, with `last_sealed_seq` sealed.
+    ///
+    /// # Errors
+    /// [`ChunkKeyError::Crypto`] when signing fails.
+    pub fn stamp_backlog(
+        &self,
+        sent_ms: u64,
+        backlog_ms: u32,
+        last_sealed_seq: u64,
+    ) -> Result<BacklogStamp, ChunkKeyError> {
+        let mut st = BacklogStamp {
+            stream: self.stream,
+            epoch: self.epoch.0,
+            sent_ms,
+            backlog_ms,
+            last_sealed_seq,
+            sig: [0u8; CHUNK_SIG_LEN],
+        };
+        let sig = self
+            .key
+            .sign(&st.message())
+            .map_err(|e| ChunkKeyError::Crypto(e.to_string()))?;
+        st.sig
+            .copy_from_slice(sig.get(..CHUNK_SIG_LEN).ok_or_else(|| {
+                ChunkKeyError::Crypto("an Ed25519 signature that is not 64 bytes".to_owned())
+            })?);
+        Ok(st)
+    }
+}
+
 // ─── the binding ────────────────────────────────────────────────────
 
 /// A publisher's hybrid-signed statement that `chunk_key` signs its stream's
@@ -1777,6 +1907,37 @@ impl ChunkAuth {
         held.bound.retain(|(s, _), _| *s != stream);
         held.codecs.remove(&stream);
         short
+    }
+
+    /// 45.3 — check a [`BacklogStamp`] as a chunk is checked: by the bound
+    /// chunk key of its `(stream, epoch)`, without the DEK. Returns its
+    /// publisher. A stamp under no bound key (a retired or unknown one
+    /// included) is `Unbound`; a bad signature is `TrailerInvalid`; a stamp
+    /// for a stretch of the stream already behind what this node verified
+    /// (its `last_sealed_seq` under the highest verified chunk) is refused
+    /// as `TrailerInvalid` too, so a stamp cannot be replayed across a gap.
+    /// Each refusal is counted with the chunks'.
+    ///
+    /// # Errors
+    /// [`ChunkAuthError::Unbound`] or [`ChunkAuthError::TrailerInvalid`].
+    pub fn check_stamp(&self, stamp: &BacklogStamp) -> Result<Arc<str>, ChunkAuthError> {
+        let Some(bound) = self.bound(stamp.stream, Epoch(stamp.epoch)) else {
+            self.unbound.fetch_add(1, Ordering::Relaxed);
+            return Err(ChunkAuthError::Unbound);
+        };
+        let ok = Ed25519Verifier::new()
+            .verify_strict(&bound.key, &stamp.message(), &stamp.sig)
+            .unwrap_or(false);
+        let behind = self
+            .held()
+            .highest
+            .get(&(stamp.stream, stamp.epoch))
+            .is_some_and(|h| stamp.last_sealed_seq < *h);
+        if !ok || behind {
+            self.forged.fetch_add(1, Ordering::Relaxed);
+            return Err(ChunkAuthError::TrailerInvalid);
+        }
+        Ok(bound.publisher)
     }
 
     /// The bound key for `(stream, epoch)`, if any.

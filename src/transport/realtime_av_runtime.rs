@@ -1855,10 +1855,20 @@ mod leviculum_link {
                     self.link_id
                 )));
             };
+            // 45.3 (leviculum ciris.5) — the scheduler's media kind: audio
+            // (CODEC_OPAQUE) leaves before video and is age-dropped on its
+            // own bound; anything else, a binding part included, is video.
+            let kind = if bytes.get(crate::transport::realtime_av::CHUNK_HEADER_LEN)
+                == Some(&crate::transport::realtime_av::CODEC_OPAQUE)
+            {
+                leviculum_std::MediaKind::Audio
+            } else {
+                leviculum_std::MediaKind::Video
+            };
             match self
                 .node
                 .link_handle(&self.link_id)
-                .try_send_unordered(&sealed)
+                .try_send_unordered_as(&sealed, kind)
             {
                 Ok(_sequence) => {
                     crate::transport::realtime_av_runtime::send_diag::note(

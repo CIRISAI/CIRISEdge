@@ -132,6 +132,20 @@ struct Cand<P> {
     /// offer (offer-as-life): a path owes chunks only from then on, as it
     /// owes them only from a stream's resume.
     excused_at_ms: Option<u64>,
+    /// 45.3 (R29) — the publisher's signed backlog word this candidate last
+    /// carried, verified by the caller: `(seen at, its net age then — `None`
+    /// when this node had no latency floor to judge it by — the declared
+    /// backlog)`, all ms. The only thing that excuses this candidate's
+    /// silence, or owes it a first-chunk grace.
+    stamp: Option<(u64, Option<u64>, u64)>,
+    /// 45.3 (R31) — when this candidate last carried a stale chunk of the
+    /// stream (verified, new by seq, within the cap): the publisher's own
+    /// signed media, late. Excuses its silence for [`OFFER_IS_LIFE_MS`].
+    stale_at: Option<u64>,
+    /// 45.3 (R31) — when this candidate's current run of stale-chunk
+    /// excuses began (cleared when it delivers or the run lapses): stale
+    /// chunks alone excuse for at most [`STALE_ONLY_EXCUSE_MS`] of it.
+    stale_since: Option<u64>,
 }
 
 /// One chunk as a path delivered it.
@@ -450,6 +464,9 @@ impl<P: PeerRef> ParentSelector<P> {
             offer_at_ms: now_ms,
             abandoned_at_ms: None,
             excused_at_ms: None,
+            stamp: None,
+            stale_at: None,
+            stale_since: None,
         })
     }
 
@@ -500,6 +517,51 @@ impl<P: PeerRef> ParentSelector<P> {
         }
     }
 
+    /// 45.3 (R29 OFFER-AS-LIFE) — candidate `from` carried the publisher's
+    /// signed backlog stamp, which the caller verified (bound chunk key, not
+    /// behind the highest verified chunk): it declares `backlog_ms`, and was
+    /// `net_age_ms` old net of that backlog when heard (its age by the
+    /// publisher's clock, the stream's floor offset cancelled, less the
+    /// declared backlog). While it stays within [`OFFER_IS_LIFE_MS`] net and
+    /// declares more than [`STALE_UPSTREAM_MS`], the candidate's silence is
+    /// excused; a new subscription's first chunk is owed its backlog. With no
+    /// floor to judge it by (`net_age_ms` `None`: nothing of the stream
+    /// heard yet) it excuses nothing, but a first chunk is still owed its
+    /// backlog (`OfferAsLife.tla` "graceraw": a liar gains one grace of at
+    /// most `down_silence_ms`, once). A relay's own word (its offer's
+    /// `upstream_latency_ms`) excuses nothing.
+    pub fn on_backlog_stamp(
+        &mut self,
+        now_ms: u64,
+        from: &P,
+        backlog_ms: u64,
+        net_age_ms: Option<u64>,
+    ) {
+        if let Some(c) = self.cands.get_mut(from) {
+            c.stamp = Some((now_ms, net_age_ms, backlog_ms));
+        }
+    }
+
+    /// 45.3 (R31 `RoomStamps.tla`) — candidate `from` carried a chunk of the
+    /// stream that the caller verified as the publisher's and judged stale
+    /// end to end (new by seq, within the cap). A stale chunk is the
+    /// publisher's signed word that its media is late, so the candidate's
+    /// silence is excused for [`OFFER_IS_LIFE_MS`]: it is forwarding nothing
+    /// because nothing fresh exists. It never reaches the candidate before
+    /// the media it excuses, as a stamp in the same queue does.
+    pub fn on_stale_witness(&mut self, now_ms: u64, from: &P) {
+        if let Some(c) = self.cands.get_mut(from) {
+            // The stale-only budget restarts only on a delivered chunk
+            // (`on_chunk` clears it), never on a lapse: a relay sending one
+            // witness every 3.5 s otherwise restarted its 5 s run each time
+            // and was held for ever (R32 RoomBuilt.tla, LiarOnlyBound).
+            if c.stale_since.is_none() {
+                c.stale_since = Some(now_ms);
+            }
+            c.stale_at = Some(now_ms);
+        }
+    }
+
     /// A media chunk from `from` (after the caller's dedupe or not — the
     /// meter is per path, so duplicates across paths are counted per path).
     pub fn on_chunk(&mut self, now_ms: u64, from: &P, chunk: PathChunk) {
@@ -520,6 +582,8 @@ impl<P: PeerRef> ParentSelector<P> {
         let Some(c) = self.cands.get_mut(from) else {
             return;
         };
+        // R31 — a delivered chunk ends any run of stale-chunk excuses.
+        c.stale_since = None;
         if !c.link.subscribed() {
             return;
         }
@@ -1339,9 +1403,36 @@ impl<P: PeerRef> ParentSelector<P> {
             // publisher's backlog dipped under the budget). A parent that
             // offers a fresh stream and sends nothing is a black hole, and
             // is failed over as before.
-            let excused = c.offer.as_ref().is_some_and(|o| {
-                o.forwarding && u64::from(o.upstream_latency_ms) > STALE_UPSTREAM_MS
-            }) && now_ms.saturating_sub(c.offer_at_ms) <= OFFER_IS_LIFE_MS;
+            // R29 — only the publisher's signed word, fresh net of the
+            // backlog it declares, excuses: a relay that claims a late
+            // upstream and sends nothing is failed over within the silence
+            // bound (the lying relay; `OfferAsLife.tla`).
+            let stamp_backlog = c.stamp.and_then(|(seen, age, backlog)| {
+                age.is_some_and(|age| {
+                    now_ms.saturating_sub(seen).saturating_add(age) <= OFFER_IS_LIFE_MS
+                })
+                .then_some(backlog)
+            });
+            // The first chunk's grace: a fresh stamp's backlog, or, with no
+            // floor yet to judge one by, the stamp's backlog unjudged.
+            let grace_backlog = stamp_backlog.or_else(|| {
+                c.stamp
+                    .and_then(|(_, age, backlog)| age.is_none().then_some(backlog))
+            });
+            // R31 (CC) — stale chunks alone excuse only as long as an honest
+            // publisher's first stamp takes to arrive: a relay that holds
+            // fresh chunks to make them stale cannot make the stamp, so past
+            // that only a stamp declaring the backlog excuses.
+            let stamped = stamp_backlog.is_some_and(|b| b > STALE_UPSTREAM_MS);
+            let stale_witness = c
+                .stale_at
+                .is_some_and(|at| now_ms.saturating_sub(at) <= OFFER_IS_LIFE_MS)
+                && (stamped
+                    || c.stale_since
+                        .is_some_and(|t| now_ms.saturating_sub(t) <= STALE_ONLY_EXCUSE_MS));
+            let excused = c.offer.as_ref().is_some_and(|o| o.forwarding)
+                && (stamped || stale_witness)
+                && now_ms.saturating_sub(c.offer_at_ms) <= OFFER_IS_LIFE_MS;
             if excused && c.link.subscribed() {
                 c.excused_at_ms = Some(now_ms);
             }
@@ -1379,11 +1470,10 @@ impl<P: PeerRef> ParentSelector<P> {
                     .meter
                     .last_arrival_ms()
                     .is_none_or(|a| a < c.subscribed_at);
+                // R29 — the grace is the publisher's signed backlog, never a
+                // relay's advertised latency (a liar kept 5 s past the bound).
                 let grace = if first_owed {
-                    c.offer
-                        .as_ref()
-                        .map_or(0, |o| u64::from(o.upstream_latency_ms))
-                        .min(down_silence_ms)
+                    grace_backlog.unwrap_or(0).min(down_silence_ms)
                 } else {
                     0
                 };
@@ -1829,6 +1919,12 @@ pub const OFFER_IS_LIFE_MS: u64 = 2_500;
 /// 45.3 — an upstream this late (ms) has nothing a receiver keeps: the
 /// receivers' media budget (`av_call::MEDIA_STALE_BUDGET`).
 pub const STALE_UPSTREAM_MS: u64 = 800;
+/// 45.3 (R31, CC) — the longest stale chunks alone excuse a parent's
+/// silence: an honest publisher's first stamp crosses its own queue in about
+/// 3.75 s (the composed model's trace), so with margin 5 s; past it, only a
+/// stamp declaring the backlog excuses (a relay holding fresh chunks to make
+/// them stale cannot make one).
+pub const STALE_ONLY_EXCUSE_MS: u64 = 5_000;
 
 #[cfg(test)]
 mod tests {
@@ -2309,6 +2405,7 @@ mod tests {
             t += 250;
             if t % 1_000 == 0 {
                 s.on_offer(t, late(&cfg), 20.0, &mut log);
+                s.on_backlog_stamp(t, &2, 3_000, Some(0));
             }
             let _ = s.tick(t, &mut rng, &mut log);
             assert_eq!(s.state_of(&2), Some(PeerState::Available), "at {t}");
@@ -2352,6 +2449,7 @@ mod tests {
         while e.primary().is_none() && et < 10_000 {
             if et % 1_000 == 0 {
                 e.on_offer(et, late(&cfg), 20.0, &mut log);
+                e.on_backlog_stamp(et, &2, 3_000, Some(0));
             }
             for a in e.tick(et, &mut rng, &mut log) {
                 if let SelectorAction::Subscribe { parent, role } = a {
@@ -2367,6 +2465,7 @@ mod tests {
             et += 250;
             if et % 1_000 == 0 {
                 e.on_offer(et, late(&cfg), 20.0, &mut log);
+                e.on_backlog_stamp(et, &2, 3_000, Some(0));
             }
             let _ = e.tick(et, &mut rng, &mut log);
         }
@@ -2387,11 +2486,44 @@ mod tests {
             }
             let _ = e.tick(et, &mut rng, &mut log);
             assert!(
-                et <= ended + cfg.down_silence_ms + 250,
+                et <= ended + OFFER_IS_LIFE_MS + cfg.down_silence_ms + 250,
                 "silence after the excuse is seen: failed over (at {et})"
             );
         }
         assert_ne!(e.state_of(&2), Some(PeerState::Available));
+        // R29 — a LYING relay: offers that claim a late upstream, no
+        // publisher stamp, no media. Its own word excuses nothing: failed
+        // over within the silence bound, as a black hole is. Mutation: the
+        // excuse read from the offer's upstream_latency_ms (45.3 before
+        // R29) keeps it Available for ever.
+        let mut l = ParentSelector::new(1u32, cfg.clone(), false);
+        l.set_members([1u32, 2]);
+        let mut lt = 0;
+        while l.primary().is_none() && lt < 10_000 {
+            if lt % 1_000 == 0 {
+                l.on_offer(lt, late(&cfg), 20.0, &mut log);
+            }
+            for a in l.tick(lt, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let d = AdmitDecision::Admit { role };
+                    let _ = l.on_decision(lt, &parent, &d, &mut rng, &mut log);
+                }
+            }
+            lt += 250;
+        }
+        l.on_chunk(lt, &2, at(1, false, 100, 5.0));
+        let lie_from = lt;
+        while l.state_of(&2) == Some(PeerState::Available) {
+            lt += 250;
+            if lt % 1_000 == 0 {
+                l.on_offer(lt, late(&cfg), 20.0, &mut log);
+            }
+            let _ = l.tick(lt, &mut rng, &mut log);
+            assert!(
+                lt <= lie_from + cfg.down_silence_ms + 250,
+                "a lying relay is failed over within the bound (at {lt})"
+            );
+        }
         // The offers stop: failed over within the offer's life plus the
         // silence bound (Suspected drops a primary with no standby to wait
         // on; it never reaches Down unsubscribed).
@@ -2405,6 +2537,50 @@ mod tests {
             );
         }
         assert_ne!(s.state_of(&2), Some(PeerState::Available));
+    }
+
+    /// 45.3 R31/R32 — a relay that manufactures stale chunks (holds fresh
+    /// ones, forwards them late) and delivers nothing is excused by them for
+    /// at most STALE_ONLY_EXCUSE_MS in all until it delivers: witnessing
+    /// every 3.5 s it is still failed over within that plus the silence
+    /// bound. Mutation: restarting the run on a lapse (45.3 before R32)
+    /// holds it for ever.
+    #[test]
+    fn a_relay_living_on_stale_chunks_alone_is_failed_over() {
+        let cfg = ControllerConfig::interactive();
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2]);
+        let mut rng = SplitMix64(13);
+        let mut log = DecisionLog::default();
+        let mut t = 0;
+        while s.primary().is_none() && t < 10_000 {
+            if t % 1_000 == 0 {
+                s.on_offer(t, offer(2, 4, &cfg), 20.0, &mut log);
+            }
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let d = AdmitDecision::Admit { role };
+                    let _ = s.on_decision(t, &parent, &d, &mut rng, &mut log);
+                }
+            }
+            t += 250;
+        }
+        s.on_chunk(t, &2, at(1, false, 100, 5.0));
+        let from = t;
+        while s.state_of(&2) == Some(PeerState::Available) {
+            t += 250;
+            if t % 1_000 == 0 {
+                s.on_offer(t, offer(2, 4, &cfg), 20.0, &mut log);
+            }
+            if (t - from) % 3_500 == 0 {
+                s.on_stale_witness(t, &2);
+            }
+            let _ = s.tick(t, &mut rng, &mut log);
+            assert!(
+                t <= from + STALE_ONLY_EXCUSE_MS + OFFER_IS_LIFE_MS + cfg.down_silence_ms + 250,
+                "a relay living on stale chunks is failed over (at {t})"
+            );
+        }
     }
 
     /// #945 item 3: a standby promoted to primary owes nothing from before

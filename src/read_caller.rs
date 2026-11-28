@@ -87,11 +87,13 @@ pub(crate) enum Site {
     /// The transport's round-start reach check (`round_carriable`,
     /// `undialable_now`).
     RoundCarriable,
+    /// v45.3 — the host's per-peer reach question (`peer_reach`).
+    PeerReach,
 }
 
 impl Site {
     /// Every site, in label order (the slot table's order).
-    pub(crate) const ALL: [Self; 27] = [
+    pub(crate) const ALL: [Self; 28] = [
         Self::AdvertiseRequired,
         Self::AdvertiseGroups,
         Self::AdvertiseWelcomes,
@@ -119,6 +121,7 @@ impl Site {
         Self::BlobDurability,
         Self::BundleSeats,
         Self::RoundCarriable,
+        Self::PeerReach,
     ];
 
     /// The label persist counts this site's reads under.
@@ -152,6 +155,7 @@ impl Site {
             Self::BlobDurability => "edge.blob.durability",
             Self::BundleSeats => "edge.bundle.seats",
             Self::RoundCarriable => "edge.transport.carriable",
+            Self::PeerReach => "edge.transport.peer_reach",
         }
     }
 

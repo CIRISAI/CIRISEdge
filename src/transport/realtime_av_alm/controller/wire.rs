@@ -22,7 +22,15 @@
 //!                   ‖ headroom_bps u64_be ‖ forwarder_headroom_bps u64_be
 //!                   ‖ upstream_latency_ms u32_be
 //!                   ‖ n u8 ‖ n × (len u16_be ‖ utf8 key id)   (ancestry, root first)
+//! STAMP       0x08  a publisher's signed backlog stamp, 124 bytes
+//!                   (`av_chunk_auth::BacklogStamp`; 45.3, R29 OFFER-AS-LIFE)
 //! ```
+//!
+//! **STAMP** (45.3) is sent only to a peer whose `CAPS` carry
+//! [`CAP_BACKLOG_STAMP`]: by the publisher with its offers while its own
+//! uplink is past the stale budget, and by a relay, byte for byte, the
+//! latest one it verified for the stream. A peer without the bit gets none
+//! and judges its parent by silence alone, as before 45.3.
 //!
 //! **The SUBSCRIBE layer cap** (v45; CC reads it as conformant in direction,
 //! a correction to 5.3.3.2.4's carriage sentence pending): a receiver asks
@@ -93,9 +101,14 @@ pub const CAP_LAYER_REQUEST: u32 = 1 << 4;
 /// to every peer).
 pub const CAP_BINDING_V2: u32 = 1 << 5;
 
+/// It takes `STAMP` frames (45.3): a publisher's signed backlog word, the
+/// only thing that excuses a parent's silence.
+pub const CAP_BACKLOG_STAMP: u32 = 1 << 6;
+
 /// What this build advertises (relay added per call; `CAP_LAYER_REQUEST`
 /// only behind the host's lever).
-pub const CAPS_THIS_BUILD: u32 = CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_LINK_DATAGRAMS | CAP_BINDING_V2;
+pub const CAPS_THIS_BUILD: u32 =
+    CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_LINK_DATAGRAMS | CAP_BINDING_V2 | CAP_BACKLOG_STAMP;
 
 const KIND_CAPS: u8 = 0x01;
 const KIND_SUBSCRIBE: u8 = 0x02;
@@ -104,6 +117,7 @@ const KIND_ADMIT: u8 = 0x04;
 const KIND_REFUSE: u8 = 0x05;
 const KIND_SHED: u8 = 0x06;
 const KIND_OFFER: u8 = 0x07;
+const KIND_STAMP: u8 = 0x08;
 
 /// `SUBSCRIBE` flags: the requester can forward.
 const SUB_FORWARD_CAPABLE: u8 = 1 << 0;
@@ -136,6 +150,15 @@ pub fn is_periodic(frame: &[u8]) -> bool {
     frame.len() > 5 && frame[5] == KIND_OFFER
 }
 
+/// 45.3 — whether `frame` is a `STAMP`: sent with a period's offers, the
+/// next one superseding it, but never standing in for an offer (an offer is
+/// each leg's liveness and the drain's outstanding message; a stamp is
+/// neither).
+#[must_use]
+pub fn is_stamp(frame: &[u8]) -> bool {
+    frame.len() > 5 && frame[5] == KIND_STAMP
+}
+
 /// A decoded C3 frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WireFrame {
@@ -143,6 +166,9 @@ pub enum WireFrame {
     Caps(u32),
     /// A control message about one stream; peer fields are the link's peer.
     Control(super::ControlFrame<String>),
+    /// 45.3 — a publisher's signed backlog stamp, unchecked: the receiver
+    /// checks it against the stream's bound chunk key.
+    Stamp(crate::transport::av_chunk_auth::BacklogStamp),
 }
 
 /// Why a frame was refused.
@@ -199,6 +225,15 @@ const fn role_of(c: u8) -> Option<Role> {
 pub fn encode_caps(caps: u32) -> Vec<u8> {
     let mut v = header(KIND_CAPS, 4);
     v.extend_from_slice(&caps.to_be_bytes());
+    v
+}
+
+/// 45.3 — encode a `STAMP` frame carrying `stamp`'s bytes as they are.
+#[must_use]
+pub fn encode_stamp(stamp: &crate::transport::av_chunk_auth::BacklogStamp) -> Vec<u8> {
+    let b = stamp.to_bytes();
+    let mut v = header(KIND_STAMP, b.len());
+    v.extend_from_slice(&b);
     v
 }
 
@@ -432,6 +467,12 @@ pub fn decode(frame: &[u8], peer: &str) -> Result<WireFrame, WireError> {
                 }),
             })
         }
+        KIND_STAMP => WireFrame::Stamp(
+            crate::transport::av_chunk_auth::BacklogStamp::from_bytes(
+                r.take(crate::transport::av_chunk_auth::BACKLOG_STAMP_LEN)?,
+            )
+            .ok_or(WireError::Malformed)?,
+        ),
         k => return Err(WireError::UnknownKind(k)),
     };
     r.end()?;
@@ -720,5 +761,27 @@ mod tests {
         let mut f = with;
         f.push(0);
         assert_eq!(decode(&f, "x"), Err(WireError::Malformed), "trailing byte");
+    }
+
+    /// 45.3 R29 — a STAMP frame carries the stamp's bytes unaltered (a relay
+    /// forwards it byte for byte); it is not an offer (it never stands in for
+    /// a leg's liveness offer); a truncated one is malformed.
+    #[test]
+    fn a_stamp_frame_round_trips_byte_for_byte() {
+        let key = crate::transport::av_chunk_auth::ChunkSigner::generate(
+            s(),
+            crate::transport::realtime_av::Epoch(2),
+        )
+        .unwrap();
+        let st = key.stamp_backlog(42, 1_200, 7).unwrap();
+        let f = encode_stamp(&st);
+        assert!(is_control_frame(&f) && is_stamp(&f) && !is_periodic(&f));
+        assert_eq!(decode(&f, "peer-a"), Ok(WireFrame::Stamp(st.clone())));
+        assert_eq!(&f[HEADER_LEN..], st.to_bytes().as_slice());
+        assert_eq!(
+            decode(&f[..f.len() - 1], "peer-a"),
+            Err(WireError::Malformed)
+        );
+        assert_ne!(CAPS_THIS_BUILD & CAP_BACKLOG_STAMP, 0);
     }
 }

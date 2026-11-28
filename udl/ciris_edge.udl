@@ -149,6 +149,12 @@ namespace ciris_edge {
     [Throws=EdgeBindingsError]
     u32 link_count();
 
+    // v45.3 — whether this node can reach a peer now, and how: live
+    // identity link, dialable (path or transit pair), unreachable (exactly
+    // the #971 undialable) or unknown; plus whether the link is direct.
+    [Throws=EdgeBindingsError]
+    EdgePeerReach peer_reach(string node_key_id);
+
     [Throws=EdgeBindingsError]
     EdgeLinkHandle link_open(bytes destination_hash, u64 timeout_ms);
 
@@ -469,6 +475,27 @@ enum EdgeLinkDirection {
     "Inbound",
     "Outbound",
     "Unknown",
+};
+
+// v45.3 — `peer_reach`'s summary (`transport::peer_reach::ReachState`).
+enum EdgeReachState {
+    "Live",
+    "Dialable",
+    "Unreachable",
+    "Unknown",
+};
+
+// v45.3 — `peer_reach`: no address, hops and booleans only.
+// `last_inbound_ms_ago` is at one-second resolution; `transit_pair` is null
+// when not read (a live link or a path answered first) or the read failed.
+dictionary EdgePeerReach {
+    EdgeReachState state;
+    boolean live_link;
+    u64? last_inbound_ms_ago;
+    boolean has_path;
+    u8? path_hops;
+    boolean? transit_pair;
+    boolean direct;
 };
 
 dictionary EdgeLinkHandle {
