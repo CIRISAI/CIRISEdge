@@ -293,9 +293,14 @@ async fn a_cancelled_send_gives_its_lane_back_853() {
             .first()
             .expect("one lane pooled");
     p.b.delay_resource_ships_for_test(3000);
+    // 45.3 — the send is BULK: an unclassed (FIRST) envelope rides the
+    // Channel before any Resource, and the seam holds Resource ships only.
     let cancelled = tokio::time::timeout(
         Duration::from_millis(200),
-        p.b.send(&dest, b"held mid-ship"),
+        ciris_edge::transport::egress_budget::sending_as(
+            ciris_edge::transport::egress_budget::SendClass::Bulk,
+            p.b.send(&dest, b"held mid-ship"),
+        ),
     )
     .await;
     p.b.delay_resource_ships_for_test(0);

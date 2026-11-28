@@ -168,6 +168,7 @@ pub enum WireFrame {
     Control(super::ControlFrame<String>),
     /// 45.3 — a publisher's signed backlog stamp, unchecked: the receiver
     /// checks it against the stream's bound chunk key.
+    #[cfg(feature = "_reticulum-module")]
     Stamp(crate::transport::av_chunk_auth::BacklogStamp),
 }
 
@@ -229,6 +230,7 @@ pub fn encode_caps(caps: u32) -> Vec<u8> {
 }
 
 /// 45.3 — encode a `STAMP` frame carrying `stamp`'s bytes as they are.
+#[cfg(feature = "_reticulum-module")]
 #[must_use]
 pub fn encode_stamp(stamp: &crate::transport::av_chunk_auth::BacklogStamp) -> Vec<u8> {
     let b = stamp.to_bytes();
@@ -467,6 +469,7 @@ pub fn decode(frame: &[u8], peer: &str) -> Result<WireFrame, WireError> {
                 }),
             })
         }
+        #[cfg(feature = "_reticulum-module")]
         KIND_STAMP => WireFrame::Stamp(
             crate::transport::av_chunk_auth::BacklogStamp::from_bytes(
                 r.take(crate::transport::av_chunk_auth::BACKLOG_STAMP_LEN)?,
@@ -763,6 +766,7 @@ mod tests {
         assert_eq!(decode(&f, "x"), Err(WireError::Malformed), "trailing byte");
     }
 
+    #[cfg(feature = "_reticulum-module")]
     /// 45.3 R29 — a STAMP frame carries the stamp's bytes unaltered (a relay
     /// forwards it byte for byte); it is not an offer (it never stands in for
     /// a leg's liveness offer); a truncated one is malformed.
