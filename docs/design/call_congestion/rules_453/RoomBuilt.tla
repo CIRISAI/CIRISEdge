@@ -29,8 +29,10 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS Liar, CapEnd, H, USet, LSet, GSet, ThrS, DSet,
           RunSet, PauseSet,  \* the liar's pattern: witness for runLen ticks, pause pauseLen
-          LapseRestarts      \* as built: a witness after a 2.5 s lapse starts a new 5 s run
-                             \* (selector.rs:554-559); FALSE: only a delivered chunk does
+          LapseRestarts,     \* TRUE: a witness after a 2.5 s lapse starts a new 5 s run
+                             \* (e356 + edits); FALSE (squash/45.3): only a delivered chunk does
+          SelfStamp          \* squash/45.3 B: while withholding (STALE here) P stamps
+                             \* max(word, 801)
 
 Budget == 3        \* > 800 ms
 Life == 10         \* 2.5 s
@@ -72,9 +74,11 @@ Tick ==
       capped  == t < CapEnd
       media   == est <= Budget
       wmax    == Max(est, MaxSet({hist[i] : i \in 0..(Win - 1)}))
-      stampP  == (t % 4 = phP) /\ wmax >= ThrS
+      withh   == SelfStamp /\ ~media
+      stampP  == (t % 4 = phP) /\ (wmax >= ThrS \/ withh)
+      dDecl   == IF withh THEN Max(wmax, Budget + 1) ELSE wmax
       sendC   == IF media THEN {[at |-> t + q, kind |-> "c", sent |-> t, d |-> 0]} ELSE {}
-      sendS   == IF stampP THEN {[at |-> t + q, kind |-> "s", sent |-> t, d |-> wmax]} ELSE {}
+      sendS   == IF stampP THEN {[at |-> t + q, kind |-> "s", sent |-> t, d |-> dDecl]} ELSE {}
       pend1   == pend \cup sendC \cup sendS
       arr     == {x \in pend1 : x.at = t}
       chA     == {x \in arr : x.kind = "c"}

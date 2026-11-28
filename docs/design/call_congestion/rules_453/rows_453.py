@@ -112,7 +112,8 @@ def register(add, B, S):
             invs=["ChildKeepsRelay", "RelayKeepsP", "StandbyKept"])
     # ---------------------------------------------------------------- R32
     rb = dict(CapEnd=32, H=80, USet="{0, 1, 2, 3}", LSet="{0, 1, 2, 3, 4}", GSet="{1, 2}",
-              DSet="{1}", RunSet="{1}", PauseSet="{0}", LapseRestarts=B(True))
+              DSet="{1}", RunSet="{1}", PauseSet="{0}", LapseRestarts=B(True),
+              SelfStamp=B(False))
     for thr in (2, 1):
         add(f"R32-honest-thr{thr}", "RoomBuilt", dict(rb, Liar=B(False), ThrS=thr),
             invs=["MovedKeepsRelay", "RelayKeepsP"])
@@ -125,3 +126,22 @@ def register(add, B, S):
         invs=["LiarOnlyBound", "LiarGone"])
     add("R32-honest-thr2-nolapse", "RoomBuilt", dict(rb, Liar=B(False), ThrS=2,
         LapseRestarts=B(False)), invs=["MovedKeepsRelay", "RelayKeepsP"])
+    # ---------------------------------------------------------------- R33
+    for order in ("fifo", "chatfirst"):
+        for bound in (120, 40):
+            add(f"R33-{order}-b{bound}", "BulkPacers",
+                dict(RSet="{32, 64, 128}", SSet="{20, 75, 150}", Chat=10, NEnv=10, Lanes=1,
+                     Order=S(order), Bound=bound, Ann=0),
+                invs=["ChatWithin"])
+    add("R33-fifo-announce", "BulkPacers",
+        dict(RSet="{32, 64, 128}", SSet="{75}", Chat=10, NEnv=10, Lanes=1,
+             Order=S("fifo"), Bound=400, Ann=3), invs=["ChatArrives"])
+    # R32 against squash/45.3 as built: A (no lapse restart) + B (SelfStamp)
+    asb = dict(rb, LapseRestarts=B(False), SelfStamp=B(True))
+    add("R32abc-honest", "RoomBuilt", dict(asb, Liar=B(False), ThrS=2),
+        invs=["MovedKeepsRelay", "RelayKeepsP"])
+    add("R32abc-honest-g4", "RoomBuilt", dict(asb, Liar=B(False), ThrS=2, GSet="{3, 4}"),
+        invs=["MovedKeepsRelay", "RelayKeepsP"])
+    add("R32abc-liar-only", "RoomBuilt", dict(asb, Liar=B(True), ThrS=2, CapEnd=0, H=120,
+        DSet="{1, 2}", RunSet="{4, 8, 12, 16, 20, 24, 40}", PauseSet="{0, 4, 8, 10, 11, 12, 14}",
+        USet="{0}", LSet="{0}", GSet="{1}"), invs=["LiarOnlyBound", "LiarGone"])

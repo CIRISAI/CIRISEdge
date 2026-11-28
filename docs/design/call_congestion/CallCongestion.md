@@ -257,7 +257,7 @@ The final run is in `results/` (`matrix.json`, `matrix.md`, `quality.md`). The t
 
 The 45.3 call-reliability rules as built on `work/45.3` (edge 6392b0a) are each checked by their own small spec in `rules_453/`, not folded into `CallCongestion.tla`. Each spec carries the code lines it models in its header.
 
-- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `RoomBuilt.tla` (R32), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
+- **Files.** `OfferAsLife.tla` and `RelayAdvert.tla` (R29), `PunchTrust.tla` (R30), `RoomStamps.tla` (R31), `RoomBuilt.tla` (R32), `BulkPacers.tla` (R33), `SendClock.tla` (R24), `UplinkBacklog.tla` (R25), `StaleAtSender.tla` (R26), `AgeFloor.tla` (R27), `EgressBudget.tla` (R28). `run_rules.py` is the runner and `rows_453.py` holds the R24–R28 scenarios.
 - **How to run.** `python3 docs/design/call_congestion/rules_453/run_rules.py OUTDIR --split [--only REGEX]`. `--split` runs each invariant alone, because with `-continue` a state that breaks two invariants is reported under the first only.
 - **The scheduler.** The same convention as `run_matrix.py`: `GRACE_SCHED_*` + `cargo_guard.sh` at priority low, nice 19, idle I/O class, `-Xmx2g`, 2 workers, declared peak 3 GB. Grace measured peaks of 0.78–1.7 GB.
 - **Tick.** One step is one watch tick (250 ms) unless a row says otherwise. Every timer is an age in ticks, capped, so most specs need no horizon.
@@ -577,6 +577,45 @@ In the model, C starts as P's direct child and moves to R when it first reads P 
 - **(d) The come-back.** RM3 unsubscribes P once R admits C, so the come-back is a fresh standby pick of P plus the `to_direct` switch, gated by the dwell (at least 10 s after the move). That path is the same as at 1545ee18.
   - The two gaps that broke it in the field are closed in R31/R32: the relay failed over, and the standby starved by the stall cadence.
   - The compact models do not model P's headroom returning after the lift. That piece is CallCongestion.tla's.
+
+**R32 against squash/45.3 as built (A + B + C).** What was built:
+- A: stale chunks count as stamps; a stale chunk is not an arrival; the stale-only run lasts at most 5 s and is restarted only by a delivered chunk (`selector.rs:552-563`).
+- B: SelfStamp. While withholding, P stamps max(word, 801).
+- C: the floor-debit fix.
+
+| Run | Checks | States / depth | Result |
+|---|---|---|---|
+| honest move, 2× / 3× overload | MovedKeepsRelay, RelayKeepsP | 51,840 / 81 | pass |
+| honest move, 4× / 5× overload | MovedKeepsRelay, RelayKeepsP | 51,840 / 81 | pass |
+| honest move, 7× overload | MovedKeepsRelay | – | **FAIL** (the stated limit) |
+| honest move, stale-only cap 2.0 s / 2.5 s | MovedKeepsRelay | – | **FAIL** / pass: the margin is unchanged |
+| manufactured-stale liar, only candidate, every witness pattern, depth 1 and 2 | LiarOnlyBound, LiarGone | 189,728 / 121 | pass |
+
+### R33 BULK-PACERS (two pacers in series)
+
+`rules_453/BulkPacers.tla`, with an exact Python replica for the table. It models:
+- edge's single bulk FIFO, served by the floor (max(0.1 R, 8 kbit/s)) with the floor-debit fix;
+- leviculum ciris.5's low-tier floor credit: 10/90 of the high-class bytes sent, plus 4 kbit/s, with announces ahead of bulk;
+- one transfer at a time, serial, which is the worst case of one Resource per link.
+
+Media saturates both pacers' high tiers. Ten envelopes are queued ahead of one 1 KB chat row.
+
+| R (kbit/s) | envelope | chat row arrives, FIFO (as built) | chat row first |
+|---|---|---|---|
+| 128 | 2.2 KB | 17.75 s | 0.75 s |
+| 128 | 8.2 KB | 62.75 s | 0.75 s |
+| 256 | 2.2 KB | 9.0 s | 0.5 s |
+| 256 | 8.2 KB | **32.75 s** | 0.5 s |
+| 256 | 16.3 KB | 62.75 s | 0.5 s |
+| 512 | 8.2 KB | 16.5 s | 0.25 s |
+
+TLC: ChatWithin 30 s **FAILS** for FIFO (800 states, depth 122) and passes for chat first (27 states).
+
+- **Bulk is live.** Every envelope arrives, because edge's floor and leviculum's credit both accrue for as long as anything is queued.
+- **The bound is (the bytes queued ahead) / (0.1 R).** Edge's floor governs: leviculum's credit is about 0.11 R + 4 kbit/s, so leviculum is never the bottleneck.
+- **The field's "a chat row behind bulk never arrives within 30 s" is this bound, not a liveness bug.** Ten 8 KB envelopes at R = 256 kbit/s give 32.75 s.
+- **The fix is ordering, not rate.** Serve a chat row (or any small interactive bulk row) ahead of queued transfers: its own FIFO, served first by the same floor. It then arrives in under 1 s at every rate.
+- **Starvation condition at leviculum.** Within the low tiers, announces outrank bulk. With announce load at or above leviculum's floor credit (about 0.11 R + 4 kbit/s), bulk starves. At 12 kbit/s of announces, R = 128 kbit/s gives 190 s (ChatArrives fails at its 100 s horizon).
 
 ## Decision table
 
