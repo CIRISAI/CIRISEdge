@@ -2031,6 +2031,24 @@ fn leg_is_punched(call: &Call, to: &Side) -> bool {
     })
 }
 
+/// The room's own addresses on both sides, as a host installs every
+/// persisted room (`mls::boot::readdress_persisted_rooms`): the room is what
+/// two members share between calls, so a hang-up leaves their standing (the
+/// address predicate) as it is.
+async fn install_room(p: &Pair) {
+    for (side, group) in [(&p.a, &p.groups[0]), (&p.b, &p.groups[1])] {
+        let snapshot = ciris_edge::cohort_addressing::snapshot(group)
+            .await
+            .expect("the room's snapshot");
+        side.lifecycle
+            .install(
+                &ciris_edge::cohort_addressing::scope_for(&p.room),
+                &snapshot,
+            )
+            .expect("install the room");
+    }
+}
+
 /// **G8 C, end to end** — a punched path whose LINK closes under a live call
 /// leg comes back within seconds, not after the 60 s backoff that mirrored
 /// leviculum's per-link proposal cooldown (the 45.1.9 relay matrix's 60–75 s
@@ -2043,6 +2061,8 @@ fn leg_is_punched(call: &Call, to: &Side) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_punched_link_closed_under_a_call_comes_back_within_seconds() {
     let mut p = Box::pin(pair("g8c", true)).await;
+    // The hang-up below keeps the direct path: the two still share the room.
+    install_room(&p).await;
     let call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
     let call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
     let (first, _) = next_established(&mut p.a, Duration::from_mins(1))

@@ -419,6 +419,22 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -1660,6 +1676,80 @@ public func FfiConverterTypeEdgePeerPolicy_lower(_ value: EdgePeerPolicy) -> Rus
 }
 
 
+public struct EdgePeerReach: Equatable, Hashable {
+    public var state: EdgeReachState
+    public var liveLink: Bool
+    public var lastInboundMsAgo: UInt64?
+    public var hasPath: Bool
+    public var pathHops: UInt8?
+    public var transitPair: Bool?
+    public var direct: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: EdgeReachState, liveLink: Bool, lastInboundMsAgo: UInt64?, hasPath: Bool, pathHops: UInt8?, transitPair: Bool?, direct: Bool) {
+        self.state = state
+        self.liveLink = liveLink
+        self.lastInboundMsAgo = lastInboundMsAgo
+        self.hasPath = hasPath
+        self.pathHops = pathHops
+        self.transitPair = transitPair
+        self.direct = direct
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgePeerReach: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgePeerReach: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgePeerReach {
+        return
+            try EdgePeerReach(
+                state: FfiConverterTypeEdgeReachState.read(from: &buf), 
+                liveLink: FfiConverterBool.read(from: &buf), 
+                lastInboundMsAgo: FfiConverterOptionUInt64.read(from: &buf), 
+                hasPath: FfiConverterBool.read(from: &buf), 
+                pathHops: FfiConverterOptionUInt8.read(from: &buf), 
+                transitPair: FfiConverterOptionBool.read(from: &buf), 
+                direct: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgePeerReach, into buf: inout [UInt8]) {
+        FfiConverterTypeEdgeReachState.write(value.state, into: &buf)
+        FfiConverterBool.write(value.liveLink, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastInboundMsAgo, into: &buf)
+        FfiConverterBool.write(value.hasPath, into: &buf)
+        FfiConverterOptionUInt8.write(value.pathHops, into: &buf)
+        FfiConverterOptionBool.write(value.transitPair, into: &buf)
+        FfiConverterBool.write(value.direct, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgePeerReach_lift(_ buf: RustBuffer) throws -> EdgePeerReach {
+    return try FfiConverterTypeEdgePeerReach.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgePeerReach_lower(_ value: EdgePeerReach) -> RustBuffer {
+    return FfiConverterTypeEdgePeerReach.lower(value)
+}
+
+
 public struct EdgeProbeResult: Equatable, Hashable {
     public var reachable: Bool
     public var latencyMs: UInt64?
@@ -2856,6 +2946,111 @@ public func FfiConverterTypeEdgePeerTrust_lower(_ value: EdgePeerTrust) -> RustB
 }
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum EdgeReachState: Equatable, Hashable {
+    
+    case live
+    case dialable
+    case unreachable
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension EdgeReachState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeReachState: FfiConverterRustBuffer {
+    typealias SwiftType = EdgeReachState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeReachState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .live
+        
+        case 2: return .dialable
+        
+        case 3: return .unreachable
+        
+        case 4: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EdgeReachState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .live:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .dialable:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unreachable:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeReachState_lift(_ buf: RustBuffer) throws -> EdgeReachState {
+    return try FfiConverterTypeEdgeReachState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeReachState_lower(_ value: EdgeReachState) -> RustBuffer {
+    return FfiConverterTypeEdgeReachState.lower(value)
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
+    typealias SwiftType = UInt8?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt8.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt8.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -3737,6 +3932,13 @@ public func peerProbe(keyId: String, timeoutMs: UInt64)throws  -> EdgeProbeResul
     )
 })
 }
+public func peerReach(nodeKeyId: String)throws  -> EdgePeerReach  {
+    return try  FfiConverterTypeEdgePeerReach_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_peer_reach(
+        FfiConverterString.lower(nodeKeyId),$0
+    )
+})
+}
 public func peerRemove(handle: EdgePeerHandle, hard: Bool)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_peer_remove(
         FfiConverterTypeEdgePeerHandle_lower(handle),
@@ -4044,6 +4246,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_peer_probe() != 59245) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_peer_reach() != 29445) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_peer_remove() != 60093) {

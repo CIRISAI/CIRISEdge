@@ -1109,3 +1109,161 @@ fn a_relayed_binding_repeat_goes_only_to_children() {
         "no children: nobody"
     );
 }
+
+/// 45.3 row AGE — staleness is judged end to end above the stream's RM1
+/// floor, so a ±5 min clock skew between the publisher and this receiver
+/// (CC 2.6.7) cancels: 799 ms late passes, 801 ms is dropped, either way the
+/// clocks disagree.
+#[test]
+fn media_is_stale_past_800_ms_above_its_floor_whatever_the_clock_skew() {
+    use super::rxmove::LatencyFloor;
+    for skew in [-300_000_i64, 0, 300_000] {
+        let mut floor = LatencyFloor::new(skew + 20, 0);
+        let mut at =
+            |offset: i64, now: u64| super::is_stale_end_to_end(Some(floor.sample(offset, now)));
+        assert!(!at(skew + 20, 100), "on time ({skew})");
+        assert!(!at(skew + 20 + 799, 200), "799 ms late passes ({skew})");
+        assert!(at(skew + 20 + 801, 300), "801 ms late is stale ({skew})");
+        assert!(at(skew + 20 + 9_000, 400), "a 9 s queue is stale ({skew})");
+    }
+    assert!(!super::is_stale_end_to_end(None), "this node's own stream");
+}
+
+/// 45.3 row AGE — a stream already 9 s late when this receiver first hears
+/// it: its late offset is the floor (not known stale) until a confirming pair
+/// of faster chunks lowers it, and from then the late ones are stale. The floor never rises
+/// on a late sample, so a queue that persists cannot teach itself away.
+#[test]
+fn a_stream_that_starts_late_is_judged_from_its_first_on_time_chunk() {
+    use super::rxmove::LatencyFloor;
+    let skew = 123_456_i64;
+    let late = skew + 9_000;
+    let mut floor = LatencyFloor::new(late, 0);
+    assert!(!super::is_stale_end_to_end(Some(floor.sample(late, 250))));
+    // Still late a minute on: the floor did not climb to make it "on time"
+    // (it was already there), and nothing faster has come.
+    assert!(!super::is_stale_end_to_end(Some(
+        floor.sample(late + 30, 60_000)
+    )));
+    // The queue drains: two on-time chunks confirm the new floor (confirm0)...
+    assert!(!super::is_stale_end_to_end(Some(
+        floor.sample(skew + 10, 61_000)
+    )));
+    assert!(!super::is_stale_end_to_end(Some(
+        floor.sample(skew + 12, 61_020)
+    )));
+    // ...and the queue coming back is stale.
+    assert!(super::is_stale_end_to_end(Some(floor.sample(late, 62_000))));
+}
+
+/// 45.3 — `CallEvent::KeyframeWanted`: once per resume of an own stream's
+/// video after frames were held or dropped, never for audio, never for a
+/// stream that was not held, not again until it is held once more, and at
+/// most once per KEYFRAME_WANTED_MIN_INTERVAL_MS: four resumes inside a
+/// second fire once, and the one still owed fires at the first frame out
+/// after the interval. Each own stream on its own. Mutation: dropping the
+/// interval fires on every resume and fails "inside the interval".
+#[test]
+fn a_keyframe_is_wanted_once_per_resume_and_at_most_once_a_second() {
+    use super::KEYFRAME_WANTED_MIN_INTERVAL_MS as GAP;
+    let (a, b) = (StreamId([1; 32]), StreamId([2; 32]));
+    let mut k = std::collections::HashMap::new();
+    let mut at = |s: StreamId, video: bool, sent: bool, t: u64| {
+        super::video_resumes(&mut k, s, video, sent, t)
+    };
+    assert!(!at(a, true, true, 0), "never held");
+    assert!(!at(a, false, false, 10), "audio held");
+    assert!(!at(a, false, true, 20), "audio resumes");
+    assert!(!at(a, true, false, 30), "held");
+    assert!(!at(a, true, false, 40), "still held");
+    assert!(!at(b, true, true, 50), "the other stream");
+    assert!(at(a, true, true, 60), "resumes: wanted");
+    assert!(!at(a, true, true, 70), "once");
+    // Three more resumes inside the interval: owed, not fired.
+    for t in [100, 300, 600] {
+        assert!(!at(a, true, false, t));
+        assert!(!at(a, true, true, t + 10), "inside the interval ({t})");
+    }
+    assert!(
+        at(a, true, true, 60 + GAP),
+        "owed: fires once the interval ends"
+    );
+    assert!(!at(a, true, true, 70 + GAP), "and only once");
+    assert!(!at(a, true, false, 3_000));
+    assert!(at(a, true, true, 3_010), "the next resume");
+}
+
+// ─── 45.3 model R24/R25: the backlog reading and the drain ──────────────
+
+const fn out(age_ms: u64, floor_ms: u64) -> LegBacklog {
+    LegBacklog::Outstanding { age_ms, floor_ms }
+}
+
+/// **R25, one leg** — a two-person call's one leg, or one busy leg beside
+/// idle ones, is read: before, the reading needed two outstanding legs and
+/// a two-person call never drained, held STALE media or engaged the budget.
+/// One slow leg beside a leg this uplink serves in time is still that peer
+/// (OnePeerIsNotOwn): the clear leg reads 0.
+#[test]
+fn one_leg_with_traffic_is_read_and_one_slow_peer_is_not_this_uplink() {
+    assert_eq!(backlog_reading(&[out(900, 50)]), Some(850));
+    assert_eq!(
+        backlog_reading(&[out(900, 50), LegBacklog::Idle, LegBacklog::Idle]),
+        Some(850)
+    );
+    assert_eq!(backlog_reading(&[out(900, 50), LegBacklog::Clear]), Some(0));
+    assert_eq!(backlog_reading(&[out(900, 50), out(700, 0)]), Some(700));
+    assert_eq!(backlog_reading(&[LegBacklog::Idle]), None);
+    assert_eq!(backlog_reading(&[]), None);
+    // A one-leg backlog over the bound starts the drain, and STALE reads it.
+    let mut d = alm::UplinkDrain::default();
+    assert_eq!(d.observe(0, backlog_reading(&[out(1_000, 50)])), Some(true));
+    assert!(alm::stale_at_sender(d.backlog_ms()));
+}
+
+/// **R25, the lasso** — draining, the kept child's own uplink is slow (its
+/// proofs come back 400 ms late every tick) while this uplink is clear (the
+/// other legs prove their liveness offers in time). The drain ends within
+/// its clear span: the reading is over every leg, not the kept one alone.
+#[test]
+fn a_slow_kept_child_does_not_hold_the_drain_once_this_uplink_is_clear() {
+    let mut d = alm::UplinkDrain::default();
+    assert_eq!(
+        d.observe(0, backlog_reading(&[out(900, 0), out(800, 0)])),
+        Some(true)
+    );
+    let mut ended_at = None;
+    for t in (100..5_000).step_by(100) {
+        let r = backlog_reading(&[out(400, 0), LegBacklog::Clear, LegBacklog::Clear]);
+        if d.observe(t, r) == Some(false) {
+            ended_at = Some(t);
+            break;
+        }
+    }
+    assert!(
+        ended_at.is_some_and(|t| t <= 100 + alm::DRAIN_CLEAR_MS + 100),
+        "the drain ended at {ended_at:?}"
+    );
+    // The kept leg alone (the rule before): it never ends.
+    let mut d = alm::UplinkDrain::default();
+    let _ = d.observe(0, Some(900));
+    for t in (100..5_000).step_by(100) {
+        assert_ne!(d.observe(t, backlog_reading(&[out(400, 0)])), Some(false));
+    }
+}
+
+/// **R24** — G8 reads the send clock: the oldest unproved message's age is
+/// from ITS send, so proving an older one does not restart it (the verdict's
+/// own "oldest since" age did, and read near zero under a standing queue).
+#[test]
+fn the_send_clock_age_does_not_restart_when_an_older_message_is_proved() {
+    let mut c = alm::SendClock::default();
+    c.note(0, 1);
+    c.note(100, 2);
+    c.note(200, 3);
+    // At 300 the oldest unproved is 1: sent at 0.
+    assert_eq!(c.age_of(300, 1), Some(300));
+    // 1 is proved; the oldest is now 2, sent at 100: 400 at t=500, not 0.
+    assert_eq!(c.age_of(500, 2), Some(400));
+    assert_eq!(c.last_send_ms(), Some(200));
+}

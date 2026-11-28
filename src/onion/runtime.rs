@@ -67,6 +67,10 @@ pub struct OnionRuntime {
     state: Mutex<State>,
     counters: Mutex<HashMap<&'static str, u64>>,
     exits: Mutex<VecDeque<Vec<u8>>>,
+    /// v45.3 — whether this node may reveal its address
+    /// ([`Self::may_reveal_address`]), announced on every change a mutation
+    /// makes, so the direct-link address predicate is re-read at once.
+    reveal: tokio::sync::watch::Sender<bool>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -84,7 +88,29 @@ impl OnionRuntime {
             state: Mutex::new(State::default()),
             counters: Mutex::new(HashMap::new()),
             exits: Mutex::new(VecDeque::new()),
+            reveal: tokio::sync::watch::channel(true).0,
         }
+    }
+
+    /// v45.3 — a receiver that wakes whenever [`Self::may_reveal_address`]
+    /// changes value through a mutation here (the policy, the device, the
+    /// deal, the relay, liveness evidence). Evidence ageing out can only
+    /// turn the tier OFF, the direction that hides nothing; the transport's
+    /// cadence recheck covers it.
+    #[must_use]
+    pub fn reveal_changes(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.reveal.subscribe()
+    }
+
+    /// Announce [`Self::may_reveal_address`] if it changed. Called after
+    /// every mutation, with no lock held.
+    fn note_reveal(&self) {
+        let now = self.may_reveal_address().is_ok();
+        self.reveal.send_if_modified(|v| {
+            let changed = *v != now;
+            *v = now;
+            changed
+        });
     }
 
     /// The operator's policy.
@@ -102,6 +128,7 @@ impl OnionRuntime {
             .policy
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = p;
+        self.note_reveal();
     }
 
     /// The device state.
@@ -119,6 +146,7 @@ impl OnionRuntime {
             .device
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = d;
+        self.note_reveal();
     }
 
     /// Whether this node's relay offering is on
@@ -131,16 +159,19 @@ impl OnionRuntime {
     /// Install this period's deal (computed from the fold).
     pub fn install_deal(&self, deal: LayerDeal) {
         lock(&self.state).deal = Some(deal);
+        self.note_reveal();
     }
 
     /// Install (or remove) this node's relay: its hop secret(s).
     pub fn set_relay(&self, relay: Option<OnionRelay>) {
         lock(&self.state).relay = relay.map(Arc::new);
+        self.note_reveal();
     }
 
     /// Record liveness evidence about a relay.
     pub fn observe(&self, relay: &str, kind: LivenessEvidence) {
         lock(&self.state).liveness.observe(relay, kind);
+        self.note_reveal();
     }
 
     /// Whether `relay` answered within the window (for route choice).

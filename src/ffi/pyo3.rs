@@ -1311,6 +1311,48 @@ impl PyEdge {
         Ok(out.unbind().into_any())
     }
 
+    /// v45.3 — whether this node can reach `node_key_id` now, and how, as a
+    /// dict: `state` (`live` / `dialable` / `unreachable` / `unknown`;
+    /// `unreachable` is exactly the CIRISEdge#971 undialable), `live_link`,
+    /// `last_inbound_ms_ago` (one-second resolution, `None` with no live
+    /// link), `has_path`, `path_hops`, `transit_pair` (`None` when not read or
+    /// the read failed) and `direct` (the link rides a punched interface).
+    /// `unknown` with nothing known when this build has no Reticulum
+    /// transport.
+    fn peer_reach<'py>(
+        &self,
+        py: Python<'py>,
+        node_key_id: &str,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        #[cfg(feature = "_reticulum-module")]
+        let reach = match self.inner.reticulum_transport() {
+            Some(transport) => {
+                let key = node_key_id.to_owned();
+                py.detach(|| {
+                    run_async(
+                        &self.executor,
+                        async move { transport.peer_reach(&key).await },
+                    )
+                })
+            }
+            None => crate::transport::peer_reach::PeerReach::unknown(),
+        };
+        #[cfg(not(feature = "_reticulum-module"))]
+        let reach = {
+            let _ = node_key_id;
+            crate::transport::peer_reach::PeerReach::unknown()
+        };
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("state", reach.state.token())?;
+        d.set_item("live_link", reach.live_link)?;
+        d.set_item("last_inbound_ms_ago", reach.last_inbound_ms_ago)?;
+        d.set_item("has_path", reach.has_path)?;
+        d.set_item("path_hops", reach.path_hops)?;
+        d.set_item("transit_pair", reach.transit_pair)?;
+        d.set_item("direct", reach.direct)?;
+        Ok(d)
+    }
+
     /// Local agent's federation `key_id` — the identity peers seed
     /// into their `federation_keys` directory to root inbound traffic
     /// from this agent. CIRISAgent 2.9.4 displays this on the
@@ -3795,6 +3837,8 @@ fn telemetry_into_pydict(
         ("direct_link_proposing", b.direct_link_proposing),
         ("alm_active_calls", b.alm_active_calls),
         ("alm_c3_peers", b.alm_c3_peers),
+        ("alm_uplink_backlog_ms", b.alm_uplink_backlog_ms),
+        ("alm_media_budget_bps", b.alm_media_budget_bps),
         ("decision_row_subscribers", b.decision_row_subscribers),
         (
             "group_backfill_rows_read_total",
@@ -4631,6 +4675,10 @@ fn call_event_to_pydict<'py>(
             d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
             d.set_item("cause", cause.token())?;
             d.set_item("truncated", *truncated)?;
+        }
+        V::KeyframeWanted { stream } => {
+            d.set_item("kind", "keyframe_wanted")?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
         }
         V::StreamAdded {
             publisher,
@@ -8422,6 +8470,10 @@ pub fn init_edge_runtime(
             })?,
         facilitator: direct_link_facilitator,
         serve_facilitator: direct_link_serve_port,
+        // 45.3 — derived from the bundle's facilitator at resolve; a serve
+        // seat's second port is the transport's to turn on.
+        facilitator2: None,
+        serve_second_port: false,
         accept: crate::transport::direct_path::DirectAccept::parse(direct_link_accept).ok_or_else(
             || {
                 PyValueError::new_err(format!(
@@ -15012,6 +15064,12 @@ mod pyo3_tier2_tests {
                     "keep_refused",
                 ),
                 (CallEvent::EpochRolled { from: 1, to: 2 }, "epoch_rolled"),
+                (
+                    CallEvent::KeyframeWanted {
+                        stream: crate::transport::realtime_av::StreamId([7; 32]),
+                    },
+                    "keyframe_wanted",
+                ),
                 (
                     CallEvent::MemberJoined {
                         key_id: "b".to_owned(),

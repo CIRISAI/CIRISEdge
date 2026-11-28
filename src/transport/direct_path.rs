@@ -218,10 +218,9 @@ pub enum DirectAccept {
     /// The operator override: refuse every peer's upgrade request
     /// (leviculum's REJECT, reason POLICY).
     Off,
-    /// Accept from ANY peer whose identity is known on the link: leviculum's
-    /// node-wide `IdentifiedOnly`. **Discloses this node's public address to
-    /// every identified link peer that asks**, not only room peers. For tests
-    /// and an explicit operator choice, never a default.
+    /// Kept for the API. Since v45.3 it follows the one address predicate,
+    /// as [`Self::RoomPeers`] does: a known peer that shares a room with this
+    /// node or that it names as a contact, never while anonymous.
     IdentifiedOnly,
 }
 
@@ -296,6 +295,21 @@ pub struct DirectLinksConfig {
     /// Run a facilitator on this UDP port (a reachable node: a canonical or
     /// any transport node with a public address).
     pub serve_facilitator: Option<u16>,
+    /// 45.3 (Eric, 11-22) — the second observer this node probes from the
+    /// same session socket to classify its NAT, as `host:port`. Resolved
+    /// with the facilitator: when that is the genesis bundle's serve node,
+    /// the same host at its dial's port + 1 ([`second_observer_of`]: derived
+    /// from the bundle's signed dial hint, so not a new observer under CC
+    /// 5.4.6), UDP and probes only. A host-named facilitator has none unless
+    /// the host names one here. `None`: no NAT is classified (port
+    /// prediction never runs; the birthday spray starts only on the node's
+    /// own evidence).
+    pub facilitator2: Option<String>,
+    /// 45.3 — with [`Self::serve_facilitator`], also answer probes on the
+    /// next UDP port: a serve seat is both observers its probers derive.
+    /// The transport turns it on when this node is a serve node of the
+    /// genesis bundle; a host may set it.
+    pub serve_second_port: bool,
     /// Who this node accepts an upgrade from ([`DirectAccept`]; default room
     /// peers only).
     pub accept: DirectAccept,
@@ -366,6 +380,9 @@ impl DirectLinksConfig {
             }
             Proposing::On => {
                 self.facilitator = Self::bundle_facilitator();
+                if self.facilitator2.is_none() {
+                    self.facilitator2 = self.facilitator.as_deref().and_then(second_observer_of);
+                }
                 // No address in a log line: the source is the whole story.
                 if self.facilitator.is_some() {
                     tracing::info!(
@@ -436,6 +453,9 @@ impl DirectLinksConfig {
         }
         if baked_dials_allowed {
             if let Some(f) = bundle() {
+                if self.facilitator2.is_none() {
+                    self.facilitator2 = second_observer_of(&f);
+                }
                 self.facilitator = Some(f);
                 return (self, FacilitatorSource::Bundle);
             }
@@ -455,10 +475,10 @@ impl DirectLinksConfig {
         // set every field edge chooses.
         let mut settings = leviculum_std::direct_link::DirectLinkSettings::default();
         settings.policy = match self.accept {
-            // Asked per request, answered by `should_accept_direct`.
-            DirectAccept::RoomPeers => DirectLinkPolicy::AskHost,
+            // Asked per request, answered by `should_accept_direct`. v45.3:
+            // `identified_only` is asked too, under the same predicate.
+            DirectAccept::RoomPeers | DirectAccept::IdentifiedOnly => DirectLinkPolicy::AskHost,
             DirectAccept::Off => DirectLinkPolicy::Reject,
-            DirectAccept::IdentifiedOnly => DirectLinkPolicy::IdentifiedOnly,
         };
         // Named, whether or not this node proposes: since leviculum
         // v0.34.0+ciris.4 a node ANSWERS a proposal only by probing a
@@ -470,8 +490,36 @@ impl DirectLinksConfig {
         settings.facilitator.clone_from(&self.facilitator);
         settings.protocol = ProbeProtocol::Rnsp;
         settings.facilitator_port = self.serve_facilitator;
+        // 45.3 — the second observer, and on a serve seat the second port.
+        settings.facilitator2.clone_from(&self.facilitator2);
+        settings.protocol2 = ProbeProtocol::Rnsp;
+        settings.facilitator_second_port =
+            self.serve_facilitator.is_some() && self.serve_second_port;
         settings
     }
+
+    /// 45.3 — which second observer this node probes, as a log word (never
+    /// an address): `derived` (the bundle facilitator's dial port + 1),
+    /// `named` (by the host), `none`.
+    #[must_use]
+    pub fn second_observer_role(&self) -> &'static str {
+        match (&self.facilitator, &self.facilitator2) {
+            (_, None) => "none",
+            (Some(f), Some(s)) if second_observer_of(f).as_deref() == Some(s.as_str()) => "derived",
+            (_, Some(_)) => "named",
+        }
+    }
+}
+
+/// 45.3 (Eric, 11-22) — the second NAT observer a facilitator dial implies:
+/// the same host at the next UDP port, where a serve seat answers probes
+/// (`DirectLinkSettings::facilitator_second_port`). `None` when the dial is
+/// not `ip:port` or its port is the last one.
+#[must_use]
+pub fn second_observer_of(dial: &str) -> Option<String> {
+    let addr: std::net::SocketAddr = dial.parse().ok()?;
+    let port = addr.port().checked_add(1)?;
+    Some(std::net::SocketAddr::new(addr.ip(), port).to_string())
 }
 
 /// When a peer may be proposed to again, after a proposal ended without a
@@ -576,9 +624,10 @@ fn retry_base(failure: Failure, attempts: u32) -> DirectRetry {
 #[must_use]
 pub const fn accepts_direct(accept: DirectAccept, shares_room: bool) -> bool {
     match accept {
-        DirectAccept::RoomPeers => shares_room,
+        // v45.3 — one address predicate on both sides: `identified_only`
+        // follows the room/contact rule, as `room_peers` does.
+        DirectAccept::RoomPeers | DirectAccept::IdentifiedOnly => shares_room,
         DirectAccept::Off => false,
-        DirectAccept::IdentifiedOnly => true,
     }
 }
 
@@ -595,12 +644,17 @@ pub const DIRECT_STANDING_WAIT: Duration =
 pub const DIRECT_STANDING_POLL: Duration = Duration::from_millis(50);
 
 /// Whether a request is held for standing rather than answered now: only
-/// under [`DirectAccept::RoomPeers`], only from a peer the link is attributed
-/// to, and only while that peer has no standing. `Off` and `IdentifiedOnly`
-/// do not read standing; an unattributed link can never earn it.
+/// under [`DirectAccept::RoomPeers`] (or `IdentifiedOnly`, which follows it),
+/// only from a peer the link is attributed to, and only while that peer has
+/// no standing. `Off` does not read standing; an unattributed link can never
+/// earn it.
 #[must_use]
 pub const fn waits_for_standing(accept: DirectAccept, peer_known: bool, shares_room: bool) -> bool {
-    matches!(accept, DirectAccept::RoomPeers) && peer_known && !shares_room
+    matches!(
+        accept,
+        DirectAccept::RoomPeers | DirectAccept::IdentifiedOnly
+    ) && peer_known
+        && !shares_room
 }
 
 /// The `direct_link` metric label of a failure.
@@ -1214,6 +1268,17 @@ pub(crate) struct DirectPaths {
     /// v0.34.0+ciris.3 pin: leviculum measures nothing yet. Its probe
     /// summary (`direct_link_diag` `event = "probe"`) will fill it.
     local_nat: std::sync::Mutex<Option<crate::transport::media_path::NatReport>>,
+    /// v45.3 — the escalation answer last handed leviculum per link
+    /// (`set_direct_link_escalation`), so a change is seen as one.
+    escalation: std::sync::Mutex<HashMap<LinkId, bool>>,
+    /// v45.3 — a peer's standing may have changed (a room, a contact, the
+    /// tier): the event loop re-reads the address predicate on every link.
+    standing: tokio::sync::Notify,
+    /// v45.3 — this node's proposals that ended without a direct path since
+    /// the predicate was last re-read.
+    failed: std::sync::Mutex<std::collections::HashSet<LinkId>>,
+    /// Test seam: the predicate's cadence recheck is off.
+    recheck_off_for_test: std::sync::atomic::AtomicBool,
     /// Test seam: refuse every peer's direct-link request (REJECT `POLICY`),
     /// whatever the accept rule says.
     refuse_for_test: std::sync::atomic::AtomicBool,
@@ -1236,6 +1301,10 @@ impl DirectPaths {
             contacts: std::sync::Mutex::new(std::collections::HashSet::new()),
             yielding: std::sync::Mutex::new(HashMap::new()),
             local_nat: std::sync::Mutex::new(None),
+            escalation: std::sync::Mutex::new(HashMap::new()),
+            standing: tokio::sync::Notify::new(),
+            failed: std::sync::Mutex::new(std::collections::HashSet::new()),
+            recheck_off_for_test: std::sync::atomic::AtomicBool::new(false),
             refuse_for_test: std::sync::atomic::AtomicBool::new(false),
             refuse_peers_for_test: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
@@ -1257,6 +1326,72 @@ impl DirectPaths {
             .local_nat
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+    }
+
+    /// v45.3 — record the escalation answer handed leviculum for `link`;
+    /// returns the one before it.
+    pub(crate) fn note_escalation(&self, link: LinkId, allowed: bool) -> Option<bool> {
+        self.escalation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(link, allowed)
+    }
+
+    /// v45.3 — forget a closed link's escalation answer.
+    pub(crate) fn forget_escalation(&self, link: &LinkId) {
+        self.escalation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(link);
+    }
+
+    /// v45.3 — the escalation answer last handed leviculum for `link`.
+    pub(crate) fn escalation_of(&self, link: &LinkId) -> Option<bool> {
+        self.escalation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(link)
+            .copied()
+    }
+
+    /// v45.3 — this node's proposal on `link` ended without a direct path.
+    pub(crate) fn note_failed(&self, link: LinkId) {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(link);
+    }
+
+    /// v45.3 — the proposals that failed since the last call.
+    pub(crate) fn take_failed(&self) -> std::collections::HashSet<LinkId> {
+        std::mem::take(
+            &mut *self
+                .failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Test seam: turn the predicate's cadence recheck off.
+    pub(crate) fn set_recheck_off_for_test(&self, off: bool) {
+        self.recheck_off_for_test
+            .store(off, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the predicate's cadence recheck is off (a test seam).
+    pub(crate) fn recheck_off_for_test(&self) -> bool {
+        self.recheck_off_for_test
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// v45.3 — a peer's standing may have changed: wake the re-read.
+    pub(crate) fn notify_standing(&self) {
+        self.standing.notify_one();
+    }
+
+    /// v45.3 — resolves when [`Self::notify_standing`] was called.
+    pub(crate) async fn standing_changed(&self) {
+        self.standing.notified().await;
     }
 
     /// Test seam: refuse every direct-link request while set.
@@ -1319,14 +1454,17 @@ impl DirectPaths {
     /// peer by its NODE key id (on sending a request, and on accepting one).
     /// `false` when the set is full ([`DIRECT_CONTACTS_MAX`]).
     pub(crate) fn allow_contact(&self, node_key_id: &str) -> bool {
-        let mut contacts = self
-            .contacts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if contacts.len() >= DIRECT_CONTACTS_MAX && !contacts.contains(node_key_id) {
-            return false;
+        {
+            let mut contacts = self
+                .contacts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if contacts.len() >= DIRECT_CONTACTS_MAX && !contacts.contains(node_key_id) {
+                return false;
+            }
+            contacts.insert(node_key_id.to_owned());
         }
-        contacts.insert(node_key_id.to_owned());
+        self.notify_standing();
         true
     }
 
@@ -1336,6 +1474,7 @@ impl DirectPaths {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(node_key_id);
+        self.notify_standing();
     }
 
     /// Whether `peer` is a consented contact.
@@ -1614,10 +1753,8 @@ mod tests {
             accept: DirectAccept::IdentifiedOnly,
             ..c
         };
-        assert_eq!(
-            c.leviculum_settings().policy,
-            DirectLinkPolicy::IdentifiedOnly
-        );
+        // v45.3 — asked per request, under the same predicate.
+        assert_eq!(c.leviculum_settings().policy, DirectLinkPolicy::AskHost);
     }
 
     #[test]
@@ -1625,7 +1762,9 @@ mod tests {
         assert!(accepts_direct(DirectAccept::RoomPeers, true));
         assert!(!accepts_direct(DirectAccept::RoomPeers, false));
         assert!(!accepts_direct(DirectAccept::Off, true));
-        assert!(accepts_direct(DirectAccept::IdentifiedOnly, false));
+        // v45.3 — `identified_only` follows the room/contact rule.
+        assert!(!accepts_direct(DirectAccept::IdentifiedOnly, false));
+        assert!(accepts_direct(DirectAccept::IdentifiedOnly, true));
     }
 
     /// Only a known peer with no standing yet, under `RoomPeers`, is held; the
@@ -1636,7 +1775,7 @@ mod tests {
         assert!(!waits_for_standing(DirectAccept::RoomPeers, true, true));
         assert!(!waits_for_standing(DirectAccept::RoomPeers, false, false));
         assert!(!waits_for_standing(DirectAccept::Off, true, false));
-        assert!(!waits_for_standing(
+        assert!(waits_for_standing(
             DirectAccept::IdentifiedOnly,
             true,
             false
@@ -2044,5 +2183,67 @@ mod tests {
         );
         let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(false, || None, &[]);
         assert_eq!((src, d.facilitator), (FacilitatorSource::None, None));
+    }
+
+    /// 45.3 (Eric, 11-22) — the second NAT observer: the bundle's facilitator
+    /// at its dial port + 1, derived at resolve, UDP probes only; none for a
+    /// host-named facilitator or a bootstrap peer unless the host names one;
+    /// a host's own second is kept. On a serve seat (serving a facilitator,
+    /// the flag on) leviculum answers on the second port; never without a
+    /// facilitator served.
+    #[test]
+    fn the_second_observer_is_the_bundle_facilitators_next_port() {
+        assert_eq!(
+            second_observer_of("127.0.0.1:4242").as_deref(),
+            Some("127.0.0.1:4243")
+        );
+        assert_eq!(second_observer_of("127.0.0.1:65535"), None, "no next port");
+        assert_eq!(second_observer_of("not-an-addr"), None);
+        let boot: Vec<std::net::SocketAddr> = vec!["127.0.0.1:5000".parse().unwrap()];
+        let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(
+            true,
+            || Some("127.0.0.1:4242".to_owned()),
+            &boot,
+        );
+        assert_eq!(src, FacilitatorSource::Bundle);
+        assert_eq!(d.facilitator2.as_deref(), Some("127.0.0.1:4243"));
+        assert_eq!(d.second_observer_role(), "derived");
+        let s = d.leviculum_settings();
+        assert_eq!(s.facilitator2.as_deref(), Some("127.0.0.1:4243"));
+        assert_eq!(s.protocol2, ProbeProtocol::Rnsp);
+        assert!(!s.facilitator_second_port, "a prober serves no second port");
+        // Host-named: no derived second.
+        let (d, src) = DirectLinksConfig {
+            facilitator: Some("127.0.0.1:7000".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_facilitator_from(true, || Some("127.0.0.1:4242".to_owned()), &boot);
+        assert_eq!(src, FacilitatorSource::Host);
+        assert_eq!(d.facilitator2, None);
+        assert_eq!(d.second_observer_role(), "none");
+        // Bootstrap: none either.
+        let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(false, || None, &boot);
+        assert_eq!(src, FacilitatorSource::Bootstrap);
+        assert_eq!(d.facilitator2, None);
+        // A host's own second is kept, bundle or not.
+        let (d, _) = DirectLinksConfig {
+            facilitator2: Some("127.0.0.1:9000".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_facilitator_from(true, || Some("127.0.0.1:4242".to_owned()), &boot);
+        assert_eq!(d.facilitator2.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(d.second_observer_role(), "named");
+        // The serve seat's second port: only with a facilitator served.
+        let seat = DirectLinksConfig {
+            serve_facilitator: Some(4242),
+            serve_second_port: true,
+            ..DirectLinksConfig::default()
+        };
+        assert!(seat.leviculum_settings().facilitator_second_port);
+        let not_serving = DirectLinksConfig {
+            serve_second_port: true,
+            ..DirectLinksConfig::default()
+        };
+        assert!(!not_serving.leviculum_settings().facilitator_second_port);
     }
 }

@@ -1313,14 +1313,19 @@ impl ReplicationCoordinator {
             }
         };
         self.book_wire_built(msg, bytes.len());
-        self.transport
-            .send(&self.peer_key_id, &bytes)
-            .await
-            .map(|_| {
-                self.book_served(msg);
-                self.book_wire(msg, bytes.len(), true);
-            })
-            .map_err(CoordinatorError::from)
+        // 45.3 — the egress class from the message's row family (CC
+        // review: FIRST unless every row is positively bulk).
+        crate::transport::egress_budget::sending_as_family(
+            super::egress_class::class_of(msg),
+            super::egress_class::family_of(msg),
+            self.transport.send(&self.peer_key_id, &bytes),
+        )
+        .await
+        .map(|_| {
+            self.book_served(msg);
+            self.book_wire(msg, bytes.len(), true);
+        })
+        .map_err(CoordinatorError::from)
     }
 
     /// Range fingerprints, step A (design §8, §11.2) — a Summary as BUILT,
@@ -1537,14 +1542,19 @@ impl ReplicationCoordinator {
     ) -> Result<(), CoordinatorError> {
         let bytes = Self::reply_frame(msg, round);
         self.book_wire_built(msg, bytes.len());
-        self.transport
-            .send(&self.peer_key_id, &bytes)
-            .await
-            .map(|_| {
-                self.book_served(msg);
-                self.book_wire(msg, bytes.len(), true);
-            })
-            .map_err(CoordinatorError::from)
+        // 45.3 — the egress class from the message's row family (CC
+        // review: FIRST unless every row is positively bulk).
+        crate::transport::egress_budget::sending_as_family(
+            super::egress_class::class_of(msg),
+            super::egress_class::family_of(msg),
+            self.transport.send(&self.peer_key_id, &bytes),
+        )
+        .await
+        .map(|_| {
+            self.book_served(msg);
+            self.book_wire(msg, bytes.len(), true);
+        })
+        .map_err(CoordinatorError::from)
     }
 
     /// Take this peer's queued signer name and send the `Pull` that recovers it
@@ -1791,14 +1801,19 @@ impl ReplicationCoordinator {
     ) -> Result<(), CoordinatorError> {
         let bytes = super::wire_frame::wrap_v3(msg, RoundSide::Initiator, round);
         self.book_wire_built(msg, bytes.len());
-        self.transport
-            .send(&self.peer_key_id, &bytes)
-            .await
-            .map(|_| {
-                self.book_served(msg);
-                self.book_wire(msg, bytes.len(), true);
-            })
-            .map_err(CoordinatorError::from)
+        // 45.3 — the egress class from the message's row family (CC
+        // review: FIRST unless every row is positively bulk).
+        crate::transport::egress_budget::sending_as_family(
+            super::egress_class::class_of(msg),
+            super::egress_class::family_of(msg),
+            self.transport.send(&self.peer_key_id, &bytes),
+        )
+        .await
+        .map(|_| {
+            self.book_served(msg);
+            self.book_wire(msg, bytes.len(), true);
+        })
+        .map_err(CoordinatorError::from)
     }
 
     async fn drive_pull_exchange(

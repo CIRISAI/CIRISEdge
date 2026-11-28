@@ -205,9 +205,19 @@ struct Node {
     transport: Arc<ReticulumTransport>,
     metrics: EdgeMetrics,
     lifecycle: Arc<ScopeLifecycle>,
+    /// Identity-plane frames this node received that carry [`PROBE_MARKER`]:
+    /// when, and the bytes.
+    probes: ProbeLog,
     _edge: ciris_edge::Edge,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
+
+/// What a probe envelope starts with (the 45.3 FIRST-class witness).
+const PROBE_MARKER: &[u8] = b"W1PROBE:";
+/// Bulk envelopes queued ahead of each probe.
+const PROBE_FILLERS: usize = 10;
+/// Probe envelopes a node heard: when, and the bytes.
+type ProbeLog = Arc<std::sync::Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>>;
 
 async fn node(
     key: Ident,
@@ -275,11 +285,22 @@ async fn node(
     ));
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
     let listener = Arc::clone(&transport);
+    let probes: ProbeLog = Arc::default();
+    let heard = Arc::clone(&probes);
     let tasks = vec![
         tokio::spawn(async move {
             let _ = listener.listen(tx).await;
         }),
-        tokio::spawn(async move { while rx.recv().await.is_some() {} }),
+        tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if f.envelope_bytes.starts_with(PROBE_MARKER) {
+                    heard
+                        .lock()
+                        .expect("probes")
+                        .push((tokio::time::Instant::now(), f.envelope_bytes));
+                }
+            }
+        }),
     ];
     Node {
         key,
@@ -288,6 +309,7 @@ async fn node(
         transport,
         metrics,
         lifecycle,
+        probes,
         _edge: edge,
         _tasks: tasks,
     }
@@ -494,10 +516,363 @@ async fn capped_listener(port: u16, uplink: Arc<CappedUplink>) -> u16 {
     front
 }
 
+/// 45.3 — a node's WHOLE uplink as the server matrix shapes it: `tc qdisc
+/// netem rate {cap}kbit limit 1000` on the node's interface. ONE FIFO for
+/// everything the node sends on every link (media, C3 control, identity and
+/// replication traffic, Channel proofs), drained at a byte rate, holding at
+/// most [`NETEM_LIMIT_PACKETS`] packets and TAIL-DROPPING a packet that
+/// finds it full; a packet's delay is the queue ahead of it over the rate.
+///
+/// A packet here is one RNS packet: the in-process links are TCP, so the
+/// pipe splits the node's byte stream at its HDLC frame boundaries (leviculum
+/// frames every packet `0x7E … 0x7E`, nothing inside escapes to a raw flag)
+/// and queues each frame as one packet, as the matrix's UDP and punched links
+/// carry one RNS packet per datagram. A dropped frame is gone, as a dropped
+/// datagram is: TCP's own retransmission would hide the loss the matrix
+/// sees. Each packet is charged its bytes plus [`NETEM_OVERHEAD_BYTES`] (the
+/// IP and UDP headers netem's rate counts). What others send the node passes
+/// at once. Test-only; off (no rate, no limit, no delay) until capped.
+struct NetemUplink {
+    bytes_per_s: AtomicU64,
+    q: std::sync::Mutex<std::collections::VecDeque<(u64, Vec<u8>)>>,
+    wake: tokio::sync::Notify,
+    conns: std::sync::Mutex<std::collections::HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>,
+    next_conn: AtomicU64,
+    enqueued: AtomicU64,
+    dropped: AtomicU64,
+    sent_packets: AtomicU64,
+    sent_bytes: AtomicU64,
+    backlog_bytes: AtomicU64,
+    /// The packet limit (default [`NETEM_LIMIT_PACKETS`]).
+    limit: AtomicU64,
+    /// Media datagrams handed to the shaper (cumulative packets, bytes).
+    media_packets: AtomicU64,
+    media_bytes: AtomicU64,
+    /// Audio datagrams (cumulative packets, wire bytes with the overhead).
+    audio_packets: AtomicU64,
+    audio_bytes: AtomicU64,
+    /// The same for 60 ms audio packets (≥ 390 B).
+    audio_long_packets: AtomicU64,
+    audio_long_bytes: AtomicU64,
+    /// What the node handed the shaper since the last
+    /// [`NetemUplink::take_classes`], by [`rns_class`] and link.
+    classes: std::sync::Mutex<ClassMap>,
+}
+
+/// What a node handed its shaper, by [`rns_class`] and link.
+type ClassMap = std::collections::HashMap<(&'static str, Option<[u8; 16]>), ClassCount>;
+
+/// One class's share of what a node handed its shaper.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassCount {
+    packets: u64,
+    bytes: u64,
+    dropped: u64,
+}
+
+/// netem's `limit`: the packets its queue holds (the server's 1000).
+const NETEM_LIMIT_PACKETS: usize = 1000;
+
+/// The class of one HDLC-framed RNS packet (IFAC off, as in the harness), and
+/// the link it rides when its destination is a link: packet type, then
+/// context (leviculum `packet.rs`; `0xF0` is +ciris Datagram, the media lane).
+fn rns_class(frame: &[u8]) -> (&'static str, Option<[u8; 16]>) {
+    let mut b = Vec::with_capacity(48);
+    let mut esc = false;
+    for &x in frame {
+        if b.len() >= 48 {
+            break;
+        }
+        match (esc, x) {
+            (_, 0x7E) => {}
+            (false, 0x7D) => esc = true,
+            (true, _) => {
+                b.push(x ^ 0x20);
+                esc = false;
+            }
+            (false, _) => b.push(x),
+        }
+    }
+    let Some(&flags) = b.first() else {
+        return ("empty", None);
+    };
+    if flags & 0x80 != 0 {
+        return ("ifac", None);
+    }
+    let header_2 = flags & 0x40 != 0;
+    let dest_at = if header_2 { 18 } else { 2 };
+    let ctx = b.get(dest_at + 16).copied();
+    let link = if (flags >> 2) & 0x03 == 0x03 {
+        b.get(dest_at..dest_at + 16)
+            .and_then(|d| <[u8; 16]>::try_from(d).ok())
+    } else {
+        None
+    };
+    let class = match (flags & 0x03, ctx) {
+        (0x01, _) => "announce",
+        (0x02, _) => "link_request",
+        (0x03, Some(0xFF)) => "lrproof",
+        (0x03, _) => "proof",
+        (_, Some(0xF0)) => "media_datagram",
+        (_, Some(0x0E)) => "channel",
+        (_, Some(0xFA)) => "keepalive",
+        (_, Some(0x01..=0x07)) => "resource",
+        (_, Some(0x09)) => "request",
+        (_, Some(0x0A)) => "response",
+        (_, Some(0xFB)) => "link_identify",
+        (_, Some(0xFC)) => "link_close",
+        (_, Some(0xFE)) => "lrrtt",
+        (_, Some(0x00)) => "data",
+        _ => "data_other",
+    };
+    (class, link)
+}
+/// What netem's rate counts on top of an RNS packet: IPv4 (20) + UDP (8).
+const NETEM_OVERHEAD_BYTES: u64 = 28;
+
+/// One second of a [`NetemUplink`]'s counters.
+#[derive(Debug, Clone, Copy, Default)]
+struct NetemSecond {
+    enqueued: u64,
+    dropped: u64,
+    sent_packets: u64,
+    sent_bytes: u64,
+    backlog_packets: u64,
+    backlog_bytes: u64,
+}
+
+impl NetemUplink {
+    fn new() -> Arc<Self> {
+        let u = Arc::new(Self {
+            bytes_per_s: AtomicU64::new(0),
+            q: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            wake: tokio::sync::Notify::new(),
+            conns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_conn: AtomicU64::new(0),
+            enqueued: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            sent_packets: AtomicU64::new(0),
+            sent_bytes: AtomicU64::new(0),
+            backlog_bytes: AtomicU64::new(0),
+            limit: AtomicU64::new(NETEM_LIMIT_PACKETS as u64),
+            media_packets: AtomicU64::new(0),
+            media_bytes: AtomicU64::new(0),
+            audio_packets: AtomicU64::new(0),
+            audio_bytes: AtomicU64::new(0),
+            audio_long_packets: AtomicU64::new(0),
+            audio_long_bytes: AtomicU64::new(0),
+            classes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let d = Arc::clone(&u);
+        tokio::spawn(async move { d.drain().await });
+        u
+    }
+
+    /// Cap the uplink at `kbit` (0: lift; what is queued then leaves at once).
+    fn cap_kbit(&self, kbit: u64) {
+        self.bytes_per_s.store(kbit * 1000 / 8, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    fn register(&self, tx: mpsc::UnboundedSender<Vec<u8>>) -> u64 {
+        let id = self.next_conn.fetch_add(1, Ordering::SeqCst);
+        self.conns.lock().expect("conns").insert(id, tx);
+        id
+    }
+
+    /// One packet the node sends on `conn`: queued, or tail-dropped when the
+    /// capped queue is full.
+    fn push(&self, conn: u64, pkt: Vec<u8>) {
+        let capped = self.bytes_per_s.load(Ordering::SeqCst) > 0;
+        let mut key = rns_class(&pkt);
+        if key.0 == "media_datagram" && pkt.len() < AUDIO_PACKET_MAX {
+            key.0 = "media_audio";
+        }
+        let limit = usize::try_from(self.limit.load(Ordering::SeqCst)).unwrap_or(usize::MAX);
+        {
+            let mut q = self.q.lock().expect("q");
+            let full = capped && q.len() >= limit;
+            {
+                let mut c = self.classes.lock().expect("classes");
+                let e = c.entry(key).or_default();
+                e.packets += 1;
+                e.bytes += pkt.len() as u64;
+                e.dropped += u64::from(full);
+            }
+            if key.0 == "media_datagram" {
+                self.media_packets.fetch_add(1, Ordering::SeqCst);
+                self.media_bytes
+                    .fetch_add(pkt.len() as u64, Ordering::SeqCst);
+            } else if key.0 == "media_audio" {
+                let (p, b) = if pkt.len() >= 390 {
+                    (&self.audio_long_packets, &self.audio_long_bytes)
+                } else {
+                    (&self.audio_packets, &self.audio_bytes)
+                };
+                p.fetch_add(1, Ordering::SeqCst);
+                b.fetch_add(pkt.len() as u64 + NETEM_OVERHEAD_BYTES, Ordering::SeqCst);
+            }
+            if full {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            self.backlog_bytes
+                .fetch_add(pkt.len() as u64, Ordering::SeqCst);
+            q.push_back((conn, pkt));
+        }
+        self.enqueued.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    /// The one drain: head first, each packet leaving after its
+    /// transmission time at the rate (none uncapped).
+    async fn drain(self: Arc<Self>) {
+        let mut next_free = tokio::time::Instant::now();
+        loop {
+            let head = self.q.lock().expect("q").pop_front();
+            let Some((conn, pkt)) = head else {
+                self.wake.notified().await;
+                continue;
+            };
+            let rate = self.bytes_per_s.load(Ordering::SeqCst);
+            let now = tokio::time::Instant::now();
+            if let Some(us) =
+                ((pkt.len() as u64 + NETEM_OVERHEAD_BYTES) * 1_000_000).checked_div(rate)
+            {
+                next_free = next_free.max(now) + Duration::from_micros(us);
+                tokio::time::sleep_until(next_free).await;
+            } else {
+                next_free = now;
+            }
+            self.backlog_bytes
+                .fetch_sub(pkt.len() as u64, Ordering::SeqCst);
+            self.sent_packets.fetch_add(1, Ordering::SeqCst);
+            self.sent_bytes
+                .fetch_add(pkt.len() as u64 + NETEM_OVERHEAD_BYTES, Ordering::SeqCst);
+            let tx = self.conns.lock().expect("conns").get(&conn).cloned();
+            if let Some(tx) = tx {
+                let _ = tx.send(pkt);
+            }
+        }
+    }
+
+    /// What the node handed the shaper since the last call, by class and link.
+    fn take_classes(&self) -> ClassMap {
+        std::mem::take(&mut *self.classes.lock().expect("classes"))
+    }
+
+    /// Media datagrams handed to the shaper so far: (packets, bytes).
+    fn media_totals(&self) -> (u64, u64) {
+        (
+            self.media_packets.load(Ordering::SeqCst),
+            self.media_bytes.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Audio datagrams handed to the shaper so far: (wire bytes, packets),
+    /// 20 ms ones and 60 ms ones.
+    fn audio_totals(&self) -> ((u64, u64), (u64, u64)) {
+        (
+            (
+                self.audio_bytes.load(Ordering::SeqCst),
+                self.audio_packets.load(Ordering::SeqCst),
+            ),
+            (
+                self.audio_long_bytes.load(Ordering::SeqCst),
+                self.audio_long_packets.load(Ordering::SeqCst),
+            ),
+        )
+    }
+
+    /// Hold at most `packets` (netem's `limit`).
+    fn set_limit(&self, packets: u64) {
+        self.limit.store(packets, Ordering::SeqCst);
+    }
+
+    /// The counters now (cumulative, and the backlog).
+    fn read(&self) -> NetemSecond {
+        NetemSecond {
+            enqueued: self.enqueued.load(Ordering::SeqCst),
+            dropped: self.dropped.load(Ordering::SeqCst),
+            sent_packets: self.sent_packets.load(Ordering::SeqCst),
+            sent_bytes: self.sent_bytes.load(Ordering::SeqCst),
+            backlog_packets: self.q.lock().expect("q").len() as u64,
+            backlog_bytes: self.backlog_bytes.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Split `buf` (appended to `carry`) into whole HDLC-framed packets: a
+/// packet ends at a `0x7E` that follows at least one non-flag byte, and
+/// carries every byte since the last packet's end, its opening flag
+/// included, so the stream the peer reads is byte-identical when nothing
+/// is dropped.
+fn hdlc_packets(carry: &mut Vec<u8>, buf: &[u8]) -> Vec<Vec<u8>> {
+    const FLAG: u8 = 0x7E;
+    let mut out = Vec::new();
+    for &b in buf {
+        carry.push(b);
+        if b == FLAG && carry.iter().rev().skip(1).any(|x| *x != FLAG) {
+            out.push(std::mem::take(carry));
+        }
+    }
+    out
+}
+
+/// A pipe in front of `port`'s listener whose return direction (the node's
+/// sends) rides `uplink`, packet by packet. Returns the port to dial instead.
+async fn netem_listener(port: u16, uplink: Arc<NetemUplink>) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the netem pipe");
+    let front = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(node) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+                continue;
+            };
+            let _ = client.set_nodelay(true);
+            let _ = node.set_nodelay(true);
+            let (mut client_rx, mut client_tx) = client.into_split();
+            let (mut node_rx, mut node_tx) = node.into_split();
+            // The node's downlink: unshaped.
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_rx, &mut node_tx).await;
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let conn = uplink.register(tx);
+            let up = Arc::clone(&uplink);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut carry = Vec::new();
+                while let Ok(n) = node_rx.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    for pkt in hdlc_packets(&mut carry, &buf[..n]) {
+                        up.push(conn, pkt);
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some(bytes) = rx.recv().await {
+                    if client_tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    front
+}
+
 /// [`topo`], with node `capped.0`'s uplink a [`CappedUplink`]: every node that
 /// dials it reaches it through [`capped_listener`]. The capped node must dial
 /// nobody (its own outbound connections would bypass the cap).
-#[allow(clippy::too_many_lines)] // `topo`'s body plus the capped pipe
 async fn topo_capped(
     tag: &str,
     n: usize,
@@ -505,6 +880,37 @@ async fn topo_capped(
     dials: &[(usize, usize)],
     canonical: Option<usize>,
     capped: Option<(usize, Arc<CappedUplink>)>,
+) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
+    topo_shaped(
+        tag,
+        n,
+        members,
+        dials,
+        canonical,
+        capped.map(|(c, u)| (c, Shaper::Fluid(u))),
+    )
+    .await
+}
+
+/// The bottleneck in front of a capped node's egress.
+#[derive(Clone)]
+enum Shaper {
+    /// [`CappedUplink`]: a byte rate, no queue limit, nothing dropped.
+    Fluid(Arc<CappedUplink>),
+    /// [`NetemUplink`]: the server matrix's shaper (rate + a packet FIFO
+    /// that tail-drops).
+    Netem(Arc<NetemUplink>),
+}
+
+/// [`topo_capped`] with any [`Shaper`].
+#[allow(clippy::too_many_lines)] // `topo`'s body plus the capped pipe
+async fn topo_shaped(
+    tag: &str,
+    n: usize,
+    members: usize,
+    dials: &[(usize, usize)],
+    canonical: Option<usize>,
+    capped: Option<(usize, Shaper)>,
 ) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
     init_tracing();
     if let Some((c, _)) = &capped {
@@ -537,8 +943,12 @@ async fn topo_capped(
             match &capped {
                 Some((c, uplink)) if c == a => {
                     if capped_port.is_none() {
-                        capped_port =
-                            Some(capped_listener(nodes[*a].port, Arc::clone(uplink)).await);
+                        capped_port = Some(match uplink {
+                            Shaper::Fluid(u) => {
+                                capped_listener(nodes[*a].port, Arc::clone(u)).await
+                            }
+                            Shaper::Netem(u) => netem_listener(nodes[*a].port, Arc::clone(u)).await,
+                        });
                     }
                     peers.push(capped_port.expect("the capped pipe"));
                 }
@@ -3656,6 +4066,57 @@ fn count_frames_from(listeners: &mut [Call], publisher: &str) -> FrameCounts {
     FrameCounts { counts, tasks }
 }
 
+/// One listener's arrivals: each frame's seq and when it was handed out.
+type ArrivalLog = Arc<std::sync::Mutex<Vec<(u64, tokio::time::Instant)>>>;
+
+/// Every frame each of `listeners` hears from `publisher`: its seq (the
+/// `body` prefix) and when it was handed out, recorded as it arrives.
+struct FrameArrivals {
+    got: Vec<ArrivalLog>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl FrameArrivals {
+    fn read(&self) -> Vec<Vec<(u64, tokio::time::Instant)>> {
+        self.got
+            .iter()
+            .map(|g| g.lock().expect("arrivals").clone())
+            .collect()
+    }
+}
+
+impl Drop for FrameArrivals {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+fn record_frames_from(listeners: &mut [Call], publisher: &str) -> FrameArrivals {
+    let mut got = Vec::new();
+    let mut tasks = Vec::new();
+    for l in listeners.iter_mut() {
+        let mut rx = l.frames().expect("frames");
+        let g: ArrivalLog = Arc::default();
+        let w = Arc::clone(&g);
+        let from = publisher.to_owned();
+        tasks.push(tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if f.publisher == from {
+                    if let Some(s) = seq_of(&f.bytes) {
+                        w.lock()
+                            .expect("arrivals")
+                            .push((s, tokio::time::Instant::now()));
+                    }
+                }
+            }
+        }));
+        got.push(g);
+    }
+    FrameArrivals { got, tasks }
+}
+
 /// One frame at the 30 Hz these witnesses publish at.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
@@ -4140,7 +4601,11 @@ async fn a_member_whose_host_reads_nothing_still_relays_to_its_child() {
 /// and everyone keeps hearing `P` at about the one-copy rate. What must not
 /// happen (CIRISEdge 45.1.9 matrix, leviculum#113): every link of `P`
 /// torn down by Channel retry exhaustion within ~2 s of the cap.
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::cast_precision_loss
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     let _call = one_call().await;
@@ -4178,17 +4643,47 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     for l in &listeners {
         wait_legs(l, 3).await;
     }
-    // Counted as they arrive: each call's frame queue holds 256, and a
-    // count read only at the end is capped there.
-    let heard_of = count_frames_from(&mut listeners, &p.key.key_id);
+    // Recorded as they arrive: each call's frame queue holds 256, and a
+    // count read only at the end is capped there. Each frame's age is its
+    // arrival less its publish() call, on the one process clock.
+    let arrivals = record_frames_from(&mut listeners, &p.key.key_id);
+    let pid = p.key.key_id.clone();
+    let mut stamps: Vec<Stamp> = Vec::new();
+    let mut looks = Vec::new();
     // Baseline: the full mesh carries P.
-    let (seq, base_lat) = publish_timed_for(&mut cp, 5, 0).await;
+    let origin = tokio::time::Instant::now();
+    let seq = publish_looking_stamped(
+        &mut cp,
+        &listeners,
+        &uplink,
+        origin,
+        5,
+        0,
+        &mut looks,
+        Some(&mut stamps),
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let base = heard_of.read();
+    let base: Vec<usize> = arrivals.read().iter().map(Vec::len).collect();
     assert!(
-        base.iter().all(|n| *n * 10 >= seq * 9),
+        base.iter().all(|n| *n as u64 * 10 >= seq * 9),
         "baseline: {base:?} of {seq}"
     );
+    let sent_at: std::collections::HashMap<u64, tokio::time::Instant> =
+        stamps.iter().map(|(q, t, _)| (*q, *t)).collect();
+    // Each listener's floor: its quickest baseline frame (AGE's RM1 floor is
+    // the same kind of minimum, learned from the stream's on-time chunks).
+    let floor: Vec<Duration> = arrivals
+        .read()
+        .iter()
+        .map(|g| {
+            g.iter()
+                .filter_map(|(q, at)| sent_at.get(q).map(|t| at.saturating_duration_since(*t)))
+                .min()
+                .unwrap_or_default()
+        })
+        .collect();
+    let base_lat = stamps.iter().map(|(_, _, d)| *d).max().unwrap_or_default();
 
     // The cap: one copy of P's stream on the wire and a third to spare (the
     // server's cell, 250 kbit/s against ~190 kbit/s a copy, scaled to this
@@ -4234,17 +4729,30 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     };
     let capped_from = seq;
     let _ = uplink.take_peak();
-    let (seq, capped_lat) = publish_timed_for(&mut cp, 30, seq).await;
+    let mut capped = Vec::new();
+    let mut capped_stamps: Vec<Stamp> = Vec::new();
+    let seq = publish_looking_stamped(
+        &mut cp,
+        &listeners,
+        &uplink,
+        cap_on,
+        30,
+        seq,
+        &mut capped,
+        Some(&mut capped_stamps),
+    )
+    .await;
     sampler.abort();
     let peak = uplink.take_peak();
     let sent = seq - capped_from;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let heard: Vec<u64> = heard_of
-        .read()
+    let capped_lat = capped_stamps
         .iter()
-        .zip(&base)
-        .map(|(n, b)| n - b)
-        .collect();
+        .map(|(_, _, d)| *d)
+        .max()
+        .unwrap_or_default();
+    let sent_in_cap: std::collections::HashMap<u64, tokio::time::Instant> =
+        capped_stamps.iter().map(|(q, t, _)| (*q, *t)).collect();
     let exhausted: u64 = nodes
         .iter()
         .map(|n| channel_exhausted(&n.metrics))
@@ -4257,15 +4765,79 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
         .collect();
     let direct = parents
         .iter()
-        .filter(|x| x.as_deref() == Some(p.key.key_id.as_str()))
+        .filter(|x| x.as_deref() == Some(pid.as_str()))
         .count();
+    // Settled: P's uplink first queued 300 ms, that media's 300 ms on its
+    // way, and a second for the moves (the deadline
+    // `a_capped_publishers_children_move_themselves_and_come_back` holds the
+    // children to).
+    let late_at = capped
+        .iter()
+        .find(|l| l.queue_ms.is_some_and(|q| q >= 300))
+        .map(|l| l.at);
+    let settle = late_at.map(|t| t + Duration::from_millis(300) + Duration::from_secs(1));
+    let settle_at = settle.map(|d| cap_on + d);
+    // Per listener, over the capped run: frames delivered, the oldest one's
+    // age above its floor, and the fresh ones after the settle (within
+    // MEDIA_FRESH of their publish, above the floor).
+    let got = arrivals.read();
+    let mut delivered = Vec::new();
+    let mut oldest = Vec::new();
+    let mut fresh_settled = Vec::new();
+    for (i, g) in got.iter().enumerate() {
+        let mine: Vec<(Duration, tokio::time::Instant)> = g
+            .iter()
+            .filter_map(|(q, at)| {
+                sent_in_cap
+                    .get(q)
+                    .map(|t| (at.saturating_duration_since(*t), *at))
+            })
+            .collect();
+        delivered.push(mine.len());
+        oldest.push(
+            mine.iter()
+                .map(|(a, _)| a.saturating_sub(floor[i]))
+                .max()
+                .unwrap_or_default(),
+        );
+        fresh_settled.push(
+            mine.iter()
+                .filter(|(a, at)| {
+                    settle_at.is_some_and(|s| *at >= s) && a.saturating_sub(floor[i]) <= MEDIA_FRESH
+                })
+                .count(),
+        );
+    }
+    let settled_secs = settle.map_or(0.0, |d| 30.0 - d.as_secs_f64());
+    let direct_idx = parents
+        .iter()
+        .position(|x| x.as_deref() == Some(pid.as_str()));
     let context = format!(
-        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; peak queue {peak:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
-         ChannelExhausted {exhausted}; torn {torn}; first teardown after the cap (P, A, B, C, T) {:?}; P legs {:?}",
+        "copy {copy_kbit} kbit/s; sent {sent}; delivered {delivered:?}; floors {floor:?}; oldest above floor {oldest:?}; \
+         fresh after settle {fresh_settled:?} over {settled_secs:.1} s (direct listener {direct_idx:?}); late at {late_at:?}; \
+         peak queue {peak:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
+         ChannelExhausted {exhausted}; torn {torn}; first teardown after the cap (P, A, B, C, T) {:?}; P legs {:?}; \
+         looks {:?}",
         cp.alm_own_children(),
         cp.alm_counts(),
         first_torn.lock().expect("first").clone(),
-        cp.legs()
+        cp.legs(),
+        capped
+            .iter()
+            .step_by(5)
+            .map(|l| (
+                l.at.as_millis(),
+                l.queue_ms,
+                l.parents
+                    .iter()
+                    .map(|x| match x.as_deref() {
+                        None => '-',
+                        Some(x) if x == pid.as_str() => 'P',
+                        Some(_) => 'r',
+                    })
+                    .collect::<String>()
+            ))
+            .collect::<Vec<_>>(),
     );
     // Every criterion is judged and every failure named, so a red run says
     // what each fix buys (G8: A and C in edge, leviculum#113).
@@ -4291,31 +4863,75 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
             cp.alm_own_children()
         ));
     }
-    if parents.iter().any(Option::is_none) {
-        failed.push("a listener has no parent".to_owned());
-    }
     // The host's capture loop waits on publish(): one call must never cost
     // it a frame, capped or not (G8: 45-60 ms a call, and seconds when a
     // leg redialled, with sends retried under the publisher lock).
     for (phase, lat) in [("uncapped", base_lat), ("capped", capped_lat)] {
-        if lat.max >= FRAME_INTERVAL {
+        if lat >= FRAME_INTERVAL {
             failed.push(format!(
                 "publish() {phase}: {lat:?}, over one frame interval"
             ));
         }
     }
-    for (i, n) in heard.iter().enumerate() {
-        // About the one-copy rate: the uplink carries one copy, so each
-        // listener hears most of what P published once it settled.
-        if *n * 10 < sent * 7 {
-            failed.push(format!("listener {i} heard {n} of {sent}"));
+    // 45.3 — the bar changed with row AGE. Before it, each listener had to
+    // hear 70 % of what P published: true while relays passed on whatever
+    // reached them, however late. Under AGE a receiver never delivers or
+    // relays media more than MEDIA_FRESH (800 ms) above its floor, and a
+    // capped uplink's queue is seconds deep, so most of what P published
+    // during the cap is stale and dropped, by design. What AGE makes true,
+    // and is judged instead:
+    //   (1) after the settle no listener is without a parent;
+    //   (2) no stale media is delivered: every frame within MEDIA_FRESH of
+    //       its publish, above the listener's floor;
+    //   (3) the relayed listeners get fresh media at a fraction of what the
+    //       direct child gets (RELAYED_FRESH_SHARE, from this run's numbers).
+    let Some(settle) = settle else {
+        panic!("the cap never queued P's uplink 300 ms: {context}");
+    };
+    if let Some(l) = capped
+        .iter()
+        .find(|l| l.at > settle && l.parents.iter().any(Option::is_none))
+    {
+        failed.push(format!(
+            "a listener without a parent at {:?} (settled {settle:?}): {:?}",
+            l.at, l.parents
+        ));
+    }
+    for (i, o) in oldest.iter().enumerate() {
+        if *o > MEDIA_FRESH {
+            failed.push(format!(
+                "listener {i} was handed a frame {o:?} above its floor (stale past {MEDIA_FRESH:?})"
+            ));
+        }
+    }
+    if let Some(d) = direct_idx {
+        let base = fresh_settled[d];
+        for (i, n) in fresh_settled.iter().enumerate() {
+            if i != d && (*n as f64) < base as f64 * RELAYED_FRESH_SHARE {
+                failed.push(format!(
+                    "relayed listener {i}: {n} fresh frames after the settle, under {RELAYED_FRESH_SHARE} of the direct child's {base}"
+                ));
+            }
         }
     }
     eprintln!("[G8] capped publisher: {context}; failed {failed:?}");
     assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(arrivals);
     drop(listeners);
     drop(cp);
 }
+
+/// 45.3 — the share of the direct child's fresh frames each relayed listener
+/// must get after the settle in
+/// [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`]. The
+/// relayed ones hear the same copy one hop later, so they lose only what the
+/// relay's extra hop drops or turns stale: on this bench, 13 runs (10 alone,
+/// 3 under `taskset -c 0`), the worst relayed listener got 0.964 of the
+/// direct child's count (541 of 561 over 28.4 s settled) and the median
+/// about 0.99. 0.9 is about three times the worst shortfall seen: a relay
+/// whose hop pushes a tenth of the direct child's fresh frames past the
+/// budget is not relaying the one copy the cap carries.
+const RELAYED_FRESH_SHARE: f64 = 0.9;
 
 /// **G8 slow start — a call that STARTS on a capped uplink.** The same
 /// room and cap as [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`]
@@ -4851,6 +5467,25 @@ async fn publish_looking(
     seq0: u64,
     looks: &mut Vec<Look>,
 ) -> u64 {
+    publish_looking_stamped(cp, listeners, uplink, origin, secs, seq0, looks, None).await
+}
+
+/// One frame as `P` published it: its seq, when `publish()` was called, and
+/// how long that call took (the host's capture loop waits on it).
+type Stamp = (u64, tokio::time::Instant, Duration);
+
+/// [`publish_looking`], stamping every frame into `stamps` when given.
+#[allow(clippy::too_many_arguments)]
+async fn publish_looking_stamped(
+    cp: &mut Call,
+    listeners: &[Call],
+    uplink: &CappedUplink,
+    origin: tokio::time::Instant,
+    secs: u64,
+    seq0: u64,
+    looks: &mut Vec<Look>,
+    mut stamps: Option<&mut Vec<Stamp>>,
+) -> u64 {
     let size = cp.chunk_plaintext_budget().unwrap_or(240).min(600);
     let stream = cp.stream();
     let mut seq = seq0;
@@ -4858,7 +5493,11 @@ async fn publish_looking(
     while tokio::time::Instant::now() < end {
         let mut b = body("p", seq);
         b.resize(size, b'.');
+        let t = tokio::time::Instant::now();
         let _ = cp.publish(Frame::opaque(b)).await;
+        if let Some(st) = stamps.as_deref_mut() {
+            st.push((seq, t, t.elapsed()));
+        }
         if seq.is_multiple_of(3) {
             looks.push(Look {
                 at: origin.elapsed(),
@@ -5859,4 +6498,1406 @@ async fn late_joiners_in_a_room_where_nobody_relays_hear_everyone() {
         eprintln!("{}", room.logs());
     }
     assert!(failed.is_empty(), "{failed:?}");
+}
+
+// ─── 45.3: the whole-uplink cap, as the server matrix applies it ─────────
+
+/// One second of [`whole_uplink_cap`]'s samples.
+struct UplinkSecond {
+    s: u64,
+    shaper: NetemSecond,
+    /// Per node: (exhausted, timeout, stale) closes, cumulative.
+    torn: Vec<Vec<u64>>,
+    /// What m0 handed its shaper this second, by class and link.
+    classes: ClassMap,
+    /// m0's `av_send_congested` and `alm_c3_send_failed`, cumulative.
+    congested: u64,
+    c3_failed: u64,
+    /// m0's `alm_c3_received`, and every node's `alm_c3_sent`, cumulative.
+    c3_received: u64,
+    c3_sent: Vec<u64>,
+    /// m0's own A/V legs now: (member, srtt, learned srtt, min rtt, tx ring).
+    rtt: Vec<LegRtt>,
+}
+
+/// One of m0's legs: (member, srtt, learned srtt, min rtt, tx ring).
+type LegRtt = (String, Option<f64>, Option<f64>, Option<u64>, usize);
+
+/// What one [`whole_uplink_cap`] run measured.
+struct UplinkCapRun {
+    /// Per listener: the fraction of m0's frames heard, over the cap.
+    capped: Vec<f64>,
+    /// Per listener: over the cap's first 10 s.
+    first_10s: Vec<f64>,
+    /// Per listener: the fraction of m0's frames heard within 800 ms of
+    /// being published, over the cap after a 10 s settle.
+    capped_fresh: Vec<f64>,
+    /// Per listener: after the lift (from 2 s after it).
+    lifted: Vec<f64>,
+    /// Per listener: the longest gap between m0's frames under the cap.
+    longest_gap: Vec<Duration>,
+    /// Links torn down (exhausted/timeout/stale) under the cap, every node.
+    torn_under_cap: u64,
+    /// The cap applied (kbit/s), and the server's it stands for.
+    cap_kbit: u64,
+    /// Per listener: m0's audio heard within 800 ms after a 2 s settle.
+    audio_fresh: Vec<f64>,
+    /// Per listener: the longest audio gap after the settle.
+    audio_gap: Vec<Duration>,
+    /// Per listener: of m0's video frames delivered, the share within 800 ms.
+    video_fresh_of_delivered: Vec<f64>,
+    /// Per listener: the longest video gap after the settle.
+    video_gap: Vec<Duration>,
+    /// Per listener: the longest gap in DECODABLE video after the settle (a
+    /// frame decodes if it is a keyframe or follows the last decoded one).
+    video_decoded_gap: Vec<Duration>,
+    /// `CallEvent::KeyframeWanted` events m0's host saw, and whether it
+    /// honoured them.
+    keyframe_events: (u64, bool),
+    /// 45.3 (CC review, FIRST class) — a room removal and a chat row of the
+    /// same size, sent m0 → m1 at one instant: before the cap...
+    probe_uncapped: FirstProbe,
+    /// ...and mid-cap, while m0's budget is in force and holding video.
+    probe_capped: FirstProbe,
+}
+
+/// One FIRST-vs-BULK probe: each envelope's class (from edge's own
+/// classifier), its delivery time (`None`: not heard within the wait), the
+/// uplink FIFO's queue time at the send, and m0's held-video count across it.
+#[derive(Debug, Clone, Default)]
+struct FirstProbe {
+    removal_class: Option<ciris_edge::transport::egress_budget::SendClass>,
+    chat_class: Option<ciris_edge::transport::egress_budget::SendClass>,
+    removal: Option<Duration>,
+    chat: Option<Duration>,
+    fifo_ms: u64,
+    budget_bps: Option<f64>,
+    video_held: (u64, u64),
+}
+
+/// The probe: a `membership:removal` Deliver and a `chat:` Deliver, each
+/// classed by `ciris_edge::replication::egress_class::class_of` and sent by
+/// `from` under that class at one instant, padded to one size; heard on
+/// `to`'s identity plane. `cap_kbit` turns the FIFO's backlog into time.
+async fn first_probe(
+    from: &Node,
+    to: &Node,
+    uplink: &NetemUplink,
+    cap_kbit: u64,
+    tag: &str,
+) -> FirstProbe {
+    use ciris_edge::replication::egress_class::class_of;
+    use ciris_edge::replication::protocol::{DeliverMessage, EnvelopeKind, ReplicationMessage};
+    const SIZE: usize = 1_200;
+    let deliver = |dimension: &str| {
+        ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![serde_json::to_vec(&serde_json::json!({
+                "attestation_id": "probe",
+                "attestation_type": "membership",
+                "attestation_envelope": {"dimension": dimension},
+            }))
+            .expect("row")],
+        })
+    };
+    let removal_class = class_of(&deliver("membership:removal:v1"));
+    let chat_class = class_of(&deliver("chat:message:v1"));
+    let bytes = |what: &str| {
+        let mut b = PROBE_MARKER.to_vec();
+        b.extend_from_slice(format!("{tag}:{what}:").as_bytes());
+        b.resize(SIZE, b'.');
+        b
+    };
+    let held = |n: &Node| av(&n.metrics, "av_frame_held_budget");
+    let held0 = held(from);
+    let budget_bps = from.transport.egress_budget().rate_bps();
+    let q = uplink.read();
+    let fifo_ms = (q.backlog_bytes * 8).checked_div(cap_kbit).unwrap_or(0);
+    // Bulk already waiting: ten envelopes of the same size queued ahead, as
+    // a replication round's rows would be. A removal filed as bulk would
+    // wait behind them; the chat row does.
+    for k in 0..PROBE_FILLERS {
+        let t = Arc::clone(&from.transport);
+        let dest = to.key.key_id.clone();
+        let b = bytes(&format!("filler{k}"));
+        tokio::spawn(async move {
+            let _ = ciris_edge::transport::egress_budget::sending_as(
+                ciris_edge::transport::egress_budget::SendClass::Bulk,
+                t.send(&dest, &b),
+            )
+            .await;
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let sent = tokio::time::Instant::now();
+    for (what, class) in [("removal", removal_class), ("chat", chat_class)] {
+        let t = Arc::clone(&from.transport);
+        let dest = to.key.key_id.clone();
+        let b = bytes(what);
+        tokio::spawn(async move {
+            let _ =
+                ciris_edge::transport::egress_budget::sending_as(class, t.send(&dest, &b)).await;
+        });
+    }
+    let heard = |what: &str| {
+        let want = format!("{tag}:{what}:");
+        to.probes
+            .lock()
+            .expect("probes")
+            .iter()
+            .find(|(_, b)| b[PROBE_MARKER.len()..].starts_with(want.as_bytes()))
+            .map(|(at, _)| at.saturating_duration_since(sent))
+    };
+    let until = sent + Duration::from_secs(30);
+    while tokio::time::Instant::now() < until
+        && (heard("removal").is_none() || heard("chat").is_none())
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    FirstProbe {
+        removal_class: Some(removal_class),
+        chat_class: Some(chat_class),
+        removal: heard("removal"),
+        chat: heard("chat"),
+        fifo_ms,
+        budget_bps,
+        video_held: (held0, held(from)),
+    }
+}
+
+/// The frame sequence number `body("w", seq)` carries.
+fn seq_of(bytes: &[u8]) -> Option<u64> {
+    let s = std::str::from_utf8(bytes.get(..32)?.split(|b| *b == b'.').next()?).ok()?;
+    let rest = s.split("-frame-").nth(1)?;
+    rest.split('-').next()?.parse().ok()
+}
+
+/// **45.3 — the server matrix's capped-uplink cell, in process.** `n`
+/// members in a full mesh, every one publishing (600 B frames, or the leg's
+/// budget, at 30 Hz) with relay on. After a settled baseline m0's WHOLE
+/// uplink ([`NetemUplink`]: one FIFO for everything it sends, 1000 packets,
+/// tail drop) is capped for `cap_s` seconds, then lifted.
+///
+/// **The kbit/s here are NOT the server's.** This harness's links are
+/// loopback TCP with a link MDU of 431 B, so a frame is the leg's budget
+/// (246 B), not 600 B in one datagram. One copy is MEASURED in the
+/// baseline's last 5 s (a media packet is ~532 B on the wire with netem's
+/// 28 B, so ~127 kbit/s against ~190 on the server), and the cap is the
+/// server's 300 kbit/s scaled by that ratio (~200 kbit/s), so the same
+/// number of copies fit (1.58). The FIFO limit is scaled the same way
+/// (~666 packets), so a full queue is the server's seconds. [`NetemUplink`]
+/// cuts the TCP stream at its frame ends and tail-drops whole frames, as
+/// netem drops whole datagrams on the server's UDP links. The server's
+/// replication load, which this harness lacks, is added as identity-link
+/// bulk ([`W_BULK_KBIT_SERVER`]).
+///
+/// Known gap: no punched (UDP) interfaces in this harness, so an interface
+/// lost behind the queue (and its links with it) cannot show here.
+///
+/// Recorded per second and printed: each listener's fraction of m0's frames
+/// heard (by the second m0 SENT them), the shaper's counters, every listener's
+/// parent for m0's stream when it changes, each node's link teardowns by
+/// reason (run with `RUST_LOG=ciris_edge::link_close=debug` for each close's
+/// plane and peer), and m0's `av_plane` deltas per phase.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::type_complexity
+)]
+async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64) -> UplinkCapRun {
+    const SERVER_CAP_KBIT: u64 = 300;
+    const SERVER_COPY_KBIT: u64 = 190;
+    const BASELINE: Duration = Duration::from_secs(15);
+    const AFTER_LIFT: Duration = Duration::from_secs(20);
+    let uplink = NetemUplink::new();
+    let mut dials = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            // (i, j): node j dials node i, so m0 dials nobody.
+            dials.push((i, j));
+        }
+    }
+    let (nodes, groups, _tmp) = topo_shaped(
+        tag,
+        n,
+        n,
+        &dials,
+        None,
+        Some((0, Shaper::Netem(Arc::clone(&uplink)))),
+    )
+    .await;
+    // Every member publishes VIDEO (framed, single-layer base) with a codec
+    // map, as a camera does: video and audio are told apart by the codec (a
+    // stream of codec-opaque frames reads as audio).
+    let camera = || CallOptions {
+        relay: true,
+        codecs: Some(
+            ciris_edge::transport::av_chunk_auth::CodecMap::new([
+                ciris_edge::transport::av_chunk_auth::CodecToken::Opus,
+                ciris_edge::transport::av_chunk_auth::CodecToken::H264,
+            ])
+            .expect("map"),
+        ),
+        ..CallOptions::default()
+    };
+    let mut calls = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        calls.push(join_loaded(&nodes[i], g, tag, camera(), None).await);
+    }
+    for c in &calls {
+        wait_legs(c, n - 1).await;
+        // The bench's no-drain baseline, on demand.
+        c.set_drain_off_for_test(std::env::var_os("W_NO_DRAIN").is_some());
+    }
+    // Both bindings from every member (v2 carries the framing).
+    for c in &calls {
+        wait_bound(c, 2 * (n as u64 - 1)).await;
+    }
+    let m0 = nodes[0].key.key_id.clone();
+    let m0_stream = calls[0].stream();
+    // One fragment a frame: the budget less the framing marker.
+    let frame = calls[0].chunk_plaintext_budget().unwrap_or(240).min(600) - 8;
+    // m0's own host reads its frames, as a real host does.
+    let m0_drain = {
+        let mut rx = calls[0].frames().expect("m0's frames");
+        tokio::spawn(async move { while rx.recv().await.is_some() {} })
+    };
+    // Every listener's arrivals of m0's frames: (seq, when).
+    let arrivals: Vec<Arc<std::sync::Mutex<Vec<(u64, tokio::time::Instant)>>>> =
+        (1..n).map(|_| Arc::default()).collect();
+    let audio_arrivals: Vec<Arc<std::sync::Mutex<Vec<(u64, tokio::time::Instant)>>>> =
+        (1..n).map(|_| Arc::default()).collect();
+    // Every listener's m0 keyframes heard (by seq): the decoder model.
+    let keyframes_heard: Vec<Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>> =
+        (1..n).map(|_| Arc::default()).collect();
+    let mut recorders = Vec::new();
+    for (k, c) in calls.iter_mut().enumerate().skip(1) {
+        let mut rx = c.frames().expect("frames");
+        let log = Arc::clone(&arrivals[k - 1]);
+        let alog = Arc::clone(&audio_arrivals[k - 1]);
+        let klog = Arc::clone(&keyframes_heard[k - 1]);
+        let from = m0.clone();
+        recorders.push(tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if f.publisher == from {
+                    if let Some(s) = seq_of(&f.bytes) {
+                        let audio = f.codec_id == ciris_edge::transport::realtime_av::CODEC_OPAQUE;
+                        if !audio && f.bytes.starts_with(b"k-") {
+                            klog.lock().expect("keyframes").insert(s);
+                        }
+                        let to = if audio { &alog } else { &log };
+                        to.lock()
+                            .expect("arrivals")
+                            .push((s, tokio::time::Instant::now()));
+                    }
+                }
+            }
+        }));
+    }
+    // The publishers: every member, 30 Hz; m0's send instants by seq. Every
+    // 250 ms the listeners' parents for m0's stream are read.
+    let sent_at: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>> = Arc::default();
+    let audio_sent_at: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>> = Arc::default();
+    // m0's own view each second: (t, legs, direct children, relayed-to, tier).
+    let m0_view: Arc<std::sync::Mutex<Vec<(u64, usize, usize, usize, String)>>> = Arc::default();
+    let parents_log: Arc<std::sync::Mutex<Vec<(Duration, usize, Option<String>)>>> = Arc::default();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let t0 = tokio::time::Instant::now();
+    // 45.3 — m0's host honours CallEvent::KeyframeWanted: its next video
+    // frame is a keyframe (W_KEYFRAME_IGNORE: it does not, and only the GOP
+    // brings one).
+    let keyframe_due = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let keyframe_events = Arc::new(AtomicU64::new(0));
+    let honour_keyframes = std::env::var_os("W_KEYFRAME_IGNORE").is_none();
+    let m0_events = {
+        let mut ev = calls[0].events().expect("m0's events");
+        let (due, count) = (Arc::clone(&keyframe_due), Arc::clone(&keyframe_events));
+        tokio::spawn(async move {
+            while let Some(e) = ev.recv().await {
+                if matches!(
+                    e,
+                    ciris_edge::transport::av_call::CallEvent::KeyframeWanted { .. }
+                ) {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if honour_keyframes {
+                        due.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        })
+    };
+    let publisher = {
+        let keyframe_due = Arc::clone(&keyframe_due);
+        let sent_at = Arc::clone(&sent_at);
+        let audio_sent_at = Arc::clone(&audio_sent_at);
+        let parents_log = Arc::clone(&parents_log);
+        let m0_view = Arc::clone(&m0_view);
+        let stop = Arc::clone(&stop);
+        let names: Vec<String> = nodes.iter().map(|x| x.key.key_id.clone()).collect();
+        tokio::spawn(async move {
+            let mut seq = 0u64;
+            let mut aseq = 0u64;
+            let mut long_audio = false;
+            let mut long_audio_packets = 0u64;
+            let mut last: Vec<Option<String>> = vec![None; calls.len()];
+            let mut next_video = tokio::time::Instant::now();
+            let mut audio_due = next_video;
+            while !stop.load(Ordering::SeqCst) {
+                // m0's audio between the video ticks: one Opus packet every
+                // AUDIO_EVERY, as a host packetizes it.
+                if audio_due < next_video {
+                    tokio::time::sleep_until(audio_due).await;
+                    // The host's congested-mode packetization: 60 ms Opus
+                    // packets (one ~180 B chunk) while the node's media
+                    // budget is under what 20 ms audio costs, 20 ms again
+                    // once it is well over (CC rc23: one codec packet, one
+                    // chunk, any frame length that fits).
+                    let budget = calls[0].media_budget_bps();
+                    if budget.is_some_and(|b| b < AUDIO_20MS_WIRE_BPS * 1.2) {
+                        long_audio = true;
+                    } else if budget.is_none_or(|b| b > AUDIO_20MS_WIRE_BPS * 2.0) {
+                        long_audio = false;
+                    }
+                    let (bytes, every) = if long_audio {
+                        (AUDIO_BYTES * 3, AUDIO_EVERY * 3)
+                    } else {
+                        (AUDIO_BYTES, AUDIO_EVERY)
+                    };
+                    let mut a = body("a", aseq);
+                    a.resize(bytes, b'.');
+                    audio_sent_at
+                        .lock()
+                        .expect("audio sent")
+                        .push(tokio::time::Instant::now());
+                    let _ = calls[0].publish(Frame::opaque(a)).await;
+                    aseq += 1;
+                    audio_due += every;
+                    if long_audio {
+                        long_audio_packets += 1;
+                    }
+                    continue;
+                }
+                tokio::time::sleep_until(next_video).await;
+                next_video += FRAME_INTERVAL;
+                // m0's keyframes: one a GOP, and the next frame after a
+                // KeyframeWanted the host honours; two fragments each.
+                let key = seq.is_multiple_of(KEYFRAME_EVERY)
+                    || keyframe_due.swap(false, Ordering::SeqCst);
+                for (i, c) in calls.iter_mut().enumerate() {
+                    let m0_key = i == 0 && key;
+                    let mut b = body(
+                        if m0_key {
+                            "k"
+                        } else if i == 0 {
+                            "w"
+                        } else {
+                            "o"
+                        },
+                        seq,
+                    );
+                    // One fragment, then two: 1.5 packets a frame.
+                    b.resize(
+                        if seq.is_multiple_of(2) && !m0_key {
+                            frame
+                        } else {
+                            2 * frame - 16
+                        },
+                        b'.',
+                    );
+                    let b = Frame {
+                        codec_id: ciris_edge::transport::realtime_av::CODEC_TEMPORAL_LAYERED,
+                        layer: ChunkLayer::BASE,
+                        bytes: b,
+                    };
+                    if i == 0 {
+                        sent_at
+                            .lock()
+                            .expect("sent")
+                            .push(tokio::time::Instant::now());
+                    }
+                    let _ = c.publish(b).await;
+                }
+                if seq.is_multiple_of(30) {
+                    let c = &calls[0];
+                    m0_view.lock().expect("view").push((
+                        t0.elapsed().as_secs(),
+                        c.legs().len(),
+                        c.alm_own_children().len(),
+                        c.relayed_to().len(),
+                        format!(
+                            "{:?} drain {:?} budget {:?}",
+                            c.service_tier(),
+                            c.uplink_drain(),
+                            c.media_budget_bps().map(f64::round)
+                        ),
+                    ));
+                }
+                if seq.is_multiple_of(8) {
+                    for (k, c) in calls.iter().enumerate().skip(1) {
+                        let p = primary_for(c, m0_stream);
+                        if p != last[k] {
+                            let role = p.as_ref().and_then(|p| names.iter().position(|x| x == p));
+                            parents_log.lock().expect("parents").push((
+                                t0.elapsed(),
+                                k,
+                                role.map(|r| format!("m{r}")),
+                            ));
+                            last[k].clone_from(&p);
+                        }
+                    }
+                }
+                seq += 1;
+            }
+            eprintln!("[W] m0 sent {long_audio_packets} audio packets at 60 ms of {aseq}");
+            calls
+        })
+    };
+    // Per-second samples: the shaper, every node's teardowns by reason.
+    let reasons = ["channel_exhausted", "timeout", "stale"];
+    let sampler = {
+        let up = Arc::clone(&uplink);
+        let ms: Vec<EdgeMetrics> = nodes.iter().map(|x| x.metrics.clone()).collect();
+        let stop = Arc::clone(&stop);
+        let t = Arc::clone(&nodes[0].transport);
+        let names: Vec<String> = nodes.iter().map(|x| x.key.key_id.clone()).collect();
+        tokio::spawn(async move {
+            let mut rows: Vec<UplinkSecond> = Vec::new();
+            let mut labels: std::collections::HashMap<[u8; 16], String> =
+                std::collections::HashMap::new();
+            let mut s = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                tokio::time::sleep_until(t0 + Duration::from_secs(s + 1)).await;
+                s += 1;
+                let torn = ms
+                    .iter()
+                    .map(|m| reasons.iter().map(|r| closed_by(m, r)).collect())
+                    .collect();
+                // m0's links by plane, the A/V ones it dialled by member.
+                let role = |k: &str| {
+                    names
+                        .iter()
+                        .position(|x| x == k)
+                        .map_or_else(|| k.to_owned(), |i| format!("m{i}"))
+                };
+                for (link, plane, dialled) in t.link_planes_for_test().await {
+                    labels.entry(link).or_insert_with(|| {
+                        format!("{}{}", plane.as_str(), if dialled { ">" } else { "<" })
+                    });
+                }
+                let mut rtt = Vec::new();
+                for d in t.av_links_for_test() {
+                    if d.dialled {
+                        labels.insert(d.link, format!("av>{}", role(&d.peer)));
+                        if let Some(st) = t.av_link_stats(&d.link) {
+                            rtt.push((
+                                role(&d.peer),
+                                st.srtt_ms,
+                                st.learned_srtt_ms,
+                                st.min_rtt_ms,
+                                st.tx_ring,
+                            ));
+                        }
+                    }
+                }
+                rtt.sort_by(|a, b| a.0.cmp(&b.0));
+                let plane = ms[0].av_plane();
+                let get = |k: &str| plane.get(k).copied().unwrap_or(0);
+                rows.push(UplinkSecond {
+                    s,
+                    shaper: up.read(),
+                    torn,
+                    classes: up.take_classes(),
+                    congested: get("av_send_congested"),
+                    c3_failed: get("alm_c3_send_failed"),
+                    c3_received: get("alm_c3_received"),
+                    c3_sent: ms
+                        .iter()
+                        .map(|m| m.av_plane().get("alm_c3_sent").copied().unwrap_or(0))
+                        .collect(),
+                    rtt,
+                });
+            }
+            (rows, labels)
+        })
+    };
+    // The cap from what one copy MEASURES on the wire in the baseline's last
+    // 5 s: the mean media packet (+ netem's 28 B) at the stream's 30 Hz. The
+    // server's cell is 300 kbit/s for a ~190 kbit/s copy; the same ratio here.
+    tokio::time::sleep(BASELINE.saturating_sub(Duration::from_secs(5))).await;
+    let (p1, b1) = uplink.media_totals();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let (p2, b2) = uplink.media_totals();
+    let per_packet = (b2 - b1) / (p2 - p1).max(1) + NETEM_OVERHEAD_BYTES;
+    let probe_uncapped = first_probe(&nodes[0], &nodes[1], &uplink, 0, "uncapped").await;
+    // A copy: 1.5 video packets a frame at 30 Hz (frames alternate one and
+    // two fragments, so a copy is ~190 kbit/s, the server's codec's).
+    let copy_kbit = per_packet * 45 * 8 / 1000;
+    let _ = SERVER_COPY_KBIT;
+    // The server's cell as it is: 300 kbit/s, 1000 packets. Audio and
+    // control cost what they cost per packet whatever the cap, so the cap is
+    // NOT scaled (scaled, one audio copy was 71 % of it, against 47 % on the
+    // server).
+    let cap_kbit = SERVER_CAP_KBIT;
+    let limit = NETEM_LIMIT_PACKETS as u64;
+    uplink.set_limit(limit);
+    // (b) The server's non-media that this harness lacks (replication rounds
+    // and replies on the identity links): `bulk_kbit_server` of the server's
+    // 300 kbit/s, scaled to this cap, sent from m0 to every member on its
+    // identity link in 2 KB envelopes (Resources) on a fixed clock, one at
+    // a time per member as edge's replication rounds are. From the cap on.
+    let bulk_kbit = bulk_kbit_server * cap_kbit / SERVER_CAP_KBIT;
+    let mut bulk = Vec::new();
+    if bulk_kbit > 0 {
+        const BULK_BYTES: usize = 2048;
+        // One transfer at a time per member: edge's replication runs one
+        // round per peer at once.
+        const BULK_IN_FLIGHT: u64 = 1;
+        let per_peer_bps = bulk_kbit * 1000 / (n as u64 - 1);
+        let every = Duration::from_micros(BULK_BYTES as u64 * 8 * 1_000_000 / per_peer_bps.max(1));
+        for peer in nodes.iter().skip(1) {
+            let t = Arc::clone(&nodes[0].transport);
+            let to = peer.key.key_id.clone();
+            let stop = Arc::clone(&stop);
+            bulk.push(tokio::spawn(async move {
+                let blob: Arc<[u8]> = Arc::from(vec![0x42u8; BULK_BYTES]);
+                let in_flight = Arc::new(AtomicU64::new(0));
+                let mut tick = tokio::time::interval(every);
+                while !stop.load(Ordering::SeqCst) {
+                    tick.tick().await;
+                    if in_flight.load(Ordering::SeqCst) >= BULK_IN_FLIGHT {
+                        continue;
+                    }
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    let (t, to, blob, f) = (
+                        Arc::clone(&t),
+                        to.clone(),
+                        Arc::clone(&blob),
+                        Arc::clone(&in_flight),
+                    );
+                    tokio::spawn(async move {
+                        // Bulk replication rows (chat, scores): edge classes
+                        // them BULK from their row family; this stand-in says
+                        // so itself (an unclassed send is FIRST).
+                        let _ = ciris_edge::transport::egress_budget::sending_as(
+                            ciris_edge::transport::egress_budget::SendClass::Bulk,
+                            t.send(&to, &blob),
+                        )
+                        .await;
+                        f.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            }));
+        }
+    }
+    eprintln!(
+        "[W] measured copy {copy_kbit} kbit/s ({per_packet} B a media packet on the wire); cap {cap_kbit} kbit/s; limit {limit} packets; bulk {bulk_kbit} kbit/s"
+    );
+    let plane_base = nodes[0].metrics.av_plane();
+    let torn_before: u64 = nodes.iter().map(|x| torn_down(&x.metrics)).sum();
+    // The uncapped control: every phase as it is, with no cap.
+    let no_cap = std::env::var_os("W_NO_CAP").is_some();
+    if !no_cap {
+        uplink.cap_kbit(cap_kbit);
+    }
+    let cap_on = t0.elapsed();
+    tracing::info!(
+        target: "ciris_edge::link_close",
+        names = ?nodes.iter().enumerate().map(|(i, x)| (format!("m{i}"), x.key.key_id.clone())).collect::<Vec<_>>(),
+        cap_kbit,
+        "W cap on"
+    );
+    // Mid-cap, once m0's budget is in force and holding video: the probe.
+    let cap_end = tokio::time::Instant::now() + Duration::from_secs(cap_s);
+    tokio::time::sleep(Duration::from_secs(cap_s / 2)).await;
+    let mut probe_capped = FirstProbe::default();
+    let held_at = av(&nodes[0].metrics, "av_frame_held_budget");
+    while tokio::time::Instant::now() + Duration::from_secs(10) < cap_end {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if !no_cap
+            && nodes[0].transport.egress_budget().rate_bps().is_some()
+            && av(&nodes[0].metrics, "av_frame_held_budget") > held_at
+        {
+            probe_capped = first_probe(&nodes[0], &nodes[1], &uplink, cap_kbit, "capped").await;
+            break;
+        }
+    }
+    tokio::time::sleep_until(cap_end).await;
+    let torn_under_cap: u64 =
+        nodes.iter().map(|x| torn_down(&x.metrics)).sum::<u64>() - torn_before;
+    let plane_cap = nodes[0].metrics.av_plane();
+    uplink.cap_kbit(0);
+    let cap_off = t0.elapsed();
+    tracing::info!(target: "ciris_edge::link_close", "W cap off");
+    tokio::time::sleep(AFTER_LIFT).await;
+    stop.store(true, Ordering::SeqCst);
+    let calls = publisher.await.expect("publisher");
+    m0_events.abort();
+    let (rows, labels) = sampler.await.expect("sampler");
+    for b in &bulk {
+        b.abort();
+    }
+    m0_drain.abort();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for r in &recorders {
+        r.abort();
+    }
+    let plane_end = nodes[0].metrics.av_plane();
+    // Per listener, per second m0 sent in: the fraction heard.
+    let sent = sent_at.lock().expect("sent").clone();
+    let sec_of = |i: usize| sent[i].duration_since(t0).as_secs();
+    let last_sec = sent.last().map_or(0, |t| t.duration_since(t0).as_secs());
+    let mut per_sec_sent = vec![0u64; last_sec as usize + 1];
+    for i in 0..sent.len() {
+        per_sec_sent[sec_of(i) as usize] += 1;
+    }
+    let in_window = |i: usize, from: Duration, to: Duration| {
+        let t = sent[i].duration_since(t0);
+        t >= from && t < to
+    };
+    let frac = |got: &std::collections::BTreeSet<u64>, from: Duration, to: Duration| {
+        let want: Vec<usize> = (0..sent.len())
+            .filter(|i| in_window(*i, from, to))
+            .collect();
+        if want.is_empty() {
+            return 1.0;
+        }
+        want.iter().filter(|i| got.contains(&(**i as u64))).count() as f64 / want.len() as f64
+    };
+    let mut capped = Vec::new();
+    let mut first_10s = Vec::new();
+    let mut capped_fresh = Vec::new();
+    let mut lifted = Vec::new();
+    let mut longest_gap = Vec::new();
+    let mut table = String::from("[W] heard fraction of m0's frames by send second (cap on at ");
+    let _ = write!(table, "{cap_on:?}, off at {cap_off:?}; cap {cap_kbit} kbit/s for the server's {SERVER_CAP_KBIT}, copy {copy_kbit} kbit/s here)\n[W] s   ");
+    for k in 1..n {
+        let _ = write!(table, " m{k}  ");
+    }
+    table.push('\n');
+    let mut per_listener_secs: Vec<Vec<u64>> = Vec::new();
+    for a in &arrivals {
+        let a = a.lock().expect("arrivals").clone();
+        let got: std::collections::BTreeSet<u64> = a.iter().map(|(s, _)| *s).collect();
+        capped.push(frac(&got, cap_on, cap_off));
+        first_10s.push(frac(&got, cap_on, cap_on + Duration::from_secs(10)));
+        {
+            let mut fresh: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+            for (seq, t) in &a {
+                if let Some(at) = usize::try_from(*seq).ok().and_then(|i| sent.get(i)) {
+                    if t.saturating_duration_since(*at) <= MEDIA_FRESH {
+                        fresh.insert(*seq);
+                    }
+                }
+            }
+            capped_fresh.push(frac(&fresh, cap_on + Duration::from_secs(10), cap_off));
+        }
+        lifted.push(frac(
+            &got,
+            cap_off + Duration::from_secs(2),
+            cap_off + AFTER_LIFT.saturating_sub(Duration::from_secs(1)),
+        ));
+        let mut times: Vec<tokio::time::Instant> = a
+            .iter()
+            .map(|(_, t)| *t)
+            .filter(|t| {
+                let d = t.duration_since(t0);
+                d >= cap_on && d < cap_off
+            })
+            .collect();
+        times.sort();
+        let mut gap = Duration::ZERO;
+        let mut prev = t0 + cap_on;
+        for t in times {
+            gap = gap.max(t.duration_since(prev));
+            prev = t;
+        }
+        gap = gap.max((t0 + cap_off).saturating_duration_since(prev));
+        longest_gap.push(gap);
+        let mut secs = vec![0u64; per_sec_sent.len()];
+        for s in &got {
+            if let Some(i) = usize::try_from(*s).ok().filter(|i| *i < sent.len()) {
+                secs[sec_of(i) as usize] += 1;
+            }
+        }
+        per_listener_secs.push(secs);
+    }
+    // Delivery latency: when the test took each frame out, minus when m0
+    // published it; per 10 s of send time, per listener. A frame never heard
+    // counts against every "within" column.
+    let mut lat_table = String::from(
+        "[W] latency by 10 s of m0's send time: listener window heard <=800ms <=1s <=2s p50 p95 max\n",
+    );
+    let windows = (last_sec / 10 + 1) as usize;
+    for (k, a) in arrivals.iter().enumerate() {
+        let a = a.lock().expect("arrivals").clone();
+        let mut first: std::collections::BTreeMap<u64, tokio::time::Instant> =
+            std::collections::BTreeMap::new();
+        for (s, t) in &a {
+            first.entry(*s).or_insert(*t);
+        }
+        for w in 0..windows {
+            let from = Duration::from_secs(w as u64 * 10);
+            let to = from + Duration::from_secs(10);
+            let idx: Vec<usize> = (0..sent.len())
+                .filter(|i| in_window(*i, from, to))
+                .collect();
+            if idx.is_empty() {
+                continue;
+            }
+            let mut lats: Vec<Duration> = idx
+                .iter()
+                .filter_map(|i| {
+                    first
+                        .get(&(*i as u64))
+                        .map(|t| t.saturating_duration_since(sent[*i]))
+                })
+                .collect();
+            lats.sort();
+            let total = idx.len() as f64;
+            let within = |b: Duration| lats.iter().filter(|l| **l <= b).count() as f64 / total;
+            let q = |p: usize| {
+                lats.get((lats.len() * p / 100).min(lats.len().saturating_sub(1)))
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let _ = writeln!(
+                lat_table,
+                "[W] m{} {:3}-{:3}s heard {:.3} {:.3} {:.3} {:.3} p50 {:?} p95 {:?} max {:?}",
+                k + 1,
+                w * 10,
+                w * 10 + 10,
+                lats.len() as f64 / total,
+                within(Duration::from_millis(800)),
+                within(Duration::from_secs(1)),
+                within(Duration::from_secs(2)),
+                q(50),
+                q(95),
+                lats.last().copied().unwrap_or_default(),
+            );
+        }
+    }
+    eprint!("{lat_table}");
+    // 45.3 — the split bars. Audio: every m0 audio packet sent from 2 s into
+    // the cap to its end, heard within 800 ms, and the longest audio gap.
+    // Video: of the frames DELIVERED (sent over the same span), the share
+    // within 800 ms, the longest video gap, and the video delivered against
+    // what the cap leaves after non-media.
+    let settle_from = cap_on + Duration::from_secs(2);
+    let asent = audio_sent_at.lock().expect("audio sent").clone();
+    let mut audio_fresh = Vec::new();
+    let mut audio_gap = Vec::new();
+    let mut video_fresh_of_delivered = Vec::new();
+    let mut video_gap = Vec::new();
+    let mut video_decoded_gap: Vec<Duration> = Vec::new();
+    let mut resume_waits: Vec<Duration> = Vec::new();
+    let mut video_fps = Vec::new();
+    let gap_over = |times: &mut Vec<tokio::time::Instant>| {
+        times.sort();
+        let mut gap = Duration::ZERO;
+        let mut prev = t0 + settle_from;
+        for t in times.iter() {
+            gap = gap.max(t.saturating_duration_since(prev));
+            prev = *t;
+        }
+        gap.max((t0 + cap_off).saturating_duration_since(prev))
+    };
+    for (va, aa) in arrivals.iter().zip(&audio_arrivals) {
+        let aa = aa.lock().expect("audio").clone();
+        let want: Vec<usize> = (0..asent.len())
+            .filter(|i| {
+                let t = asent[*i].duration_since(t0);
+                t >= settle_from && t < cap_off
+            })
+            .collect();
+        let mut first: std::collections::BTreeMap<u64, tokio::time::Instant> =
+            std::collections::BTreeMap::new();
+        for (s, t) in &aa {
+            first.entry(*s).or_insert(*t);
+        }
+        let fresh = want
+            .iter()
+            .filter(|i| {
+                first
+                    .get(&(**i as u64))
+                    .is_some_and(|t| t.saturating_duration_since(asent[**i]) <= MEDIA_FRESH)
+            })
+            .count();
+        audio_fresh.push(fresh as f64 / want.len().max(1) as f64);
+        let mut at: Vec<tokio::time::Instant> = first
+            .values()
+            .copied()
+            .filter(|t| {
+                let d = t.duration_since(t0);
+                d >= settle_from && d < cap_off
+            })
+            .collect();
+        audio_gap.push(gap_over(&mut at));
+        let va = va.lock().expect("video").clone();
+        let mut vfirst: std::collections::BTreeMap<u64, tokio::time::Instant> =
+            std::collections::BTreeMap::new();
+        for (s, t) in &va {
+            vfirst.entry(*s).or_insert(*t);
+        }
+        let delivered: Vec<(usize, tokio::time::Instant)> = vfirst
+            .iter()
+            .filter_map(|(s, t)| usize::try_from(*s).ok().map(|i| (i, *t)))
+            .filter(|(i, _)| {
+                sent.get(*i).is_some_and(|st| {
+                    let d = st.duration_since(t0);
+                    d >= settle_from && d < cap_off
+                })
+            })
+            .collect();
+        let in_time = delivered
+            .iter()
+            .filter(|(i, t)| t.saturating_duration_since(sent[*i]) <= MEDIA_FRESH)
+            .count();
+        video_fresh_of_delivered.push(if delivered.is_empty() {
+            0.0
+        } else {
+            in_time as f64 / delivered.len() as f64
+        });
+        let span = cap_off.saturating_sub(settle_from).as_secs_f64().max(1.0);
+        video_fps.push(delivered.len() as f64 / span);
+        let mut vt: Vec<tokio::time::Instant> = delivered.iter().map(|(_, t)| *t).collect();
+        video_gap.push(gap_over(&mut vt));
+        // The decoder model: a frame decodes if it is a keyframe or the next
+        // frame after the last one decoded (each frame refers to the one
+        // before); a gap leaves video frozen until the next keyframe.
+        let keys = keyframes_heard[video_decoded_gap.len()]
+            .lock()
+            .expect("keyframes")
+            .clone();
+        let mut by_arrival: Vec<(tokio::time::Instant, u64)> =
+            vfirst.iter().map(|(s, t)| (*t, *s)).collect();
+        by_arrival.sort();
+        let mut last: Option<u64> = None;
+        let mut decoded: Vec<tokio::time::Instant> = Vec::new();
+        // Each resume: delivery back after a gap over 200 ms, until the
+        // first decodable frame (the picture stays frozen meanwhile).
+        let mut prev_arrival: Option<tokio::time::Instant> = None;
+        let mut resumed_at: Option<tokio::time::Instant> = None;
+        for (t, s) in by_arrival {
+            let d = t.duration_since(t0);
+            let in_cap = d >= settle_from && d < cap_off;
+            if in_cap
+                && prev_arrival
+                    .is_some_and(|p| t.saturating_duration_since(p) > Duration::from_millis(200))
+                && resumed_at.is_none()
+            {
+                resumed_at = Some(t);
+            }
+            prev_arrival = Some(t);
+            if keys.contains(&s) || last.is_some_and(|l| s == l + 1) {
+                last = Some(s);
+                if let Some(r) = resumed_at.take() {
+                    resume_waits.push(t.saturating_duration_since(r));
+                }
+                if in_cap {
+                    decoded.push(t);
+                }
+            }
+        }
+        video_decoded_gap.push(gap_over(&mut decoded));
+    }
+    // What the cap leaves after non-media, over the cap after the settle.
+    let mut nonmedia_bytes = 0u64;
+    let mut audio_bytes = 0u64;
+    let mut audio_pkts = 0u64;
+    let mut video_bytes = 0u64;
+    let mut secs = 0u64;
+    for r in rows.iter().filter(|r| {
+        let d = Duration::from_secs(r.s);
+        d > settle_from && d <= cap_off
+    }) {
+        secs += 1;
+        for ((class, _), c) in &r.classes {
+            let wire = c.bytes + c.packets * NETEM_OVERHEAD_BYTES;
+            match *class {
+                "media_audio" => {
+                    audio_bytes += wire;
+                    audio_pkts += c.packets;
+                }
+                "media_datagram" => video_bytes += wire,
+                _ => nonmedia_bytes += wire,
+            }
+        }
+    }
+    let per_s = |b: u64| b as f64 * 8.0 / 1000.0 / secs.max(1) as f64;
+    let ((short_bytes, short_pkts), (long_bytes, long_pkts)) = uplink.audio_totals();
+    let audio_pkt = short_bytes as f64 / short_pkts.max(1) as f64;
+    let long_pkt = long_bytes as f64 / long_pkts.max(1) as f64;
+    eprintln!(
+        "[W] audio: within 800 ms after a 2 s settle {audio_fresh:.3?}; longest audio gap {audio_gap:?}; one audio copy on the wire: 20 ms {audio_pkt:.0} B a packet = {:.1} kbit/s ({short_pkts} packets), 60 ms {long_pkt:.0} B = {:.1} kbit/s ({long_pkts} packets)",
+        audio_pkt * 8.0 * 50.0 / 1000.0,
+        long_pkt * 8.0 * (50.0 / 3.0) / 1000.0,
+    );
+    eprintln!(
+        "[W] video: delivered within 800 ms {video_fresh_of_delivered:.3?}; longest video gap after the settle {video_gap:?}; delivered {video_fps:.1?} frames/s of 30"
+    );
+    eprintln!(
+        "[W] m0's uplink over the cap after the settle: non-media {:.1} kbit/s, audio {:.1} kbit/s ({:.1} pkt/s), video {:.1} kbit/s; the cap leaves {:.1} kbit/s after non-media",
+        per_s(nonmedia_bytes),
+        per_s(audio_bytes),
+        audio_pkts as f64 / secs.max(1) as f64,
+        per_s(video_bytes),
+        cap_kbit as f64 - per_s(nonmedia_bytes),
+    );
+    for (s, want) in per_sec_sent.iter().enumerate() {
+        let _ = write!(table, "[W] {s:3} ");
+        for l in &per_listener_secs {
+            let _ = write!(table, " {:.2}", l[s] as f64 / (*want).max(1) as f64);
+        }
+        table.push('\n');
+    }
+    eprint!("{table}");
+    let mut prev = NetemSecond::default();
+    let mut prev_torn: Vec<Vec<u64>> = Vec::new();
+    for UplinkSecond {
+        s, shaper: c, torn, ..
+    } in &rows
+    {
+        let torn_delta: Vec<Vec<u64>> = torn
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.iter()
+                    .enumerate()
+                    .map(|(j, x)| x - prev_torn.get(i).map_or(*x, |p| p[j]))
+                    .collect()
+            })
+            .collect();
+        let any_torn = torn_delta.iter().flatten().any(|x| *x > 0);
+        // The backlog in seconds at the cap rate (what a packet queued now
+        // waits: the shed notice's delay). Rows outside the cap read it at
+        // the cap rate too.
+        let cap_rate = cap_kbit * 1000 / 8;
+        eprintln!(
+            "[W] shaper s={s:3} enq {:4} drop {:4} sent {:4} pkts {:7} B backlog {:4} pkts {:7} B {:6.2} s{}",
+            c.enqueued - prev.enqueued,
+            c.dropped - prev.dropped,
+            c.sent_packets - prev.sent_packets,
+            c.sent_bytes - prev.sent_bytes,
+            c.backlog_packets,
+            c.backlog_bytes,
+            (c.backlog_bytes + c.backlog_packets * NETEM_OVERHEAD_BYTES) as f64 / cap_rate.max(1) as f64,
+            if any_torn {
+                format!("  TORN (exhausted, timeout, stale) per node {torn_delta:?}")
+            } else {
+                String::new()
+            }
+        );
+        prev = *c;
+        prev_torn.clone_from(torn);
+    }
+    // What m0 handed its shaper each second, by class (bytes/s, packets/s,
+    // dropped), media split per link; and m0's own view on the same axis.
+    let view = m0_view.lock().expect("view").clone();
+    let mut prev_cong = 0u64;
+    let mut prev_fail = 0u64;
+    let mut prev_recv = 0u64;
+    let mut prev_sent: Vec<u64> = Vec::new();
+    for r in &rows {
+        let mut by_class: std::collections::BTreeMap<&str, ClassCount> =
+            std::collections::BTreeMap::new();
+        let mut media: Vec<(String, ClassCount)> = Vec::new();
+        let mut by_plane: std::collections::BTreeMap<String, ClassCount> =
+            std::collections::BTreeMap::new();
+        for ((class, link), n) in &r.classes {
+            let e = by_class.entry(class).or_default();
+            e.packets += n.packets;
+            e.bytes += n.bytes;
+            e.dropped += n.dropped;
+            let label = link.map_or_else(
+                || "-".to_owned(),
+                |l| {
+                    labels
+                        .get(&l)
+                        .cloned()
+                        .unwrap_or_else(|| format!("?{}", hex::encode(&l[..3])))
+                },
+            );
+            let p = by_plane
+                .entry(format!(
+                    "{class}@{}",
+                    label
+                        .split('>')
+                        .next()
+                        .unwrap_or(&label)
+                        .split('<')
+                        .next()
+                        .unwrap_or(&label)
+                ))
+                .or_default();
+            p.packets += n.packets;
+            p.bytes += n.bytes;
+            if *class == "media_datagram" {
+                media.push((label, *n));
+            }
+        }
+        media.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut line = format!("[W] class s={:3}", r.s);
+        let mut total = ClassCount::default();
+        for (class, n) in &by_class {
+            total.packets += n.packets;
+            total.bytes += n.bytes;
+            total.dropped += n.dropped;
+            let _ = write!(line, " {class} {}B/{}p/{}d", n.bytes, n.packets, n.dropped);
+        }
+        let _ = write!(
+            line,
+            " | total {}B {}p {}d | media",
+            total.bytes, total.packets, total.dropped
+        );
+        for (l, n) in &media {
+            let _ = write!(line, " {l}:{}p", n.packets);
+        }
+        let _ = write!(line, " | by plane");
+        for (k, n) in &by_plane {
+            let _ = write!(line, " {k}:{}B", n.bytes);
+        }
+        if let Some(v) = view.iter().find(|v| v.0 == r.s) {
+            let _ = write!(
+                line,
+                " | m0 legs {} children {} relayed_to {} tier {}",
+                v.1, v.2, v.3, v.4
+            );
+        }
+        let _ = write!(
+            line,
+            " | congested {} c3_failed {}",
+            r.congested - prev_cong,
+            r.c3_failed - prev_fail
+        );
+        prev_cong = r.congested;
+        prev_fail = r.c3_failed;
+        let _ = write!(line, " | c3 in {}", r.c3_received - prev_recv);
+        let _ = write!(line, " | c3 sent by node");
+        for (i, x) in r.c3_sent.iter().enumerate() {
+            let _ = write!(
+                line,
+                " m{i}:{}",
+                x - prev_sent.get(i).copied().unwrap_or(*x)
+            );
+        }
+        prev_recv = r.c3_received;
+        prev_sent.clone_from(&r.c3_sent);
+        let _ = write!(line, " | m0 legs rtt");
+        for (m, srtt, learned, min, ring) in &r.rtt {
+            let _ = write!(
+                line,
+                " {m}:srtt {} learned {} min {} ring {ring}",
+                srtt.map_or("-".to_owned(), |x| format!("{x:.0}")),
+                learned.map_or("-".to_owned(), |x| format!("{x:.0}")),
+                min.map_or("-".to_owned(), |x| x.to_string()),
+            );
+        }
+        eprintln!("{line}");
+    }
+    for (t, k, p) in parents_log.lock().expect("parents").iter() {
+        eprintln!(
+            "[W] parent {t:?} m{k} -> {}",
+            p.as_deref().unwrap_or("none")
+        );
+    }
+    let delta = |a: &std::collections::HashMap<String, u64>,
+                 b: &std::collections::HashMap<String, u64>| {
+        let mut v: Vec<(String, u64)> = b
+            .iter()
+            .map(|(k, x)| (k.clone(), x - a.get(k).copied().unwrap_or(0)))
+            .filter(|(_, x)| *x > 0)
+            .collect();
+        v.sort();
+        v
+    };
+    eprintln!(
+        "[W] m0 av_plane under the cap: {:?}",
+        delta(&plane_base, &plane_cap)
+    );
+    eprintln!(
+        "[W] m0 av_plane after the lift: {:?}",
+        delta(&plane_cap, &plane_end)
+    );
+    eprintln!(
+        "[W] capped {capped:.3?}; within 800 ms after a 10 s settle {capped_fresh:.3?}; first 10 s {first_10s:.3?}; lifted {lifted:.3?}; longest gap {longest_gap:?}; torn under the cap {torn_under_cap}"
+    );
+    drop(calls);
+    eprintln!("[W] FIRST probe uncapped {probe_uncapped:?}; capped {probe_capped:?}");
+    resume_waits.sort();
+    let rq = |q: usize| {
+        resume_waits
+            .get((resume_waits.len() * q / 100).min(resume_waits.len().saturating_sub(1)))
+            .copied()
+    };
+    eprintln!(
+        "[W] keyframes: {} KeyframeWanted at m0, honoured {honour_keyframes}; {} resumes after a >200 ms gap, frozen until decodable p50 {:?} p95 {:?} max {:?}; longest decodable-video gap after the settle {video_decoded_gap:?}; longest delivered-video gap {video_gap:?}",
+        keyframe_events.load(Ordering::SeqCst),
+        resume_waits.len(),
+        rq(50),
+        rq(95),
+        resume_waits.last()
+    );
+    UplinkCapRun {
+        capped,
+        first_10s,
+        capped_fresh,
+        lifted,
+        longest_gap,
+        torn_under_cap,
+        cap_kbit,
+        audio_fresh,
+        audio_gap,
+        video_fresh_of_delivered,
+        video_gap,
+        video_decoded_gap,
+        keyframe_events: (keyframe_events.load(Ordering::SeqCst), honour_keyframes),
+        probe_uncapped,
+        probe_capped,
+    }
+}
+
+/// **45.3 (CC review) — a room removal leaves at once while video is held.**
+/// The faithful whole-uplink bench (4 members, m0 capped at 300 kbit/s for
+/// 40 s, bulk on the identity links). Mid-cap, while m0's budget is in force
+/// and holding video, m0 sends m1 a `membership:removal` Deliver and a
+/// `chat:` Deliver of one size at one instant, each classed by edge's own
+/// classifier. The removal is FIRST: edge never holds it, so all it waits on
+/// is the uplink's own FIFO. A 1.2 kB envelope is a Resource and crosses the
+/// capped uplink twice (its advertisement, then its parts after m1's
+/// request), so it must arrive within twice the FIFO's time at the send,
+/// plus the same envelope's uncapped delivery and [`FIRST_PROBE_SLACK`]; and
+/// before the chat row, which is BULK and waits behind the
+/// [`PROBE_FILLERS`] bulk envelopes queued ahead of both. Mutation: the
+/// removal filed as bulk waits behind them too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_room_removal_leaves_at_once_while_video_is_held() {
+    use ciris_edge::transport::egress_budget::SendClass;
+    let _call = one_call().await;
+    let r = whole_uplink_cap("w4-first", 4, 40, W_BULK_KBIT_SERVER).await;
+    let (u, c) = (&r.probe_uncapped, &r.probe_capped);
+    eprintln!("[FIRST] uncapped {u:?}; capped {c:?}");
+    assert_eq!(
+        c.removal_class,
+        Some(SendClass::First),
+        "a removal is FIRST"
+    );
+    assert_eq!(c.chat_class, Some(SendClass::Bulk), "a chat row is BULK");
+    assert!(
+        c.budget_bps.is_some(),
+        "the probe ran under a budget: {c:?}"
+    );
+    assert!(
+        c.video_held.1 > c.video_held.0,
+        "video was being held across the probe: {c:?}"
+    );
+    let base = u.removal.expect("the uncapped removal arrived");
+    let got = c.removal.expect("the capped removal arrived");
+    let bound = base + Duration::from_millis(2 * c.fifo_ms) + FIRST_PROBE_SLACK;
+    assert!(
+        got <= bound,
+        "the removal took {got:?} under the cap, bound {bound:?} (uncapped {base:?} + 2 x FIFO {} ms + slack)",
+        c.fifo_ms
+    );
+    let chat = c.chat.expect("the capped chat row arrived");
+    assert!(
+        got < chat,
+        "the removal ({got:?}) left ahead of the bulk queued before it (the chat row: {chat:?})"
+    );
+}
+
+/// The removal's allowance past its two FIFO crossings and its uncapped
+/// delivery: the FIFO grows between the crossings (it is read once, at the
+/// send) and the receiver's request rides m1's own uplink.
+const FIRST_PROBE_SLACK: Duration = Duration::from_millis(500);
+
+/// m0's GOP: a keyframe every this many video frames (2 s at 30 Hz).
+const KEYFRAME_EVERY: u64 = 60;
+
+/// 45.3 — m0's audio: one Opus packet per 20 ms, 60 B (24 kbit/s), as a
+/// host packetizes it.
+const AUDIO_EVERY: Duration = Duration::from_millis(20);
+const AUDIO_BYTES: usize = 60;
+/// A media datagram this short on m0's wire is audio (the shaper cannot read
+/// the sealed codec): a 20 ms audio packet is ~327 B and a 60 ms one ~447 B
+/// before IP/UDP, a video fragment ~500 B.
+const AUDIO_PACKET_MAX: usize = 480;
+/// What one 20 ms audio copy costs on the wire (bits/s, measured: 355 B a
+/// packet with IP/UDP, 50 a second).
+const AUDIO_20MS_WIRE_BPS: f64 = 142_000.0;
+
+/// 45.3 — how late a frame may land and still count as heard in time (the
+/// receiver's media budget, `av_call::MEDIA_STALE_BUDGET`).
+const MEDIA_FRESH: Duration = Duration::from_millis(800);
+
+/// (b) The replication/identity load m0 adds, in the server's kbit/s (scaled
+/// to the cap): the server's 130-150 kbit/s of non-media less what the
+/// harness's own control, proofs and announces already offer (~25-45 kbit/s
+/// at this cap, i.e. ~40-65 of the server's).
+const W_BULK_KBIT_SERVER: u64 = 90;
+
+/// The server matrix's bars for a capped cell, plus 45.3's latency bar.
+fn uplink_cap_bars(r: &UplinkCapRun) -> Vec<String> {
+    let mut failed = Vec::new();
+    for (k, f) in r.audio_fresh.iter().enumerate() {
+        if *f < 0.95 {
+            failed.push(format!(
+                "m{}: audio {f:.3} within {MEDIA_FRESH:?} after a 2 s settle (bar 0.95)",
+                k + 1
+            ));
+        }
+    }
+    for (k, g) in r.audio_gap.iter().enumerate() {
+        if *g > Duration::from_secs(1) {
+            failed.push(format!("m{}: audio gap {g:?} (bar 1 s)", k + 1));
+        }
+    }
+    for (k, f) in r.video_fresh_of_delivered.iter().enumerate() {
+        if *f < 0.95 {
+            failed.push(format!(
+                "m{}: {f:.3} of the video delivered within {MEDIA_FRESH:?} (bar 0.95)",
+                k + 1
+            ));
+        }
+    }
+    for (k, g) in r.video_gap.iter().enumerate() {
+        if *g > Duration::from_secs(2) {
+            failed.push(format!("m{}: video gap {g:?} (target 2 s)", k + 1));
+        }
+    }
+    if r.torn_under_cap != 0 {
+        failed.push(format!(
+            "{} links torn down under the cap (bar 0)",
+            r.torn_under_cap
+        ));
+    }
+    for (k, f) in r.lifted.iter().enumerate() {
+        if *f < 0.99 {
+            failed.push(format!("m{} heard {f:.3} after the lift (bar 0.99)", k + 1));
+        }
+    }
+    failed
+}
+
+/// **45.3 W6** — six members, every one publishing, relay on; m0's whole
+/// uplink capped at the server's 300 kbit/s (scaled, see
+/// [`whole_uplink_cap`]) for 90 s, then lifted. The server's bars: each
+/// listener hears ≥ 0.9 of m0 over the cap, no gap over 5 s, no link torn
+/// down under the cap, ≥ 0.99 after the lift. RED on v45.2.1 as the server
+/// sees it (N=6/300: 0.81, teardowns from ~+10 s, the first 10 s at
+/// 0.12-0.14). A 2-minute run on a quiet box: `--ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "45.3 witness, red until the whole-uplink fixes: a 2-minute capped run, on a quiet box"]
+async fn six_members_hear_a_publisher_whose_whole_uplink_is_capped() {
+    let _call = one_call().await;
+    let r = whole_uplink_cap("w6-uplink", 6, 90, W_BULK_KBIT_SERVER).await;
+    let failed = uplink_cap_bars(&r);
+    assert!(
+        failed.is_empty(),
+        "W6 at {} kbit/s: {failed:?}; heard {:.3?} (within 800 ms {:.3?}, longest gap {:?}); first 10 s {:.3?}; decodable-video gap {:?}; KeyframeWanted (seen, honoured) {:?}",
+        r.cap_kbit,
+        r.capped,
+        r.capped_fresh,
+        r.longest_gap,
+        r.first_10s,
+        r.video_decoded_gap,
+        r.keyframe_events
+    );
+}
+
+/// **45.3 W4** — [`six_members_hear_a_publisher_whose_whole_uplink_is_capped`]
+/// at four members: the control (the server's N=4/300 passes at 0.96), so a
+/// red W6 is the six members, not the shaper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "45.3 witness control: a 2-minute capped run, on a quiet box"]
+async fn four_members_hear_a_publisher_whose_whole_uplink_is_capped() {
+    let _call = one_call().await;
+    let r = whole_uplink_cap("w4-uplink", 4, 90, W_BULK_KBIT_SERVER).await;
+    let failed = uplink_cap_bars(&r);
+    assert!(
+        failed.is_empty(),
+        "W4 at {} kbit/s: {failed:?}; heard {:.3?} (within 800 ms {:.3?}, longest gap {:?}); first 10 s {:.3?}; decodable-video gap {:?}; KeyframeWanted (seen, honoured) {:?}",
+        r.cap_kbit,
+        r.capped,
+        r.capped_fresh,
+        r.longest_gap,
+        r.first_10s,
+        r.video_decoded_gap,
+        r.keyframe_events
+    );
+}
+
+/// [`hdlc_packets`] cuts a leviculum TCP stream at its frame ends, keeps
+/// every byte (the stream is byte-identical when nothing drops), and carries
+/// a frame split across reads.
+#[test]
+fn the_netem_pipe_cuts_the_stream_at_hdlc_frames_and_keeps_every_byte() {
+    let stream: Vec<u8> = [
+        &[0x7E, 1, 2, 0x7D, 0x5E, 3, 0x7E][..],
+        &[0x7E, 4, 0x7E][..],
+        &[0x7E, 0x7E, 5, 6, 0x7E][..],
+    ]
+    .concat();
+    let mut carry = Vec::new();
+    let mut got = Vec::new();
+    for piece in stream.chunks(4) {
+        got.extend(hdlc_packets(&mut carry, piece));
+    }
+    assert!(carry.is_empty(), "nothing left over: {carry:?}");
+    assert_eq!(
+        got,
+        vec![
+            vec![0x7E, 1, 2, 0x7D, 0x5E, 3, 0x7E],
+            vec![0x7E, 4, 0x7E],
+            vec![0x7E, 0x7E, 5, 6, 0x7E],
+        ]
+    );
+    assert_eq!(got.concat(), stream);
+}
+
+/// **45.3 model R25, a two-person call** — A's uplink capped at half of one
+/// copy of its media: with one leg, the backlog is still read, so the drain
+/// starts, STALE media is dropped at the sender and the egress budget comes
+/// into force. Before, `uplink_backlog` needed two outstanding legs, read
+/// `None` for ever in a two-person call, and none of the three engaged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_two_person_call_under_a_capped_uplink_engages_stale_and_the_budget() {
+    let _call = one_call().await;
+    let tag = "alm2-cap2";
+    let uplink = CappedUplink::new();
+    let (nodes, groups, _tmp) =
+        topo_capped(tag, 2, 2, &[(0, 1)], None, Some((0, Arc::clone(&uplink)))).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&cb, 1).await;
+    let size = ca.chunk_plaintext_budget().unwrap_or(240).min(600);
+    let copy_kbit = (u64::try_from(size).unwrap_or(600) + 170) * 8 * 30 / 1000;
+    uplink.cap_kbit(copy_kbit / 2);
+    let mut budget_seen = false;
+    let end = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut seq = 0;
+    while tokio::time::Instant::now() < end {
+        let mut f = body("a", seq);
+        f.resize(size, b'.');
+        let _ = ca.publish(Frame::opaque(f)).await;
+        budget_seen |= ca.media_budget_bps().is_some();
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let (drained, stale) = (
+        av(&a.metrics, "alm_drain_entered"),
+        av(&a.metrics, "av_chunk_dropped_stale_at_sender"),
+    );
+    eprintln!(
+        "[R25] two-person capped: copy {copy_kbit} kbit/s, sent {seq}, drain {drained}, \
+         stale at sender {stale}, budget seen {budget_seen}"
+    );
+    assert!(drained >= 1, "the drain started on the one leg");
+    assert!(stale > 0, "STALE media was dropped at the sender");
+    assert!(budget_seen, "the egress budget came into force");
+    drop(cb);
+    drop(ca);
 }

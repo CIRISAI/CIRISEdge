@@ -1114,6 +1114,65 @@ pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
 /// G8 — this node's uplink stalled: its legs' Channels held messages
 /// unproved past `UPLINK_STALL_MS` on two legs or more. Counted on the rise.
 pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
+/// 45.3 row DR — this node's uplink read backlogged and it began withholding
+/// media but audio until the backlog drains (once per episode).
+pub const ALM_DRAIN_ENTERED: &str = "alm_drain_entered";
+/// 45.3 — an identity-plane send (an envelope) that waited on the node's
+/// egress budget as bulk.
+pub const AV_BULK_DEFERRED_DRAIN: &str = "av_bulk_deferred_budget";
+/// 45.3 (leviculum ciris.5) — a FIRST-class envelope (call control, a key,
+/// a removal) that went as a Resource: the transport schedules every
+/// Resource as bulk, so it waited behind media. Channel-first carries FIRST
+/// up to its fragment cap; this counts what fell past it.
+pub const EGRESS_FIRST_ON_RESOURCE: &str = "egress_first_on_resource";
+/// 45.3 (R29) — a publisher's backlog STAMP refused: under no bound chunk
+/// key, a bad signature, or behind the highest chunk verified.
+pub const AV_BACKLOG_STAMP_REFUSED: &str = "av_backlog_stamp_refused";
+/// 45.3 (R31) — a stale chunk a relay forwarded on to its children as their
+/// witness that the publisher's media is late (one a stream per period).
+pub const AV_STALE_WITNESS_FORWARDED: &str = "av_stale_witness_forwarded";
+/// 45.3 — FIRST-class bytes on the wire, family `accord`.
+pub const AV_FIRST_BYTES_ACCORD: &str = "first_bytes:accord";
+/// 45.3 — FIRST-class bytes on the wire, family `membership`.
+pub const AV_FIRST_BYTES_MEMBERSHIP: &str = "first_bytes:membership";
+/// 45.3 — FIRST-class bytes on the wire, family `key_grant`.
+pub const AV_FIRST_BYTES_KEY_GRANT: &str = "first_bytes:key_grant";
+/// 45.3 — FIRST-class bytes on the wire, family `key`.
+pub const AV_FIRST_BYTES_KEY: &str = "first_bytes:key";
+/// 45.3 — FIRST-class bytes on the wire, family `session`.
+pub const AV_FIRST_BYTES_SESSION: &str = "first_bytes:session";
+/// 45.3 — FIRST-class bytes on the wire, family `consent`.
+pub const AV_FIRST_BYTES_CONSENT: &str = "first_bytes:consent";
+/// 45.3 — FIRST-class bytes on the wire, family `moderation`.
+pub const AV_FIRST_BYTES_MODERATION: &str = "first_bytes:moderation";
+/// 45.3 — FIRST-class bytes on the wire, family `revocation`.
+pub const AV_FIRST_BYTES_REVOCATION: &str = "first_bytes:revocation";
+/// 45.3 — FIRST-class bytes on the wire, family `recants`.
+pub const AV_FIRST_BYTES_RECANTS: &str = "first_bytes:recants";
+/// 45.3 — FIRST-class bytes on the wire, family `withdraws`.
+pub const AV_FIRST_BYTES_WITHDRAWS: &str = "first_bytes:withdraws";
+/// 45.3 — FIRST-class bytes on the wire, family `duty`.
+pub const AV_FIRST_BYTES_DUTY: &str = "first_bytes:duty";
+/// 45.3 — FIRST-class bytes on the wire, family `ownership`.
+pub const AV_FIRST_BYTES_OWNERSHIP: &str = "first_bytes:ownership";
+/// 45.3 — FIRST-class bytes on the wire, family `unknown_dimension`.
+pub const AV_FIRST_BYTES_UNKNOWN_DIMENSION: &str = "first_bytes:unknown_dimension";
+/// 45.3 — FIRST-class bytes on the wire, family `other_kind`.
+pub const AV_FIRST_BYTES_OTHER_KIND: &str = "first_bytes:other_kind";
+/// 45.3 — FIRST-class bytes on the wire, family `ephemeral_reply`.
+pub const AV_FIRST_BYTES_EPHEMERAL_REPLY: &str = "first_bytes:ephemeral_reply";
+/// 45.3 — FIRST-class bytes on the wire, a send no caller classed (FIRST by default).
+pub const AV_FIRST_BYTES_UNCLASSED: &str = "first_bytes:unclassed";
+/// 45.3 — a media frame (own: every fragment; relayed: one chunk) the egress
+/// budget did not admit, so not sent.
+pub const AV_FRAME_HELD_BUDGET: &str = "av_frame_held_budget";
+/// 45.3 — own video resumed after edge held or dropped frames of it (the
+/// egress budget, or row STALE): `CallEvent::KeyframeWanted` fires with it.
+pub const AV_VIDEO_KEYFRAME_WANTED: &str = "av_video_keyframe_wanted";
+/// 45.3 row STALE — one media chunk (own or relayed, audio included) not
+/// handed to a backlogged uplink because it would reach its receivers past
+/// their media budget.
+pub const AV_CHUNK_DROPPED_STALE_AT_SENDER: &str = "av_chunk_dropped_stale_at_sender";
 /// G8 — a periodic offer not sent on a leg whose oldest unproved Channel
 /// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
 /// queue behind the backlog and spend that link's retry budget.
@@ -2812,6 +2871,15 @@ pub const DIRECT_LINK_OFF_PROPOSING_OFF: &str = "direct_link_off:proposing_off";
 pub const DIRECT_LINK_OFF_NO_FACILITATOR: &str = "direct_link_off:no_facilitator";
 /// A yielded proposal's wait ran out and this end proposed after all.
 pub const DIRECT_LINK_YIELD_EXPIRED: &str = "direct_link_yield_expired";
+/// v45.3 — a proposal not made: the peer does not pass the address
+/// predicate (no room shared, not a contact).
+pub const DIRECT_LINK_SKIPPED_NO_STANDING: &str = "direct_link_skipped_no_standing";
+/// v45.3 — a direct link moved back to its relayed path: its peer no longer
+/// passes the address predicate.
+pub const DIRECT_LINK_RETIRED_NO_STANDING: &str = "direct_link_retired_no_standing";
+/// v45.3 — leviculum's pending background re-proposals dropped, on a peer's
+/// lost standing.
+pub const DIRECT_LINK_RETRIES_DROPPED: &str = "direct_link_retries_dropped";
 
 /// The `link_shaping_agreed` key of `class`.
 #[must_use]
@@ -2967,6 +3035,9 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_OFF_PROPOSING_OFF,
     DIRECT_LINK_OFF_NO_FACILITATOR,
     DIRECT_LINK_YIELD_EXPIRED,
+    DIRECT_LINK_SKIPPED_NO_STANDING,
+    DIRECT_LINK_RETIRED_NO_STANDING,
+    DIRECT_LINK_RETRIES_DROPPED,
 ];
 /// Every `av_plane` key.
 pub const AV_PLANE_LABELS: &[&str] = &[
@@ -3047,6 +3118,30 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_SHED,
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
+    ALM_DRAIN_ENTERED,
+    AV_BULK_DEFERRED_DRAIN,
+    EGRESS_FIRST_ON_RESOURCE,
+    AV_BACKLOG_STAMP_REFUSED,
+    AV_STALE_WITNESS_FORWARDED,
+    AV_FIRST_BYTES_ACCORD,
+    AV_FIRST_BYTES_MEMBERSHIP,
+    AV_FIRST_BYTES_KEY_GRANT,
+    AV_FIRST_BYTES_KEY,
+    AV_FIRST_BYTES_SESSION,
+    AV_FIRST_BYTES_CONSENT,
+    AV_FIRST_BYTES_MODERATION,
+    AV_FIRST_BYTES_REVOCATION,
+    AV_FIRST_BYTES_RECANTS,
+    AV_FIRST_BYTES_WITHDRAWS,
+    AV_FIRST_BYTES_DUTY,
+    AV_FIRST_BYTES_OWNERSHIP,
+    AV_FIRST_BYTES_UNKNOWN_DIMENSION,
+    AV_FIRST_BYTES_OTHER_KIND,
+    AV_FIRST_BYTES_EPHEMERAL_REPLY,
+    AV_FIRST_BYTES_UNCLASSED,
+    AV_FRAME_HELD_BUDGET,
+    AV_VIDEO_KEYFRAME_WANTED,
+    AV_CHUNK_DROPPED_STALE_AT_SENDER,
     ALM_OFFER_HELD_BACKLOG,
     ALM_DEPARTURE_CONGESTION,
     ALM_LATE_MOVE,
@@ -5601,6 +5696,8 @@ impl EdgeMetrics {
             direct_link_proposing: t.direct_link_proposing,
             alm_active_calls: t.alm_active_calls,
             alm_c3_peers: t.alm_c3_peers,
+            alm_uplink_backlog_ms: t.alm_uplink_backlog_ms,
+            alm_media_budget_bps: t.alm_media_budget_bps,
             decision_row_unheard_total: t.decision_row_unheard_total,
             decision_row_subscribers: t.decision_row_subscribers,
             group_backfill_rows_read_total: t.group_backfill_rows_read_total,
@@ -6095,6 +6192,10 @@ pub struct EdgeMetricsBundle {
     pub alm_active_calls: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub alm_c3_peers: u64,
+    /// 45.3 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_uplink_backlog_ms: u64,
+    /// 45.3 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_media_budget_bps: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub decision_row_unheard_total: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -6632,6 +6733,8 @@ impl EdgeMetricsBundle {
             ("direct_link_proposing", self.direct_link_proposing),
             ("alm_active_calls", self.alm_active_calls),
             ("alm_c3_peers", self.alm_c3_peers),
+            ("alm_uplink_backlog_ms", self.alm_uplink_backlog_ms),
+            ("alm_media_budget_bps", self.alm_media_budget_bps),
             ("decision_row_subscribers", self.decision_row_subscribers),
             (
                 "group_backfill_rows_read_total",
@@ -6840,6 +6943,8 @@ edge_metrics_bundle_fields!(
     direct_link_proposing,
     alm_active_calls,
     alm_c3_peers,
+    alm_uplink_backlog_ms,
+    alm_media_budget_bps,
     decision_row_unheard_total,
     decision_row_subscribers,
     group_backfill_rows_read_total,

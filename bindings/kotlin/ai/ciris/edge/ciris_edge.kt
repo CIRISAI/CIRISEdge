@@ -677,6 +677,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_ciris_edge_checksum_func_peer_probe(
     ): Short
+    external fun uniffi_ciris_edge_checksum_func_peer_reach(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_peer_remove(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_peer_set_alias(
@@ -801,6 +803,8 @@ external fun uniffi_ciris_edge_fn_func_peer_health_summary(uniffi_out_err: Uniff
 external fun uniffi_ciris_edge_fn_func_peer_list(`filter`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_peer_probe(`keyId`: RustBuffer.ByValue,`timeoutMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_peer_reach(`nodeKeyId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_peer_remove(`handle`: RustBuffer.ByValue,`hard`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1054,6 +1058,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ciris_edge_checksum_func_peer_probe() != 59245.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ciris_edge_checksum_func_peer_reach() != 29445.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ciris_edge_checksum_func_peer_remove() != 60093.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1251,6 +1258,29 @@ object UniffiWithHandle
  * @suppress
  * */
 object NoHandle
+
+/**
+ * @suppress
+ */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
+}
 
 /**
  * @suppress
@@ -2343,6 +2373,69 @@ public object FfiConverterTypeEdgePeerPolicy: FfiConverterRustBuffer<EdgePeerPol
 
 
 
+data class EdgePeerReach (
+    var `state`: EdgeReachState
+    , 
+    var `liveLink`: kotlin.Boolean
+    , 
+    var `lastInboundMsAgo`: kotlin.ULong?
+    , 
+    var `hasPath`: kotlin.Boolean
+    , 
+    var `pathHops`: kotlin.UByte?
+    , 
+    var `transitPair`: kotlin.Boolean?
+    , 
+    var `direct`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgePeerReach: FfiConverterRustBuffer<EdgePeerReach> {
+    override fun read(buf: ByteBuffer): EdgePeerReach {
+        return EdgePeerReach(
+            FfiConverterTypeEdgeReachState.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalUByte.read(buf),
+            FfiConverterOptionalBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgePeerReach) = (
+            FfiConverterTypeEdgeReachState.allocationSize(value.`state`) +
+            FfiConverterBoolean.allocationSize(value.`liveLink`) +
+            FfiConverterOptionalULong.allocationSize(value.`lastInboundMsAgo`) +
+            FfiConverterBoolean.allocationSize(value.`hasPath`) +
+            FfiConverterOptionalUByte.allocationSize(value.`pathHops`) +
+            FfiConverterOptionalBoolean.allocationSize(value.`transitPair`) +
+            FfiConverterBoolean.allocationSize(value.`direct`)
+    )
+
+    override fun write(value: EdgePeerReach, buf: ByteBuffer) {
+            FfiConverterTypeEdgeReachState.write(value.`state`, buf)
+            FfiConverterBoolean.write(value.`liveLink`, buf)
+            FfiConverterOptionalULong.write(value.`lastInboundMsAgo`, buf)
+            FfiConverterBoolean.write(value.`hasPath`, buf)
+            FfiConverterOptionalUByte.write(value.`pathHops`, buf)
+            FfiConverterOptionalBoolean.write(value.`transitPair`, buf)
+            FfiConverterBoolean.write(value.`direct`, buf)
+    }
+}
+
+
+
 data class EdgeProbeResult (
     var `reachable`: kotlin.Boolean
     , 
@@ -3212,6 +3305,74 @@ public object FfiConverterTypeEdgePeerTrust: FfiConverterRustBuffer<EdgePeerTrus
 }
 
 
+
+
+
+
+enum class EdgeReachState {
+    
+    LIVE,
+    DIALABLE,
+    UNREACHABLE,
+    UNKNOWN;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeReachState: FfiConverterRustBuffer<EdgeReachState> {
+    override fun read(buf: ByteBuffer) = try {
+        EdgeReachState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: EdgeReachState) = 4UL
+
+    override fun write(value: EdgeReachState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUByte: FfiConverterRustBuffer<kotlin.UByte?> {
+    override fun read(buf: ByteBuffer): kotlin.UByte? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUByte.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UByte?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUByte.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UByte?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUByte.write(value, buf)
+        }
+    }
+}
 
 
 
@@ -4352,6 +4513,17 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
     UniffiLib.uniffi_ciris_edge_fn_func_peer_probe(
     
         FfiConverterString.lower(`keyId`),FfiConverterULong.lower(`timeoutMs`),_status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `peerReach`(`nodeKeyId`: kotlin.String): EdgePeerReach {
+            return FfiConverterTypeEdgePeerReach.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_peer_reach(
+    
+        FfiConverterString.lower(`nodeKeyId`),_status)
 }
     )
     }

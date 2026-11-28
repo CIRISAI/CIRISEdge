@@ -501,6 +501,8 @@ pub struct TelemetrySnapshot {
     pub direct_link_proposing: u64,
     pub alm_active_calls: u64,
     pub alm_c3_peers: u64,
+    pub alm_uplink_backlog_ms: u64,
+    pub alm_media_budget_bps: u64,
     pub decision_row_unheard_total: HashMap<String, u64>,
     pub decision_row_subscribers: u64,
     pub group_backfill_rows_read_total: u64,
@@ -595,6 +597,8 @@ pub struct EdgeTelemetry {
     direct_link_proposing: AtomicU64,
     alm_active_calls: AtomicU64,
     alm_c3_peers: AtomicU64,
+    alm_uplink_backlog_ms: AtomicU64,
+    alm_media_budget_bps: AtomicU64,
     decision_row_unheard: [AtomicU64; DECISION_ROW_KINDS.len()],
     decision_rows: RwLock<Option<DecisionRowSender>>,
     group_backfill_rows_read: AtomicU64,
@@ -652,6 +656,8 @@ impl Default for EdgeTelemetry {
             direct_link_proposing: AtomicU64::new(0),
             alm_active_calls: AtomicU64::new(0),
             alm_c3_peers: AtomicU64::new(0),
+            alm_uplink_backlog_ms: AtomicU64::new(0),
+            alm_media_budget_bps: AtomicU64::new(0),
             decision_row_unheard: arr(),
             decision_rows: RwLock::new(None),
             group_backfill_rows_read: AtomicU64::new(0),
@@ -969,6 +975,18 @@ impl EdgeTelemetry {
             });
     }
 
+    /// 45.3 row DR — a call's uplink backlog reading this watch tick (ms past
+    /// the RTT floor; 0 when nothing is outstanding).
+    pub fn set_uplink_backlog_ms(&self, ms: u64) {
+        self.alm_uplink_backlog_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// 45.3 — what the node's egress budget leaves media after control
+    /// (bits/s; 0 when no budget is in force).
+    pub fn set_media_budget_bps(&self, bps: u64) {
+        self.alm_media_budget_bps.store(bps, Ordering::Relaxed);
+    }
+
     /// A decision row found nobody listening.
     pub fn note_decision_row_unheard(&self, kind: crate::decision_rows::DecisionRowKind) {
         let slot = DECISION_ROW_KINDS
@@ -1178,6 +1196,8 @@ impl EdgeTelemetry {
             direct_link_proposing: self.direct_link_proposing.load(Ordering::Relaxed),
             alm_active_calls: self.alm_active_calls.load(Ordering::Relaxed),
             alm_c3_peers: self.alm_c3_peers.load(Ordering::Relaxed),
+            alm_uplink_backlog_ms: self.alm_uplink_backlog_ms.load(Ordering::Relaxed),
+            alm_media_budget_bps: self.alm_media_budget_bps.load(Ordering::Relaxed),
             decision_row_unheard_total: counter_family(
                 &DECISION_ROW_KINDS,
                 &self.decision_row_unheard,
@@ -1492,6 +1512,8 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("direct_link_proposing", "ciris.edge.direct_link.proposing", Gauge, Count, None, "1 when this node proposes direct links. 0 explains a silent `direct_link` family."),
     spec("alm_active_calls", "ciris.edge.alm.active_calls", Gauge, Count, None, "Calls live on this node. 0 explains a silent ALM."),
     spec("alm_c3_peers", "ciris.edge.alm.c3_peers", Gauge, Count, None, "Call members that speak C3, across live calls."),
+    spec("alm_uplink_backlog_ms", "ciris.edge.alm.uplink_backlog", Gauge, Milliseconds, None, "The newest call watch tick's uplink backlog: its kept legs' oldest unproved Channel message, aged from its send, past the RTT floor. Over 400 the node's egress budget decreases; under 100 it increases (45.3)."),
+    spec("alm_media_budget_bps", "ciris.edge.alm.media_budget", Gauge, BitsPerSecond, None, "What the node's egress budget leaves call media after control, the rate a host's encoder sizes itself to; 0 while no budget is in force (45.3)."),
     spec("decision_row_unheard_total", "ciris.edge.decision_row.unheard", Counter, Count, closed("kind", &DECISION_ROW_KINDS), "Decision-row events with no receiver."),
     spec("decision_row_subscribers", "ciris.edge.decision_row.subscribers", Gauge, Count, None, "Receivers of decision-row events now. 0 explains a silent decision-row family."),
     spec("group_backfill_rows_read_total", "ciris.edge.group_backfill.rows_read", Counter, Count, None, "Rows of the group-history families a join backfill read (CIRISEdge#968). Bounded per round per peer by the `page` lever."),

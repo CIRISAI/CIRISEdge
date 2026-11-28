@@ -396,6 +396,55 @@ pub enum EdgeLinkDirection {
     Unknown,
 }
 
+/// v45.3 — `peer_reach`'s summary; the UniFFI twin of
+/// [`crate::transport::peer_reach::ReachState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeReachState {
+    Live,
+    Dialable,
+    Unreachable,
+    Unknown,
+}
+
+impl From<crate::transport::peer_reach::ReachState> for EdgeReachState {
+    fn from(s: crate::transport::peer_reach::ReachState) -> Self {
+        use crate::transport::peer_reach::ReachState;
+        match s {
+            ReachState::Live => Self::Live,
+            ReachState::Dialable => Self::Dialable,
+            ReachState::Unreachable => Self::Unreachable,
+            ReachState::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// v45.3 — `peer_reach`; the UniFFI twin of
+/// [`crate::transport::peer_reach::PeerReach`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgePeerReach {
+    pub state: EdgeReachState,
+    pub live_link: bool,
+    pub last_inbound_ms_ago: Option<u64>,
+    pub has_path: bool,
+    pub path_hops: Option<u8>,
+    pub transit_pair: Option<bool>,
+    pub direct: bool,
+}
+
+impl From<&crate::transport::peer_reach::PeerReach> for EdgePeerReach {
+    fn from(r: &crate::transport::peer_reach::PeerReach) -> Self {
+        Self {
+            state: r.state.into(),
+            live_link: r.live_link,
+            last_inbound_ms_ago: r.last_inbound_ms_ago,
+            has_path: r.has_path,
+            path_hops: r.path_hops,
+            transit_pair: r.transit_pair,
+            direct: r.direct,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EdgeLinkHandle {
     pub link_id: Vec<u8>,

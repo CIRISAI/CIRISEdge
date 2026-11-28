@@ -50,6 +50,11 @@ use crate::transport::realtime_av_alm::controller::{
 };
 
 /// How often a forwarder offers each stream it can serve.
+/// 45.3 (R31) — the latest a stale chunk may be (ms above the stream's
+/// floor) and still excuse its carrier's silence: past it, a relay could be
+/// living on a stock of old chunks long after the publisher recovered.
+pub(super) const STALE_WITNESS_CAP_MS: u64 = 6_000;
+
 pub(super) const OFFER_EVERY_MS: u64 = 1_000;
 /// The publisher's starting probe allowance, in streams (G8 slow start): an
 /// unmeasured uplink takes two copies first (a three-person room is the full
@@ -281,6 +286,34 @@ pub(super) struct AlmState {
     last_primary: BTreeMap<StreamId, Option<String>>,
     egress: EgressMeter,
     leg_queue_ms: BTreeMap<String, f64>,
+    /// 45.3 row AGE — per received stream, the chunks this node dropped as
+    /// stale end to end within offer-as-life's life: `(call ms, its RM1
+    /// latency)`, oldest first. The MOST late of them is what this node
+    /// advertises as its upstream latency (offer-as-life at its children):
+    /// the model's R29b row (`RelayAdvert.tla`, AdvOverDrops) fails when only
+    /// the last drop is kept, since a later, less-late drop then hides an
+    /// earlier, later one still inside the window.
+    stale_seen: BTreeMap<StreamId, StaleWindow>,
+    /// 45.3 (R29) — this node's own stream's backlog STAMP frame while its
+    /// uplink is past the stale budget (set by the call each watch tick,
+    /// cleared when the backlog is under it): sent with its offers to every
+    /// C3 peer that takes stamps.
+    own_stamp: Option<Vec<u8>>,
+    /// 45.3 (R31) — when the own stamp last went out (call ms).
+    last_stamp_ms: u64,
+    /// 45.3 (R29) — per relayed stream, the latest STAMP frame this node
+    /// verified, with when: forwarded byte for byte with its offers of that
+    /// stream while within offer-as-life's life.
+    relayed_stamps: BTreeMap<StreamId, (u64, Vec<u8>)>,
+    /// 45.3 (R31) — per received stream, the highest seq of a stale chunk
+    /// taken as an excuse: each is usable once.
+    witness_seq: BTreeMap<StreamId, u64>,
+    /// 45.3 (R31) — per received stream, when a stale chunk was last
+    /// forwarded on as this node's children's witness.
+    witness_sent_at: BTreeMap<StreamId, u64>,
+    /// 45.3 (R34) — direct children offering this node's own stream on, with
+    /// when (call ms): the relays its other children may have moved to.
+    own_relay_offers: BTreeMap<String, u64>,
     /// Row ProbeAfterDrain — out legs that cannot read as drained now: their
     /// queue gauge is unmeasured (no `min_rtt` yet, or right after a path
     /// move) or a Channel message is still outstanding on them.
@@ -292,6 +325,10 @@ pub(super) struct AlmState {
     forwarded_seen: BTreeMap<StreamId, SeenRing>,
     /// RM1 — each received stream's latency floor ([`LatencyFloor`]).
     min_offset: BTreeMap<StreamId, LatencyFloor>,
+    /// 45.3 row AGE — the AGE floor, one per (stream, epoch) (CC review):
+    /// RM1's rule, restarting at each roll. RM2's lateness keeps the
+    /// stream's own floor ([`Self::min_offset`]).
+    age_floor: BTreeMap<(StreamId, u64), LatencyFloor>,
     last_offer_ms: u64,
     pub(super) counts: AlmCounts,
     pub(super) labels: Vec<&'static str>,
@@ -343,6 +380,10 @@ pub(super) struct AlmState {
     /// [`UPLINK_STALL_LATCH_MS`] past it (the stalled legs' links can die,
     /// and their detection with them, before the queue has drained).
     uplink_stall_seen_ms: Option<u64>,
+    /// 45.3 row DR — [`UplinkDrain`].
+    drain: UplinkDrain,
+    /// Test seam: rows DR, STALE and AGE off (the backlog is still read).
+    drain_off_for_test: bool,
     /// G8 — frames made between ticks (the shed on a stall's rise), sent
     /// with the next tick's.
     pending_out: Vec<Outgoing>,
@@ -386,6 +427,136 @@ pub(super) const UPLINK_BACKLOG_MS: u64 = 200;
 /// G8 — how long a stall verdict holds after its last detection: about the
 /// time a shed publisher's queue takes to drain the backlog its legs saw.
 pub(super) const UPLINK_STALL_LATCH_MS: u64 = 2_000;
+
+/// 45.3 row DR (drain) — the uplink is BACKLOGGED, and this node sends only
+/// what a call cannot do without, once the oldest unproved Channel message on
+/// its kept leg(s) has waited this long past the leg's RTT floor: the stall
+/// verdict's own bound ([`UPLINK_STALL_MS`]), so the drain starts with the
+/// shed.
+pub(super) const DRAIN_ENTER_MS: u64 = UPLINK_STALL_MS;
+/// 45.3 row DR — the backlog is gone once that age stays under this
+/// ([`UPLINK_BACKLOG_MS`], the verdict's backlog bound) for
+/// [`DRAIN_CLEAR_MS`].
+pub(super) const DRAIN_LEAVE_MS: u64 = UPLINK_BACKLOG_MS;
+/// 45.3 row DR — how long the backlog must read clear before media resumes:
+/// four watch ticks, so one quick proof is not a drained queue.
+pub(super) const DRAIN_CLEAR_MS: u64 = 1_000;
+
+/// **45.3 row STALE — never send media that will arrive stale.** Transition:
+/// observable, the uplink backlog ([`UplinkDrain`]'s reading); action, while
+/// it is over the receivers' media budget (`MEDIA_STALE_BUDGET`, 800 ms) a
+/// media chunk handed to the uplink now would be dropped by row AGE at every
+/// receiver, so it is dropped here instead, AUDIO INCLUDED, and counted;
+/// must never, apply to control. What it buys: the queue drains even when
+/// audio alone does not fit, and audio resumes first (video waits for row
+/// DR to leave).
+pub(super) fn stale_at_sender(backlog_ms: Option<u64>) -> bool {
+    let budget = u64::try_from(super::MEDIA_STALE_BUDGET.as_millis()).unwrap_or(u64::MAX);
+    backlog_ms.is_some_and(|b| b > budget)
+}
+
+/// **45.3 row DR — the drain.** Transition: observable, the uplink backlog
+/// (the least over the legs with traffic of the oldest unproved Channel
+/// message's age past its leg's RTT floor, from its SEND, a leg that proved
+/// everything it sent lately reading 0, and the own egress queue's age,
+/// measured each watch tick; `None` when nothing has traffic, which reads as
+/// drained); state, whether media is
+/// withheld; action, enter at [`DRAIN_ENTER_MS`], leave once the backlog
+/// has read under [`DRAIN_LEAVE_MS`] for [`DRAIN_CLEAR_MS`]; must never,
+/// withhold control (the rule is applied to media sends only), or leave on a
+/// timer while the backlog still reads high.
+#[derive(Debug, Default, Clone)]
+pub(super) struct UplinkDrain {
+    active: bool,
+    clear_since: Option<u64>,
+    backlog_ms: Option<u64>,
+}
+
+impl UplinkDrain {
+    /// Fold one tick's backlog reading at `now`. `Some(true)`: the drain
+    /// began this tick; `Some(false)`: it ended; `None`: no change.
+    pub(super) fn observe(&mut self, now: u64, backlog_ms: Option<u64>) -> Option<bool> {
+        self.backlog_ms = backlog_ms;
+        let b = backlog_ms.unwrap_or(0);
+        if !self.active {
+            if b >= DRAIN_ENTER_MS {
+                self.active = true;
+                self.clear_since = None;
+                return Some(true);
+            }
+            return None;
+        }
+        if b < DRAIN_LEAVE_MS {
+            let since = *self.clear_since.get_or_insert(now);
+            if now.saturating_sub(since) >= DRAIN_CLEAR_MS {
+                self.active = false;
+                self.clear_since = None;
+                return Some(false);
+            }
+        } else {
+            self.clear_since = None;
+        }
+        None
+    }
+
+    /// Whether media is withheld now.
+    pub(super) fn active(&self) -> bool {
+        self.active
+    }
+
+    /// The last backlog reading (ms past the floor), `None` when nothing was
+    /// outstanding.
+    pub(super) fn backlog_ms(&self) -> Option<u64> {
+        self.backlog_ms
+    }
+}
+
+/// 45.3 row DR — when each Channel message on one leg left: the watch tick's
+/// reading of the leg's newest sent sequence, `(call ms, last_sent_seq)`.
+/// The oldest unproved message was sent no later than the first tick whose
+/// reading reached it, so its age is known to within a tick FROM ITS SEND.
+/// (The stall verdict ages it from the first tick it was the oldest, which
+/// restarts every time an older one is proved: under a standing queue proofs
+/// keep coming, and that age stays near zero however deep the queue is.)
+#[derive(Debug, Default, Clone)]
+pub(super) struct SendClock {
+    marks: std::collections::VecDeque<(u64, u16)>,
+}
+
+/// `a` is `b` or after it, on the Channel's wrapping 16-bit sequence.
+fn seq_at_or_after(a: u16, b: u16) -> bool {
+    a.wrapping_sub(b) < 0x8000
+}
+
+impl SendClock {
+    /// The most readings kept (a minute of ticks).
+    const MAX_MARKS: usize = 240;
+
+    /// This tick's reading of the leg's newest sent sequence.
+    pub(super) fn note(&mut self, now_ms: u64, last_sent: u16) {
+        if self.marks.back().is_none_or(|(_, s)| *s != last_sent) {
+            self.marks.push_back((now_ms, last_sent));
+            while self.marks.len() > Self::MAX_MARKS {
+                self.marks.pop_front();
+            }
+        }
+    }
+
+    /// When this leg's newest send was first read (call ms), if ever.
+    pub(super) fn last_send_ms(&self) -> Option<u64> {
+        self.marks.back().map(|(t, _)| *t)
+    }
+
+    /// How long ago the message `oldest` left (ms), at least: from the first
+    /// reading at or past it. Readings before it are dropped (proved). A
+    /// message older than every reading is aged from the oldest reading.
+    pub(super) fn age_of(&mut self, now_ms: u64, oldest: u16) -> Option<u64> {
+        while self.marks.len() > 1 && !seq_at_or_after(self.marks[0].1, oldest) {
+            self.marks.pop_front();
+        }
+        self.marks.front().map(|(t, _)| now_ms.saturating_sub(*t))
+    }
+}
 
 /// **The canonical audio fallback lever** (`FSD/CIRIS_MESH.md` §6.4; Eric
 /// 2026-11-21: no traffic on the canonical, audio included, while the mesh
@@ -446,6 +617,13 @@ impl AlmState {
             draining_parent: BTreeMap::new(),
             last_primary: BTreeMap::new(),
             leg_queue_ms: BTreeMap::new(),
+            stale_seen: BTreeMap::new(),
+            own_stamp: None,
+            last_stamp_ms: 0,
+            relayed_stamps: BTreeMap::new(),
+            witness_seq: BTreeMap::new(),
+            witness_sent_at: BTreeMap::new(),
+            own_relay_offers: BTreeMap::new(),
             leg_busy: BTreeSet::new(),
             members: members.to_vec(),
             tier: ServiceTier::FullOps,
@@ -453,6 +631,7 @@ impl AlmState {
             rates: BTreeMap::new(),
             forwarded_seen: BTreeMap::new(),
             min_offset: BTreeMap::new(),
+            age_floor: BTreeMap::new(),
             last_offer_ms: 0,
             counts: AlmCounts::default(),
             labels: Vec::new(),
@@ -473,6 +652,8 @@ impl AlmState {
             relayed: BTreeMap::new(),
             uplink_stall: false,
             uplink_stall_seen_ms: None,
+            drain: UplinkDrain::default(),
+            drain_off_for_test: false,
             pending_out: Vec::new(),
             offered_at: BTreeMap::new(),
             own_published_ms: BTreeMap::new(),
@@ -494,6 +675,57 @@ impl AlmState {
         self.uplink_stall
     }
 
+    /// 45.3 row DR — fold this tick's uplink backlog reading ([`UplinkDrain`]).
+    pub(super) fn observe_uplink_backlog(&mut self, backlog_ms: Option<u64>) -> Option<bool> {
+        let now = self.now_ms();
+        if self.drain_off_for_test {
+            self.drain = UplinkDrain::default();
+            self.drain.backlog_ms = backlog_ms;
+            return None;
+        }
+        let changed = self.drain.observe(now, backlog_ms);
+        if changed == Some(true) {
+            self.label(crate::observability::ALM_DRAIN_ENTERED);
+        }
+        changed
+    }
+
+    /// Test seam: turn rows DR, STALE and AGE off (`true`) or back on.
+    pub(super) fn set_drain_off_for_test(&mut self, off: bool) {
+        self.drain_off_for_test = off;
+    }
+
+    /// Whether the queue rules (DR, STALE, AGE) are off (a test seam).
+    pub(super) fn queue_rules_off(&self) -> bool {
+        self.drain_off_for_test
+    }
+
+    /// 45.3 row STALE — whether media handed to the uplink now would reach
+    /// its receivers stale ([`stale_at_sender`] on this tick's backlog).
+    pub(super) fn sends_stale(&self) -> bool {
+        !self.drain_off_for_test && stale_at_sender(self.drain.backlog_ms())
+    }
+
+    /// 45.3 row DR — whether this node withholds media now.
+    pub(super) fn draining(&self) -> bool {
+        self.drain.active()
+    }
+
+    /// 45.3 row DR — the last uplink backlog reading.
+    pub(super) fn uplink_backlog_ms(&self) -> Option<u64> {
+        self.drain.backlog_ms()
+    }
+
+    /// 45.3 row DR — who the backlog is read on: the members this node's own
+    /// stream goes to as a primary (the kept child after a shed).
+    pub(super) fn kept_legs(&self) -> Vec<String> {
+        self.own_children()
+            .into_iter()
+            .filter(|(_, r)| *r == Role::Primary)
+            .map(|(p, _)| p)
+            .collect()
+    }
+
     /// G8 — whether this watch tick DETECTED this node's uplink stalled (the
     /// call reads its legs' unproved Channel ages). The verdict holds
     /// [`UPLINK_STALL_LATCH_MS`] past the last detection. On its rise it is
@@ -506,6 +738,14 @@ impl AlmState {
     /// Offers keep their cadence (row D1): only a BACKLOGGED leg's offer is
     /// held, at the send (`alm_offer_held:backlog`).
     pub(super) fn set_uplink_stall(&mut self, detected: bool) {
+        // 45.3 — a draining uplink (row DR) is a stalled one. The verdict's
+        // own age restarts each time an older message is proved, so under a
+        // STANDING queue it stops detecting within seconds and every stall
+        // behaviour (one direct child, standbys get nothing, the offers to
+        // non-children at the liveness minimum, the probe held) lapsed with
+        // the queue still full: W6 saw m0 offer five streams a second to
+        // every member, 58 kbit/s of control on a 300 kbit/s cap.
+        let detected = detected || self.drain.active();
         let now = self.now_ms();
         if detected {
             self.uplink_stall_seen_ms = Some(now);
@@ -804,6 +1044,57 @@ impl AlmState {
         self.caps
             .get(peer)
             .is_some_and(|c| c & CAP_LINK_DATAGRAMS != 0)
+    }
+
+    /// 45.3 (R31 SelfStamp) — whether this node is withholding any of its
+    /// own media now: its uplink stalled, a drain on, or row STALE dropping.
+    pub(super) fn withholding_media(&self) -> bool {
+        self.uplink_stall || self.drain.active() || self.sends_stale()
+    }
+
+    /// 45.3 (R29) — whether `peer` takes backlog STAMP frames.
+    pub(super) fn takes_stamps(&self, peer: &str) -> bool {
+        self.caps
+            .get(peer)
+            .is_some_and(|c| c & wire::CAP_BACKLOG_STAMP != 0)
+    }
+
+    /// 45.3 (R29) — this node's own stream's STAMP frame for its offers, or
+    /// none (its uplink is under the stale budget).
+    pub(super) fn set_own_stamp(&mut self, frame: Option<Vec<u8>>) {
+        self.own_stamp = frame;
+    }
+
+    /// 45.3 (R29) — `peer` carried a publisher's backlog stamp for `stream`
+    /// that the call verified (`frame` is its STAMP frame, as received),
+    /// `net_age_ms` old net of its declared `backlog_ms`. The selector
+    /// learns it; a relay keeps the frame to forward with its own offers.
+    pub(super) fn on_stamp(
+        &mut self,
+        peer: &str,
+        stream: StreamId,
+        frame: Vec<u8>,
+        backlog_ms: u64,
+        net_age_ms: Option<u64>,
+    ) {
+        let now = self.now_ms();
+        if let Some(sel) = self.sels.get_mut(&stream) {
+            sel.on_backlog_stamp(now, &peer.to_owned(), backlog_ms, net_age_ms);
+        }
+        self.relayed_stamps.insert(stream, (now, frame));
+    }
+
+    /// 45.3 (R29) — the latency floor's view of a stamp `sent_ms` by the
+    /// publisher of `stream` at `epoch`: how far above the stream's floor it
+    /// is now (the publisher's clock offset cancelled): the epoch's AGE
+    /// floor, else the stream's RM1 floor, `None` with neither confirmed.
+    pub(super) fn stamp_age_ms(&self, stream: StreamId, epoch: u64, sent_ms: u64) -> Option<i64> {
+        self.latency_now(stream, epoch, sent_ms).or_else(|| {
+            let floor = self.min_offset.get(&stream)?.confirmed()?;
+            #[allow(clippy::cast_possible_wrap)]
+            let offset = crate::transport::av_chunk_auth::unix_ms_now() as i64 - sent_ms as i64;
+            Some(offset.saturating_sub(floor))
+        })
     }
 
     /// The decision log's chained hash (hex).
@@ -1329,7 +1620,9 @@ impl AlmState {
     /// C1, receiver side: a verified chunk of `stream` from `from`.
     /// `source_ms` is the publisher's signed timestamp; latency is measured
     /// above the fastest delivery seen for the stream, so clock offset
-    /// between the hosts cancels.
+    /// between the hosts cancels. Returns that latency (ms above the RM1
+    /// floor; `None` for this node's own stream): 45.3 row AGE drops a chunk
+    /// whose latency is past [`super::MEDIA_STALE_BUDGET`].
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_wrap,
@@ -1345,32 +1638,52 @@ impl AlmState {
         source_ms: u64,
         base_or_audio: bool,
         hop_lost: u64,
-    ) {
+    ) -> Option<i64> {
         if self.is_own(stream) {
-            return;
+            return None;
         }
         let now = self.now_ms();
         let newest = self.epochs.entry(stream).or_insert(epoch);
         if epoch > *newest {
             *newest = epoch;
             self.labels.push(crate::observability::ALM_EPOCH_RESYNC);
+            // The AGE floor starts again with the roll; the epoch before
+            // stays for the chunks still on their way from it.
+            let keep_from = epoch.saturating_sub(1);
+            self.age_floor
+                .retain(|(s, e), _| *s != stream || *e >= keep_from);
         }
         let wall = crate::transport::av_chunk_auth::unix_ms_now();
         let offset = wall as i64 - source_ms as i64;
+        let age_ms = self
+            .age_floor
+            .entry((stream, epoch))
+            .or_insert_with(|| LatencyFloor::empty(now))
+            .sample(offset, now);
         // RM1: a better floor wins at once; only an on-time sample
         // re-anchors an old one (drift), never a queued one.
-        let latency = self
+        let latency_ms = self
             .min_offset
             .entry(stream)
-            .or_insert_with(|| LatencyFloor::new(offset, now))
-            .sample(offset, now) as f64;
+            .or_insert_with(|| LatencyFloor::empty(now))
+            .sample(offset, now);
+        #[allow(clippy::cast_precision_loss)]
+        let latency = latency_ms as f64;
         // RM2: per path, so the publisher's own delivery is read alone.
         self.readings
             .entry((stream, from.to_owned()))
             .or_default()
             .push(now, latency);
+        // R31 (CC) — a stale chunk is not an arrival: it delivers nothing,
+        // so it never resets its carrier's silence (a relay that held fresh
+        // chunks to make them stale would otherwise never be silent). It is
+        // the publisher's word that its media is late, which excuses the
+        // silence only by the rule's own bound (`note_stale_end_to_end`).
+        if super::is_stale_end_to_end(Some(age_ms)) && !self.queue_rules_off() {
+            return Some(age_ms);
+        }
         let Some(sel) = self.sels.get_mut(&stream) else {
-            return;
+            return Some(age_ms);
         };
         let role = sel
             .subscriptions()
@@ -1398,6 +1711,7 @@ impl AlmState {
                 .or_default()
                 .add(bytes, base_or_audio);
         }
+        Some(age_ms)
     }
 
     /// What every admission on this uplink but `stream`'s commits (bits/s):
@@ -1492,14 +1806,85 @@ impl AlmState {
         self.sync_upstream(s);
     }
 
+    /// 45.3 row AGE — a received frame of `stream` stamped `source_ms` by its
+    /// publisher: how far above the stream's RM1 floor it is NOW (`None`
+    /// before the stream's first chunk set a floor). Read at hand-out to the
+    /// host: what the pump passed can still go stale waiting on its other
+    /// fragments or the reorder window.
+    pub(super) fn latency_now(&self, stream: StreamId, epoch: u64, source_ms: u64) -> Option<i64> {
+        let floor = self.age_floor.get(&(stream, epoch))?.confirmed()?;
+        #[allow(clippy::cast_possible_wrap)]
+        let offset = crate::transport::av_chunk_auth::unix_ms_now() as i64 - source_ms as i64;
+        Some(offset.saturating_sub(floor))
+    }
+
+    /// 45.3 row AGE — a chunk of `stream` was dropped here as stale end to
+    /// end, `latency_ms` above its floor.
+    ///
+    /// R31 (`RoomStamps.tla`) — the dropped chunk is the publisher's signed
+    /// word that its media is late (it verified under the stream's chunk
+    /// key): `from` is excused by it, if it is new by `seq` and not past
+    /// [`STALE_WITNESS_CAP_MS`] late. Returns whether to forward it on to
+    /// this node's children as theirs: one a stream per offer period.
+    pub(super) fn note_stale_end_to_end(
+        &mut self,
+        stream: StreamId,
+        from: &str,
+        seq: u64,
+        latency_ms: i64,
+    ) -> bool {
+        let now = self.now_ms();
+        let l = u64::try_from(latency_ms).unwrap_or(0);
+        self.stale_seen.entry(stream).or_default().note(now, l);
+        let fresh_seq = self.witness_seq.get(&stream).is_none_or(|last| seq > *last);
+        let usable = fresh_seq && l <= STALE_WITNESS_CAP_MS;
+        if usable {
+            self.witness_seq.insert(stream, seq);
+            if let Some(sel) = self.sels.get_mut(&stream) {
+                sel.on_stale_witness(now, &from.to_owned());
+            }
+        }
+        self.sync_upstream(stream);
+        let due = self
+            .witness_sent_at
+            .get(&stream)
+            .is_none_or(|at| now.saturating_sub(*at) >= OFFER_EVERY_MS);
+        if usable && due {
+            self.witness_sent_at.insert(stream, now);
+            tracing::debug!(
+                target: "ciris_edge::stamp",
+                node = %self.me,
+                from = %from,
+                seq,
+                latency_ms = l,
+                "stale chunk: excuses its carrier, forwarded on as a witness"
+            );
+            return true;
+        }
+        false
+    }
+
     fn sync_upstream(&mut self, stream: StreamId) {
         let view = self
             .sels
             .get(&stream)
             .and_then(ParentSelector::upstream_view);
+        // What this node drops as stale is as late as its upstream is: its
+        // offer says so while the drops are recent (offer-as-life's life), so
+        // a child of a relay with nothing fresh to pass on keeps it.
+        let now = self.now_ms();
+        let life = crate::transport::realtime_av_alm::controller::selector::OFFER_IS_LIFE_MS;
+        let stale = self.stale_seen.get_mut(&stream).map_or(0, |seen| {
+            u32::try_from(seen.max_within(now, life)).unwrap_or(u32::MAX)
+        });
         if let Some(a) = self.relays.get_mut(&stream) {
             match view {
-                Some(u) => a.set_upstream(Some(u.depth), u.ancestry, u.healthy, u.latency_ms),
+                Some(u) => a.set_upstream(
+                    Some(u.depth),
+                    u.ancestry,
+                    u.healthy,
+                    u.latency_ms.max(stale),
+                ),
                 None => a.set_upstream(None, Vec::new(), false, 0),
             }
         }
@@ -1713,6 +2098,19 @@ impl AlmState {
                 self.sync_upstream(stream);
             }
             ControlMsg::Offer(o) => {
+                // R34 — a direct child offering this node's own stream on
+                // (depth 1, this node its only ancestor) is a relay its
+                // siblings may have moved to: the over-commit shed keeps the
+                // lowest-ranked of these, as the movers' RM4 reading does.
+                if self.is_own(stream)
+                    && o.forwarding
+                    && o.depth == 1
+                    && o.ancestry.len() == 1
+                    && o.ancestry[0] == self.me
+                {
+                    let now = self.now_ms();
+                    self.own_relay_offers.insert(peer.to_owned(), now);
+                }
                 if self.is_own(stream) || !self.members.iter().any(|m| m == peer) {
                     return out;
                 }
@@ -1834,9 +2232,14 @@ impl AlmState {
         self.rates.remove(&old);
         self.forwarded_seen.remove(&old);
         self.min_offset.remove(&old);
+        self.age_floor.retain(|(s, _), _| *s != old);
         self.readings.retain(|(s, _), _| *s != old);
         self.late_moved.remove(&old);
         self.late_noted.remove(&old);
+        self.stale_seen.remove(&old);
+        self.relayed_stamps.remove(&old);
+        self.witness_seq.remove(&old);
+        self.witness_sent_at.remove(&old);
         self.last_primary.remove(&old);
         self.told_publisher.remove(&old);
         self.draining_parent.remove(&old);
@@ -1937,6 +2340,18 @@ impl AlmState {
             own_w.capacity_bps = Some(one + self.cfg.reserve_bps as f64 + ext as f64);
         }
         self.log.set_stream(Some(stream_label(self.own_stream)));
+        // R34 — the child the movers spared (the lowest-ranked direct child
+        // offering this stream on, as RM4 reads it from offers) is shed
+        // last: shedding it strands the members who moved to it.
+        let fresh = |at: &u64| now.saturating_sub(*at) <= self.cfg.down_silence_ms;
+        let relays: Vec<String> = self
+            .own_relay_offers
+            .iter()
+            .filter(|(_, at)| fresh(at))
+            .map(|(p, _)| p.clone())
+            .collect();
+        let spared = rxmove::lowest(self.own_stream, &relays).cloned();
+        self.own.set_spared(spared);
         for p in self.own.on_egress_window(now, &own_w, &mut self.log) {
             shed.push((self.own_stream, p));
         }
@@ -2097,26 +2512,7 @@ impl AlmState {
         // hold-back: 5 s on every leg made a dead listener noticed ~4 s late.
         if now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0 {
             self.last_offer_ms = now.max(1);
-            let mut own_offer = self.own.offer();
-            // The publisher's upstream latency is its own uplink queue: what
-            // a child admitted now waits for its first chunk (the child's
-            // selector owes a new subscription that much before calling it
-            // silent).
-            let queued = self
-                .leg_queue_ms
-                .values()
-                .copied()
-                .fold(0.0_f64, f64::max)
-                .clamp(0.0, f64::from(u32::MAX));
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            {
-                own_offer.upstream_latency_ms =
-                    own_offer.upstream_latency_ms.max(queued.round() as u32);
-            }
-            own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
-            own_offer.forwarder_headroom_bps =
-                self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
-            let own_frame = encode(self.own_stream, &ControlMsg::Offer(own_offer));
+            let own_frame = self.own_offer_frame();
             let share_frames: Vec<Vec<u8>> = self
                 .shares
                 .iter()
@@ -2130,7 +2526,12 @@ impl AlmState {
             let relay_offers: Vec<(StreamId, Vec<String>, Vec<u8>)> = self
                 .relays
                 .iter()
-                .filter(|(_, a)| self.relay_capable && a.forwarding())
+                // 45.3 — no relay offers while the uplink is stalled: a stalled
+                // node relays one stream's room at most (G8) and has none to
+                // offer, and its own stream's offer is each leg's liveness
+                // (F14a). Offered anyway they were 4 of the 5 offers a second
+                // m0 sent every member under the W6 cap.
+                .filter(|(_, a)| self.relay_capable && a.forwarding() && !self.uplink_stall)
                 .map(|(s, a)| {
                     let mut o = a.offer();
                     let rate = self.rates.get(s).cloned().unwrap_or_default();
@@ -2218,6 +2619,67 @@ impl AlmState {
                         frame: f.clone(),
                     });
                 }
+                // R29 — the publisher's signed backlog word goes with the
+                // offers: its own while backlogged; a relay's, byte for
+                // byte, the latest it verified of each stream it offers.
+                if self.takes_stamps(peer) {
+                    for (s, skip, _) in &relay_offers {
+                        if skip.contains(peer) {
+                            continue;
+                        }
+                        if let Some((at, f)) = self.relayed_stamps.get(s) {
+                            if now.saturating_sub(*at)
+                                <= crate::transport::realtime_av_alm::controller::selector::OFFER_IS_LIFE_MS
+                            {
+                                out.push(Outgoing {
+                                    to: peer.clone(),
+                                    frame: f.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 45.3 (R31 SelfStamp) — the own stamp goes to every C3 member that
+        // takes stamps each offer period, whatever the stalled offer cadence:
+        // a standby, or a member this node withholds media from, hears its
+        // publisher's word at the 1 s cadence (`RoomStamps.tla`
+        // StandbyKept: at the stalled non-child cadence a moved listener's
+        // standby went Down and it never came back).
+        if now.saturating_sub(self.last_stamp_ms) >= OFFER_EVERY_MS || self.last_stamp_ms == 0 {
+            if let Some(f) = self.own_stamp.clone() {
+                self.last_stamp_ms = now.max(1);
+                for peer in c3_legs {
+                    if self.members.iter().any(|m| m == peer) && self.takes_stamps(peer) {
+                        out.push(Outgoing {
+                            to: peer.clone(),
+                            frame: f.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 45.3 row DR — while media is withheld the backlog must stay
+        // visible: an outstanding Channel message on each kept leg every
+        // watch tick (the own stream's OFFER, the message the leg already
+        // carries each second), or a queue under a second would read as
+        // "nothing outstanding", i.e. drained, between offers.
+        if self.drain.active() {
+            let frame = self.own_offer_frame();
+            for peer in self.kept_legs() {
+                if c3_legs.contains(&peer)
+                    && !out
+                        .iter()
+                        .any(|o| o.to == peer && wire::is_periodic(&o.frame))
+                {
+                    out.push(Outgoing {
+                        to: peer,
+                        frame: frame.clone(),
+                    });
+                }
             }
         }
 
@@ -2247,6 +2709,40 @@ impl AlmState {
             self.relay_status_pending = Some(status);
         }
         out
+    }
+
+    /// The own stream's OFFER as this node sends it now: its upstream
+    /// latency is its own uplink queue (what a child admitted now waits for
+    /// its first chunk; the child's selector owes a new subscription that
+    /// much before calling it silent), its headroom in nominal units.
+    /// 45.3 — this node's own uplink queue as its own offer states it: the
+    /// most queued of its legs' gauges, or the send clock's backlog,
+    /// whichever is later (ms). While draining, the legs carry little and
+    /// the send clock can read zero; the legs' queue gauges still read the
+    /// FIFO. This is also the backlog its signed stamp declares (R29).
+    pub(super) fn own_queue_word_ms(&self) -> u64 {
+        let queued = self
+            .leg_queue_ms
+            .values()
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .clamp(0.0, f64::from(u32::MAX));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let queued = queued.round() as u64;
+        queued.max(self.uplink_backlog_ms().unwrap_or(0))
+    }
+
+    fn own_offer_frame(&self) -> Vec<u8> {
+        let mut own_offer = self.own.offer();
+        // 45.3 — the uplink's queue (its legs' gauges, the send clock) is
+        // the upstream latency a child admitted now waits for: a publisher
+        // past the stale budget sends no media (STALE).
+        let word = u32::try_from(self.own_queue_word_ms()).unwrap_or(u32::MAX);
+        own_offer.upstream_latency_ms = own_offer.upstream_latency_ms.max(word);
+        own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
+        own_offer.forwarder_headroom_bps =
+            self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
+        encode(self.own_stream, &ControlMsg::Offer(own_offer))
     }
 
     /// RM2 — ReceiverMoves, once a watch tick for each received stream: a
@@ -2473,6 +2969,35 @@ fn stream_label(s: StreamId) -> String {
     format!("{:02x}{:02x}", s.0[0], s.0[1])
 }
 
+/// 45.3 row AGE (R29b) — the stale drops of one received stream within a
+/// window, kept so the window's MOST late drop is read in O(1): latencies
+/// fall front to back, because a drop at least as late as those behind it
+/// replaces them (they can never be the maximum again while it is held).
+#[derive(Debug, Default)]
+pub(super) struct StaleWindow(VecDeque<(u64, u64)>);
+
+impl StaleWindow {
+    /// A drop at `now`, `latency_ms` above the stream's floor.
+    pub(super) fn note(&mut self, now: u64, latency_ms: u64) {
+        while self.0.back().is_some_and(|&(_, l)| l <= latency_ms) {
+            self.0.pop_back();
+        }
+        self.0.push_back((now, latency_ms));
+    }
+
+    /// The most late drop no older than `window_ms` at `now`; 0 for none.
+    pub(super) fn max_within(&mut self, now: u64, window_ms: u64) -> u64 {
+        while self
+            .0
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_sub(at) > window_ms)
+        {
+            self.0.pop_front();
+        }
+        self.0.front().map_or(0, |&(_, l)| l)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2482,6 +3007,97 @@ mod tests {
 
     fn s(b: u8) -> StreamId {
         StreamId([b; 32])
+    }
+
+    /// 45.3 row DR — the drain enters at the stall bound, holds while the
+    /// backlog reads high (however long: no timer ends it), and leaves only
+    /// after a full second under the leave bound; a reading back over the
+    /// leave bound restarts that second; "nothing outstanding" is drained.
+    #[test]
+    fn the_drain_enters_at_400_ms_and_leaves_after_a_second_under_200() {
+        let mut d = UplinkDrain::default();
+        assert_eq!(d.observe(0, Some(DRAIN_ENTER_MS - 1)), None);
+        assert!(!d.active());
+        assert_eq!(d.observe(250, Some(DRAIN_ENTER_MS)), Some(true));
+        // A deep backlog for a minute: still draining.
+        for t in (500..60_000).step_by(250) {
+            assert_eq!(d.observe(t, Some(9_000)), None);
+        }
+        assert!(d.active());
+        // Under the leave bound, but not for a second yet.
+        assert_eq!(d.observe(60_000, Some(DRAIN_LEAVE_MS - 1)), None);
+        assert_eq!(d.observe(60_750, Some(10)), None);
+        // One reading back over the leave bound restarts the second.
+        assert_eq!(d.observe(60_900, Some(DRAIN_LEAVE_MS)), None);
+        assert_eq!(d.observe(61_000, None), None);
+        assert_eq!(d.observe(61_750, None), None);
+        assert_eq!(d.observe(62_000, Some(0)), Some(false));
+        assert!(!d.active());
+        // Between the bounds it neither enters nor leaves.
+        assert_eq!(d.observe(62_250, Some(300)), None);
+        assert!(!d.active());
+    }
+
+    /// 45.3 R29b (`RelayAdvert.tla`, AdvOverDrops) — a relay advertises the
+    /// MOST late stale drop of the last 2.5 s, not the last one: a 1.0 s drop
+    /// then a 0.9 s drop reads 1.0 s while the first is in the window, then
+    /// 0.9 s once it leaves, then nothing. Mutation: keeping only the last
+    /// drop reads 0.9 s at once and fails the first assertion.
+    #[test]
+    fn a_relay_advertises_its_most_late_stale_drop_of_the_window() {
+        let life = crate::transport::realtime_av_alm::controller::selector::OFFER_IS_LIFE_MS;
+        let mut w = StaleWindow::default();
+        assert_eq!(w.max_within(0, life), 0);
+        w.note(0, 1_000);
+        w.note(500, 900);
+        assert_eq!(w.max_within(600, life), 1_000, "the earlier, later drop");
+        assert_eq!(w.max_within(life + 1, life), 900, "the first left");
+        assert_eq!(w.max_within(500 + life + 1, life), 0, "both left");
+        // A later drop at least as late replaces what it outlives.
+        w.note(10_000, 700);
+        w.note(10_100, 800);
+        assert_eq!(w.0.len(), 1);
+        assert_eq!(w.max_within(10_100, life), 800);
+    }
+
+    /// 45.3 row STALE — media is dropped at the sender only once the backlog
+    /// is past the receivers' budget; nothing outstanding is never stale.
+    #[test]
+    fn media_is_dropped_at_the_sender_once_the_backlog_is_past_800_ms() {
+        assert!(!stale_at_sender(None));
+        assert!(!stale_at_sender(Some(0)));
+        assert!(!stale_at_sender(Some(800)));
+        assert!(stale_at_sender(Some(801)));
+        assert!(stale_at_sender(Some(9_000)));
+    }
+
+    /// 45.3 row DR — the oldest unproved message is aged from its SEND, not
+    /// from when it became the oldest: under a standing queue proofs keep
+    /// arriving (the oldest changes every tick) and the age stays the
+    /// queue's depth. Wraps with the Channel's 16-bit sequence.
+    #[test]
+    fn a_send_clock_ages_the_oldest_unproved_message_from_its_send() {
+        let mut c = SendClock::default();
+        // One message a tick, each proved ~9 s (36 ticks) later.
+        let mut ages = Vec::new();
+        for k in 0u64..120 {
+            let now = k * 250;
+            let last = u16::try_from((65_500 + k) % 65_536).unwrap();
+            c.note(now, last);
+            let oldest = u16::try_from((65_500 + k.saturating_sub(36)) % 65_536).unwrap();
+            ages.push(c.age_of(now, oldest).unwrap());
+        }
+        assert!(ages[60..].iter().all(|a| *a == 9_000), "{:?}", &ages[60..]);
+        // The same queue drains: the oldest is the message just sent.
+        let mut c = SendClock::default();
+        c.note(0, 7);
+        c.note(250, 8);
+        assert_eq!(c.age_of(500, 8), Some(250));
+        assert_eq!(
+            c.age_of(500, 9),
+            Some(250),
+            "past every reading: the newest"
+        );
     }
 
     fn roster() -> Vec<String> {
@@ -2497,6 +3113,16 @@ mod tests {
                     to.on_caps(from, c);
                 }
                 WireFrame::Control(cf) => out.extend(to.on_control(from, cf, 20.0)),
+                // The sim's stamps are taken as verified, fresh when heard.
+                WireFrame::Stamp(st) => {
+                    to.on_stamp(
+                        from,
+                        st.stream,
+                        f.frame.clone(),
+                        u64::from(st.backlog_ms),
+                        Some(0),
+                    );
+                }
             }
         }
         out
@@ -2750,6 +3376,42 @@ mod tests {
         }
         a.relays.insert(s(7), adm);
         a
+    }
+
+    /// 45.3 fixes (a) and (b). (a) A draining uplink (row DR) is a stalled
+    /// one, with no detection of the verdict's own: under a standing queue
+    /// the verdict stops detecting within seconds. (b) A stalled node sends
+    /// no relay offers (it relays one stream's room at most), while its own
+    /// stream's offer, each leg's liveness, goes on. Mutations: (a) the drain
+    /// not counted, the verdict reads unstalled; (b) the filter gone, stream
+    /// 7 is offered from a stalled uplink (4 of m0's 5 offers a second under
+    /// the W6 cap).
+    #[test]
+    fn a_draining_uplink_is_stalled_and_offers_nothing_it_relays() {
+        let mut a = relaying_a();
+        let legs = ["b".to_owned(), "c".to_owned()];
+        let offers = |out: &[Outgoing], st: StreamId| {
+            out.iter()
+                .filter(|o| {
+                    matches!(
+                        decode(&o.frame, "a"),
+                        Ok(WireFrame::Control(ControlFrame { stream, msg: ControlMsg::Offer(_) })) if stream == st
+                    )
+                })
+                .count()
+        };
+        a.t0 = a.t0.checked_sub(Duration::from_secs(2)).expect("clock");
+        let out = a.tick(&legs);
+        assert!(offers(&out, s(7)) > 0, "a healthy relay offers: {out:?}");
+        // The backlog reads past the drain's entry bound.
+        let _ = a.observe_uplink_backlog(Some(DRAIN_ENTER_MS + 100));
+        assert!(a.draining());
+        a.set_uplink_stall(false);
+        assert!(a.uplink_stalled(), "(a) draining is stalled");
+        a.t0 = a.t0.checked_sub(Duration::from_secs(2)).expect("clock");
+        let out = a.tick(&legs);
+        assert_eq!(offers(&out, s(7)), 0, "(b) no relay offer while stalled");
+        assert!(offers(&out, s(1)) > 0, "the own stream's offer goes on");
     }
 
     fn sheds(out: &[Outgoing]) -> Vec<(String, ShedReason)> {
@@ -3444,6 +4106,51 @@ mod tests {
         n.min_offset[&stream].floor()
     }
 
+    /// 45.3 row AGE (CC review; R27 confirm0) — the AGE floor lives one
+    /// (stream, epoch), and a floor needs its confirming pair. The
+    /// publisher's clock steps 2 s ahead for ONE chunk: that chunk only
+    /// proposes a floor, no second chunk confirms it, and the on-time chunks
+    /// after it stay fresh, then and forty seconds on. The roll starts the
+    /// floor again: the new epoch's first chunk proposes, its second
+    /// confirms, and none is stale. Mutations: a lower offset taken at once
+    /// (45.3 before confirm0) reads every later chunk 2 s late; a floor kept
+    /// per stream across epochs carries a poisoned floor past the roll.
+    #[test]
+    fn a_publisher_clock_step_for_one_chunk_poisons_nothing() {
+        let mut b = AlmState::new("b", s(2), &roster(), true, 2);
+        b.on_caps("a", CAPS_THIS_BUILD);
+        b.note_publisher(s(1), "a");
+        b.note_bound_publisher(s(1), "a");
+        let stale = |l: Option<i64>| super::super::is_stale_end_to_end(l);
+        let chunk = |b: &mut AlmState, epoch: u64, seq: u64, ahead_ms: u64| {
+            let src = crate::transport::av_chunk_auth::unix_ms_now() + ahead_ms;
+            let l = b.on_chunk(s(1), "a", epoch, seq, 300, src, true, 0);
+            b.t0 = b.t0.checked_sub(Duration::from_millis(33)).expect("clock");
+            l
+        };
+        let mut seq = 0;
+        for _ in 0..30 {
+            assert!(!stale(chunk(&mut b, 1, seq, 0)), "on time");
+            seq += 1;
+        }
+        // One chunk stamped 2 s ahead: it proposes a floor nobody confirms.
+        assert!(!stale(chunk(&mut b, 1, seq, 2_000)));
+        seq += 1;
+        for _ in 0..30 {
+            assert!(
+                !stale(chunk(&mut b, 1, seq, 0)),
+                "the step poisoned the floor"
+            );
+            seq += 1;
+        }
+        b.t0 = b.t0.checked_sub(Duration::from_secs(40)).expect("clock");
+        assert!(!stale(chunk(&mut b, 1, seq, 0)), "forty seconds on");
+        // The roll: the floor starts again, fresh from its first chunk.
+        for k in 0..30 {
+            assert!(!stale(chunk(&mut b, 2, k, 0)), "fresh in the new epoch");
+        }
+    }
+
     /// RM1 — observable: a chunk's signed `source_ts_ms` against the wall
     /// clock; state: the stream queued 500 ms behind its floor for 40 s;
     /// action: the floor stays; must never: re-anchor while the stream is
@@ -4002,6 +4709,16 @@ mod tests {
                         for r in self.nodes[to].on_control(NAMES[from], cf, 20.0) {
                             q.push_back((to, r));
                         }
+                    }
+                    WireFrame::Stamp(st) => {
+                        let b = u64::from(st.backlog_ms);
+                        self.nodes[to].on_stamp(
+                            NAMES[from],
+                            st.stream,
+                            o.frame.clone(),
+                            b,
+                            Some(0),
+                        );
                     }
                 }
             }
@@ -5011,6 +5728,16 @@ mod tests {
                             for r in self.nodes[to].on_control(NAMES[from], cf, 20.0) {
                                 q.push_back((to, r));
                             }
+                        }
+                        WireFrame::Stamp(st) => {
+                            let b = u64::from(st.backlog_ms);
+                            self.nodes[to].on_stamp(
+                                NAMES[from],
+                                st.stream,
+                                o.frame.clone(),
+                                b,
+                                Some(0),
+                            );
                         }
                     }
                 }

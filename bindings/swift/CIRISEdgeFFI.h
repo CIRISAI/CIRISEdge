@@ -360,6 +360,11 @@ RustBuffer uniffi_ciris_edge_fn_func_peer_list(RustBuffer filter, RustCallStatus
 RustBuffer uniffi_ciris_edge_fn_func_peer_probe(RustBuffer key_id, uint64_t timeout_ms, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_PEER_REACH
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_PEER_REACH
+RustBuffer uniffi_ciris_edge_fn_func_peer_reach(RustBuffer node_key_id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_PEER_REMOVE
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_PEER_REMOVE
 void uniffi_ciris_edge_fn_func_peer_remove(RustBuffer handle, int8_t hard, RustCallStatus *_Nonnull out_status
@@ -929,6 +934,12 @@ uint16_t uniffi_ciris_edge_checksum_func_peer_list(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_PEER_PROBE
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_PEER_PROBE
 uint16_t uniffi_ciris_edge_checksum_func_peer_probe(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_PEER_REACH
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_PEER_REACH
+uint16_t uniffi_ciris_edge_checksum_func_peer_reach(void
     
 );
 #endif

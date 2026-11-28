@@ -246,6 +246,9 @@ pub struct Admission<P: PeerRef> {
     demand_at_ms: u64,
     /// RM4 — the stream id a shed ranks by ([`Self::set_shed_rank`]).
     shed_rank: Option<[u8; 32]>,
+    /// 45.3 (R34) — the primary an over-commit shed takes last: the relay
+    /// the other children moved to ([`Self::set_spared`]).
+    spared: Option<P>,
     /// Row RO — when this forwarder last shed each member: that member's
     /// refusal within a dwell is not demand (it asks back what was just
     /// taken from it).
@@ -350,6 +353,7 @@ impl<P: PeerRef> Admission<P> {
             shed_on_verdict_only: false,
             demand_at_ms: 0,
             shed_rank: None,
+            spared: None,
             shed_at: BTreeMap::new(),
             drained_since_ms: None,
             last_drain_step_ms: None,
@@ -510,6 +514,15 @@ impl<P: PeerRef> Admission<P> {
     /// `None`: LIFO (the default, and every relay's).
     pub fn set_shed_rank(&mut self, stream: Option<[u8; 32]>) {
         self.shed_rank = stream;
+    }
+
+    /// 45.3 (R34 `ShedMovers.tla`) — the primary an over-commit shed takes
+    /// last: the lowest-ranked direct child that offers this stream on, the
+    /// one its siblings' RM4 reading spared and moved to. The movers rank
+    /// only children whose offer they hear; a lower-ranked child they cannot
+    /// see was the one kept before, and the relay they chose was shed.
+    pub fn set_spared(&mut self, spared: Option<P>) {
+        self.spared = spared;
     }
 
     /// RM5 — a direct child left while this node's stream is live: read it
@@ -1344,18 +1357,19 @@ impl<P: PeerRef> Admission<P> {
                 if self.is_root && primaries <= 1 {
                     return None;
                 }
-                match &self.shed_rank {
-                    None => self
-                        .ledger
-                        .iter()
+                let spared = self.spared.as_ref();
+                let others = || self.ledger.iter().filter(move |(p, _)| Some(*p) != spared);
+                let pick = match &self.shed_rank {
+                    None => others()
                         .max_by_key(|(_, c)| c.order)
                         .map(|(p, _)| p.clone()),
-                    Some(key) => self
-                        .ledger
-                        .iter()
+                    Some(key) => others()
                         .max_by_key(|(p, _)| hash_rank(key, *p))
                         .map(|(p, _)| p.clone()),
-                }
+                };
+                // Only the spared one left: as before (a root keeps its last
+                // primary above).
+                pick.or_else(|| spared.filter(|p| self.ledger.contains_key(*p)).cloned())
             });
             let Some(victim) = victim else {
                 break;
@@ -1818,6 +1832,22 @@ mod tests {
             ),
             "one stream, not two: the ceiling still binds"
         );
+    }
+
+    /// 45.3 R34 (`ShedMovers.tla`) — an over-commit shed keeps the spared
+    /// relay (the child its siblings moved to), not the lowest-ranked child
+    /// by ledger: LIFO would keep child 1, the spared one is child 2, and it
+    /// stays. Mutation: ignoring `set_spared` sheds child 2 and strands the
+    /// members on it.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn an_over_commit_shed_keeps_the_relay_the_movers_chose() {
+        let (mut a, mut log, cfg) = publisher_of_two();
+        a.set_spared(Some(2));
+        let tiny = cfg.stream_bps as f64 / 50.0;
+        let shed = a.on_egress_window(1_000, &window(tiny, true), &mut log);
+        assert_eq!(shed, vec![1], "the other child goes");
+        assert!(a.ledger().contains_key(&2), "the spared relay stays");
     }
 
     /// A relay has no such floor: its child can go elsewhere.

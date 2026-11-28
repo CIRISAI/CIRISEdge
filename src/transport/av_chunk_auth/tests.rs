@@ -1399,3 +1399,67 @@ async fn framed_chunk_kats_with_the_shipping_trailer() {
         ]
     );
 }
+
+/// **45.3 R29 — a publisher's backlog stamp is checked as a chunk is.** A's
+/// stamp under its bound key verifies and names A, and survives its wire
+/// encoding byte for byte (a relay forwards it unaltered). A stamp under
+/// another key (a relay minting one), with a tampered backlog, for an
+/// unbound epoch, or behind the highest chunk verified (replayed across a
+/// gap) is refused and counted. Mutation: skipping the signature check
+/// admits the minted and tampered stamps.
+#[tokio::test]
+async fn a_backlog_stamp_verifies_under_the_bound_key_and_nothing_else_does() {
+    let a = signer(A, 1);
+    let keys = Keys::of(&[&a]).await;
+    let auth = ChunkAuth::new(ROOM);
+    let nonce = [7; 32];
+    let stream = call_stream_id(ROOM, A, &nonce);
+    let key = ChunkSigner::generate(stream, Epoch(3)).unwrap();
+    assert!(matches!(
+        bind(&auth, &keys, &a, nonce, 3, key.public()).await,
+        BindingOutcome::Installed(_)
+    ));
+    let st = key.stamp_backlog(1_000, 2_500, 0).unwrap();
+    let wire = st.to_bytes();
+    assert_eq!(wire.len(), BACKLOG_STAMP_LEN);
+    let back = BacklogStamp::from_bytes(&wire).expect("decodes");
+    assert_eq!(back, st);
+    assert_eq!(&*auth.check_stamp(&back).expect("A's stamp"), A);
+    // A relay's own key: minted, refused.
+    let other = ChunkSigner::generate(stream, Epoch(3)).unwrap();
+    let minted = other.stamp_backlog(1_000, 2_500, 0).unwrap();
+    assert_eq!(
+        auth.check_stamp(&minted).unwrap_err(),
+        ChunkAuthError::TrailerInvalid
+    );
+    // Tampered backlog.
+    let mut tampered = st.clone();
+    tampered.backlog_ms = 9_000;
+    assert_eq!(
+        auth.check_stamp(&tampered).unwrap_err(),
+        ChunkAuthError::TrailerInvalid
+    );
+    // An epoch with no bound key.
+    let unbound = ChunkSigner::generate(stream, Epoch(4)).unwrap();
+    assert_eq!(
+        auth.check_stamp(&unbound.stamp_backlog(1_000, 2_500, 0).unwrap())
+            .unwrap_err(),
+        ChunkAuthError::Unbound
+    );
+    // Behind what this node verified: chunk 5 arrived, a stamp naming 4 is
+    // a replay from before it.
+    let inner = seal(stream, 3, 5, b"a-5");
+    let _ = auth.check(&key.sign(&inner).unwrap()).expect("chunk 5");
+    assert_eq!(
+        auth.check_stamp(&key.stamp_backlog(2_000, 2_500, 4).unwrap())
+            .unwrap_err(),
+        ChunkAuthError::TrailerInvalid
+    );
+    assert!(auth
+        .check_stamp(&key.stamp_backlog(2_000, 2_500, 5).unwrap())
+        .is_ok());
+    assert!(
+        BacklogStamp::from_bytes(&wire[1..]).is_none(),
+        "one byte short"
+    );
+}

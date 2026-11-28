@@ -520,6 +520,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_peer_probe() != 59245:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_peer_reach() != 29445:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_peer_remove() != 60093:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_peer_set_alias() != 4725:
@@ -954,6 +956,11 @@ _UniffiLib.uniffi_ciris_edge_fn_func_peer_probe.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_ciris_edge_fn_func_peer_probe.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_ciris_edge_fn_func_peer_reach.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_peer_reach.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_ciris_edge_fn_func_peer_remove.argtypes = (
     _UniffiRustBuffer,
     ctypes.c_int8,
@@ -1194,6 +1201,9 @@ _UniffiLib.uniffi_ciris_edge_checksum_func_peer_list.restype = ctypes.c_uint16
 _UniffiLib.uniffi_ciris_edge_checksum_func_peer_probe.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_peer_probe.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_peer_reach.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_peer_reach.restype = ctypes.c_uint16
 _UniffiLib.uniffi_ciris_edge_checksum_func_peer_remove.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_peer_remove.restype = ctypes.c_uint16
@@ -2754,6 +2764,62 @@ class _UniffiFfiConverterTypeEdgePeerInfo(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.notes, buf)
         _UniffiFfiConverterBoolean.write(value.canonical, buf)
 
+
+
+
+
+
+class EdgeReachState(enum.Enum):
+    
+    LIVE = 0
+    
+    DIALABLE = 1
+    
+    UNREACHABLE = 2
+    
+    UNKNOWN = 3
+    
+
+
+class _UniffiFfiConverterTypeEdgeReachState(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return EdgeReachState.LIVE
+        if variant == 2:
+            return EdgeReachState.DIALABLE
+        if variant == 3:
+            return EdgeReachState.UNREACHABLE
+        if variant == 4:
+            return EdgeReachState.UNKNOWN
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == EdgeReachState.LIVE:
+            return
+        if value == EdgeReachState.DIALABLE:
+            return
+        if value == EdgeReachState.UNREACHABLE:
+            return
+        if value == EdgeReachState.UNKNOWN:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == EdgeReachState.LIVE:
+            buf.write_i32(1)
+        if value == EdgeReachState.DIALABLE:
+            buf.write_i32(2)
+        if value == EdgeReachState.UNREACHABLE:
+            buf.write_i32(3)
+        if value == EdgeReachState.UNKNOWN:
+            buf.write_i32(4)
+
+
+
 class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -2778,6 +2844,110 @@ class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
             return _UniffiFfiConverterUInt64.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u8"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**8
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u8()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u8(value)
+
+class _UniffiFfiConverterOptionalUInt8(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterUInt8.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterUInt8.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterUInt8.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class EdgePeerReach:
+    def __init__(self, *, state:EdgeReachState, live_link:bool, last_inbound_ms_ago:typing.Optional[int], has_path:bool, path_hops:typing.Optional[int], transit_pair:typing.Optional[bool], direct:bool):
+        self.state = state
+        self.live_link = live_link
+        self.last_inbound_ms_ago = last_inbound_ms_ago
+        self.has_path = has_path
+        self.path_hops = path_hops
+        self.transit_pair = transit_pair
+        self.direct = direct
+        
+        
+
+    
+    def __str__(self):
+        return "EdgePeerReach(state={}, live_link={}, last_inbound_ms_ago={}, has_path={}, path_hops={}, transit_pair={}, direct={})".format(self.state, self.live_link, self.last_inbound_ms_ago, self.has_path, self.path_hops, self.transit_pair, self.direct)
+    def __eq__(self, other):
+        if self.state != other.state:
+            return False
+        if self.live_link != other.live_link:
+            return False
+        if self.last_inbound_ms_ago != other.last_inbound_ms_ago:
+            return False
+        if self.has_path != other.has_path:
+            return False
+        if self.path_hops != other.path_hops:
+            return False
+        if self.transit_pair != other.transit_pair:
+            return False
+        if self.direct != other.direct:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeEdgePeerReach(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return EdgePeerReach(
+            state=_UniffiFfiConverterTypeEdgeReachState.read(buf),
+            live_link=_UniffiFfiConverterBoolean.read(buf),
+            last_inbound_ms_ago=_UniffiFfiConverterOptionalUInt64.read(buf),
+            has_path=_UniffiFfiConverterBoolean.read(buf),
+            path_hops=_UniffiFfiConverterOptionalUInt8.read(buf),
+            transit_pair=_UniffiFfiConverterOptionalBoolean.read(buf),
+            direct=_UniffiFfiConverterBoolean.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeEdgeReachState.check_lower(value.state)
+        _UniffiFfiConverterBoolean.check_lower(value.live_link)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.last_inbound_ms_ago)
+        _UniffiFfiConverterBoolean.check_lower(value.has_path)
+        _UniffiFfiConverterOptionalUInt8.check_lower(value.path_hops)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.transit_pair)
+        _UniffiFfiConverterBoolean.check_lower(value.direct)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeEdgeReachState.write(value.state, buf)
+        _UniffiFfiConverterBoolean.write(value.live_link, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.last_inbound_ms_ago, buf)
+        _UniffiFfiConverterBoolean.write(value.has_path, buf)
+        _UniffiFfiConverterOptionalUInt8.write(value.path_hops, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.transit_pair, buf)
+        _UniffiFfiConverterBoolean.write(value.direct, buf)
 
 @dataclass
 class EdgeProbeResult:
@@ -4080,19 +4250,6 @@ class _UniffiFfiConverterSequenceTypeEdgeTransportInfo(_UniffiConverterRustBuffe
         return [
             _UniffiFfiConverterTypeEdgeTransportInfo.read(buf) for i in range(count)
         ]
-
-class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u8"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**8
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u8()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u8(value)
 def av_datagrams_set_enabled(enabled: bool) -> None:
     
     _UniffiFfiConverterBoolean.check_lower(enabled)
@@ -4372,6 +4529,20 @@ def peer_probe(key_id: str,timeout_ms: int) -> EdgeProbeResult:
     _uniffi_ffi_result = _uniffi_rust_call_with_error(
         _uniffi_error_converter,
         _UniffiLib.uniffi_ciris_edge_fn_func_peer_probe,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def peer_reach(node_key_id: str) -> EdgePeerReach:
+    
+    _UniffiFfiConverterString.check_lower(node_key_id)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(node_key_id),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeEdgePeerReach.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_peer_reach,
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
@@ -4868,6 +5039,7 @@ __all__ = [
     "EdgeLinkState",
     "EdgeLinkDirection",
     "EdgePeerTrust",
+    "EdgeReachState",
     "EdgeBindingsError",
     "EdgeBlackholeEntry",
     "EdgeDeviceState",
@@ -4885,6 +5057,7 @@ __all__ = [
     "EdgePeerHealth",
     "EdgePeerPolicy",
     "EdgePeerInfo",
+    "EdgePeerReach",
     "EdgeProbeResult",
     "EdgeRateEntry",
     "EdgeReverseEntry",
@@ -4918,6 +5091,7 @@ __all__ = [
     "peer_health_summary",
     "peer_list",
     "peer_probe",
+    "peer_reach",
     "peer_remove",
     "peer_set_alias",
     "peer_set_notes",

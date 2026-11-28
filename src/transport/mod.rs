@@ -121,6 +121,10 @@ pub mod av_spine;
 #[cfg(feature = "_reticulum-module")]
 pub mod direct_path;
 
+/// v45.3 — whether this node can reach a peer now, and how
+/// (`Edge::peer_reach`), and the #971 undialable decision. Pure.
+pub mod peer_reach;
+
 /// v45.1 — why a call's media path failed: the `MediaPathFailed` event's
 /// types, the NAT report, and the one place the cause is decided. Pure, so
 /// it builds without a transport (the UniFFI surface reads its types).
@@ -279,6 +283,10 @@ pub mod onion_liveness;
 /// relay's C2 admission of the links it forwards.
 #[cfg(feature = "_reticulum-module")]
 pub mod relay_tier;
+
+/// 45.3 — the node's egress budget (delay-based AIMD, served control >
+/// audio > video > bulk).
+pub mod egress_budget;
 
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).

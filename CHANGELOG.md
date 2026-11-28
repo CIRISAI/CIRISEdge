@@ -2,6 +2,126 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.3.0
+
+**Calls through a capped uplink stay live and come back.** One additive C3 frame (`STAMP`,
+capability-gated); leviculum v0.34.0+ciris.5.
+
+### Added
+- The uplink backlog reading: per leg, the oldest unproved Channel message aged from its send
+  past the leg's RTT floor, least over every leg with something outstanding (two at least).
+  `alm_uplink_backlog_ms`, `alm_drain_entered`.
+- The node's egress budget: one rate for everything edge sends, set by delay-based AIMD from the
+  reading, serving control (never held), audio, video, then bulk. Own media is admitted per whole
+  frame. `alm_media_budget_bps`, `av_frame_held_budget`, `av_video_keyframe_wanted`,
+  `av_bulk_deferred_budget`.
+- FIRST class: identity-plane sends are never held unless known to be bulk. Replication rows are
+  classed by family (key, revocation, accord, membership/roster, epoch, session, consent and
+  moderation rows FIRST; chat, file, scores and directory rows bulk); what edge cannot place is
+  FIRST. Bulk has a guaranteed floor of the budget (10 %, at least 8 kbit/s) and never bursts.
+- Row STALE: media that would arrive past the 800 ms live-media staleness budget is not sent,
+  audio included (`av_chunk_dropped_stale_at_sender`).
+- Row AGE: media more than 800 ms above its per-(stream, epoch) floor is dropped by receivers and
+  relays, per chunk on arrival and per frame at hand-out; never delivered, never relayed on.
+- Offer-as-life, on the publisher's signed word only (CC Part 5; models R29, R31, R32): a parent
+  is not failed over for silence while the publisher's own word says its media is late, and a
+  relay's own claim excuses nothing (a relay that claims a late upstream and sends nothing is
+  failed over within the silence bound). Two signed sources:
+  - the **backlog stamp**, a new C3 frame (`STAMP` 0x08, 124 B, `CAP_BACKLOG_STAMP`): stream,
+    epoch, the publisher's send time, its declared backlog and the highest chunk it sealed,
+    signed by the stream's bound chunk key. The publisher stamps from a 300 ms queue word, and
+    whenever it withholds media, to every member each second; a relay forwards the latest it
+    verified byte for byte and never mints one. The excuse needs a stamp declaring more than
+    800 ms, fresh net of that backlog; a first chunk's grace is the stamp's backlog.
+  - a **verified stale chunk**: a relay that drops one forwards one a stream per second to its
+    children; it excuses its carrier for 2.5 s, is usable once by seq and only under 6 s late,
+    is never delivered and is not an arrival. Stale chunks alone excuse at most 5 s until the
+    parent delivers (`STALE_ONLY_EXCUSE_MS`), so a relay that holds fresh chunks to make them
+    stale is still failed over.
+  `av_backlog_stamp_refused`, `av_stale_witness_forwarded`.
+- leviculum v0.34.0+ciris.5: the transport's egress scheduler follows the budget (paced at 2x R,
+  bulk floor and media age bound edge's), media datagrams carry their kind (audio first), Channel
+  sends carry the edge class (FIRST as Control), and the scheduler's own queue joins the backlog
+  reading. A FIRST envelope that goes as a Resource (the scheduler takes a Resource as bulk) is
+  counted, `egress_first_on_resource`; at 2x the scheduler rarely holds one.
+- Logs for field diagnosis, debug level, key ids only: `ciris_edge::alm_decision` (every ALM
+  decision: who chose what about whom and why) and `ciris_edge::stamp` (stamps made, heard,
+  refused).
+
+- `CallEvent::KeyframeWanted { stream }` (Python `keyframe_wanted`): once per resume of this
+  node's own video after edge held or dropped frames of it; the host's encoder sends a keyframe
+  next. On the W4 bench the picture's freeze after a resume fell from p50 3.8 s to 72 ms.
+- The second NAT observer: when the facilitator is the genesis bundle's serve node, a node also
+  probes the same host at its dial port + 1 (UDP, probes only), so it classifies its NAT, port
+  prediction runs, and the birthday spray no longer waits on the node's own evidence. A
+  host-named facilitator has none unless the host names one (`DirectLinksConfig::facilitator2`).
+  A serve node of the bundle that serves a facilitator answers on that second port.
+
+- `Edge::peer_reach(node_key_id)` (PyO3 `peer_reach`, UniFFI `peer_reach`): `Live` / `Dialable` /
+  `Unreachable` / `Unknown`, the live link's last inbound age, path and hops, the transit pair, and
+  whether the link is direct. `Unreachable` is the CIRISEdge#971 undialable check, now one
+  function (`transport::peer_reach`) for both callers; `Dialable` is "not live and not
+  undialable". Its store reads are booked as `edge.transport.peer_reach`.
+
+### Changed
+- One address predicate on both sides of a direct link: a known peer that shares a room with this
+  node or that it names as a contact, and this node not anonymous. Every proposal, every answer
+  and each link's escalation read it. It is re-read on every standing change (a room joined or
+  left, a contact added or withdrawn, the tier turning on or off, a link up, attributed, closed,
+  gone direct or failed) and on a 5 s cadence. A link whose peer no longer passes moves back to
+  its relayed path (`direct_link_retired_no_standing`), and pending background re-proposals are
+  dropped (`direct_link_retries_dropped`); `direct_link_skipped_no_standing` counts a proposal
+  not made.
+- **Behaviour change:** `direct_link_accept = identified_only` now follows the room/contact rule,
+  as `room_peers` does. The setting is kept for the API.
+- `undialable_now` (CIRISEdge#971) counts a live link this node dialled as a live identity link,
+  so a peer with one is no longer "undialable".
+
+### Fixed
+- A two-person call (one leg) reads its uplink backlog: the drain, row STALE and the egress
+  budget engage there too. A drain ends once every leg's send clock says this uplink is clear,
+  so a kept child with a slow uplink of its own cannot hold it on (45.3 model R25).
+- The bulk floor is debited only by the sends it serves, so its debt is bounded and bulk waits
+  at most one floor refill behind media (R28).
+- The G8 stall verdict reads each leg's send clock, from the message's send (R24).
+- `withdraws`, `duty:` and `ownership:` rows ride FIRST. FIRST bytes are counted by family
+  prefix (`first_bytes:*`, prefix only).
+- A backlogged uplink counts as stalled (the verdict lapsed under a standing queue), and a
+  stalled node sends no relay offers.
+
+### Operations (outside edge)
+- The bridge must publish the canonical's dial port + 1 over UDP, and canonical-1 needs the
+  firewall allow for it; until then the second observer does not answer and nodes fall back as
+  in 45.2.
+
+### Fixed (models)
+- An over-commit shed keeps the relay its other children moved to: the lowest-ranked direct child
+  offering the stream on, as the movers' RM4 reading counts it. It had ranked its whole ledger
+  and could keep a child the movers could not see, stranding them on a shed relay (R34).
+- A frame is judged for staleness at hand-out with a 20 ms allowance for the hand-off itself, so
+  the host is never handed one past 800 ms.
+- AGE floor: every floor, an epoch's first included, needs a confirming second chunk and is the
+  lower of the pair, so one chunk from a stepped publisher clock poisons nothing (R27).
+- A relay advertises the most late stale drop of the last 2.5 s, not the last one (R29b).
+- `CallEvent::KeyframeWanted` fires at most once a second per stream; a resume inside the
+  interval is owed, not lost (`KEYFRAME_WANTED_MIN_INTERVAL_MS`).
+
+### Known
+- A publisher clock that steps BACK by more than the budget and stays reads late at every
+  receiver until the room's epoch rolls (no receiver can tell it from a standing queue); the
+  publisher-side restatement is the next cut.
+- The stale-only excuse covers a backlog that grows up to about 5x the uplink; steeper first
+  bursts can fail an honest relay over (model R32).
+- A small bulk row behind large bulk transfers waits its turn at the bulk floor (bytes ahead /
+  10 % of the budget); ordering small interactive rows first is the next cut (model R33).
+- A relay without `CAP_BACKLOG_STAMP` (pre-45.3) gets and sends no stamps: offer-as-life does
+  not reach it, as before 45.3.
+- A relay drops and admits per CHUNK, not per frame: the fragment marker that says where a frame
+  ends is inside the end-to-end AEAD, so a relay cannot see a frame's extent, and one chunk held
+  or dropped can cost a receiver the whole frame.
+- Audio within 800 ms on the faithful 300 kbit/s bench was 0.31-0.35 before the scheduler
+  (bar 0.95); it is not yet re-measured with the scheduler on.
+
 ## 45.2.1 — 2026-11-25
 
 **PATCH. A call follows its room's group; every build lane compiles.** Pins unchanged.

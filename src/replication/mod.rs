@@ -128,6 +128,7 @@ mod cosign_1252_tests;
 #[cfg(test)]
 pub(crate) mod counting_directory_930;
 pub mod directory;
+pub mod egress_class;
 #[cfg(test)]
 mod first_contact_retry_968_tests;
 #[cfg(test)]
