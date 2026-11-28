@@ -4634,6 +4634,10 @@ fn call_event_to_pydict<'py>(
             d.set_item("cause", cause.token())?;
             d.set_item("truncated", *truncated)?;
         }
+        V::KeyframeWanted { stream } => {
+            d.set_item("kind", "keyframe_wanted")?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+        }
         V::StreamAdded {
             publisher,
             stream,
@@ -15014,6 +15018,12 @@ mod pyo3_tier2_tests {
                     "keep_refused",
                 ),
                 (CallEvent::EpochRolled { from: 1, to: 2 }, "epoch_rolled"),
+                (
+                    CallEvent::KeyframeWanted {
+                        stream: crate::transport::realtime_av::StreamId([7; 32]),
+                    },
+                    "keyframe_wanted",
+                ),
                 (
                     CallEvent::MemberJoined {
                         key_id: "b".to_owned(),

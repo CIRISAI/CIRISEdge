@@ -6548,6 +6548,12 @@ struct UplinkCapRun {
     video_fresh_of_delivered: Vec<f64>,
     /// Per listener: the longest video gap after the settle.
     video_gap: Vec<Duration>,
+    /// Per listener: the longest gap in DECODABLE video after the settle (a
+    /// frame decodes if it is a keyframe or follows the last decoded one).
+    video_decoded_gap: Vec<Duration>,
+    /// `CallEvent::KeyframeWanted` events m0's host saw, and whether it
+    /// honoured them.
+    keyframe_events: (u64, bool),
     /// 45.3 (CC review, FIRST class) — a room removal and a chat row of the
     /// same size, sent m0 → m1 at one instant: before the cap...
     probe_uncapped: FirstProbe,
@@ -6762,21 +6768,25 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
         (1..n).map(|_| Arc::default()).collect();
     let audio_arrivals: Vec<Arc<std::sync::Mutex<Vec<(u64, tokio::time::Instant)>>>> =
         (1..n).map(|_| Arc::default()).collect();
+    // Every listener's m0 keyframes heard (by seq): the decoder model.
+    let keyframes_heard: Vec<Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>> =
+        (1..n).map(|_| Arc::default()).collect();
     let mut recorders = Vec::new();
     for (k, c) in calls.iter_mut().enumerate().skip(1) {
         let mut rx = c.frames().expect("frames");
         let log = Arc::clone(&arrivals[k - 1]);
         let alog = Arc::clone(&audio_arrivals[k - 1]);
+        let klog = Arc::clone(&keyframes_heard[k - 1]);
         let from = m0.clone();
         recorders.push(tokio::spawn(async move {
             while let Some(f) = rx.recv().await {
                 if f.publisher == from {
                     if let Some(s) = seq_of(&f.bytes) {
-                        let to = if f.codec_id == ciris_edge::transport::realtime_av::CODEC_OPAQUE {
-                            &alog
-                        } else {
-                            &log
-                        };
+                        let audio = f.codec_id == ciris_edge::transport::realtime_av::CODEC_OPAQUE;
+                        if !audio && f.bytes.starts_with(b"k-") {
+                            klog.lock().expect("keyframes").insert(s);
+                        }
+                        let to = if audio { &alog } else { &log };
                         to.lock()
                             .expect("arrivals")
                             .push((s, tokio::time::Instant::now()));
@@ -6794,7 +6804,31 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
     let parents_log: Arc<std::sync::Mutex<Vec<(Duration, usize, Option<String>)>>> = Arc::default();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let t0 = tokio::time::Instant::now();
+    // 45.3 — m0's host honours CallEvent::KeyframeWanted: its next video
+    // frame is a keyframe (W_KEYFRAME_IGNORE: it does not, and only the GOP
+    // brings one).
+    let keyframe_due = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let keyframe_events = Arc::new(AtomicU64::new(0));
+    let honour_keyframes = std::env::var_os("W_KEYFRAME_IGNORE").is_none();
+    let m0_events = {
+        let mut ev = calls[0].events().expect("m0's events");
+        let (due, count) = (Arc::clone(&keyframe_due), Arc::clone(&keyframe_events));
+        tokio::spawn(async move {
+            while let Some(e) = ev.recv().await {
+                if matches!(
+                    e,
+                    ciris_edge::transport::av_call::CallEvent::KeyframeWanted { .. }
+                ) {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if honour_keyframes {
+                        due.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        })
+    };
     let publisher = {
+        let keyframe_due = Arc::clone(&keyframe_due);
         let sent_at = Arc::clone(&sent_at);
         let audio_sent_at = Arc::clone(&audio_sent_at);
         let parents_log = Arc::clone(&parents_log);
@@ -6846,11 +6880,25 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
                 }
                 tokio::time::sleep_until(next_video).await;
                 next_video += FRAME_INTERVAL;
+                // m0's keyframes: one a GOP, and the next frame after a
+                // KeyframeWanted the host honours; two fragments each.
+                let key = seq.is_multiple_of(KEYFRAME_EVERY)
+                    || keyframe_due.swap(false, Ordering::SeqCst);
                 for (i, c) in calls.iter_mut().enumerate() {
-                    let mut b = body(if i == 0 { "w" } else { "o" }, seq);
+                    let m0_key = i == 0 && key;
+                    let mut b = body(
+                        if m0_key {
+                            "k"
+                        } else if i == 0 {
+                            "w"
+                        } else {
+                            "o"
+                        },
+                        seq,
+                    );
                     // One fragment, then two: 1.5 packets a frame.
                     b.resize(
-                        if seq.is_multiple_of(2) {
+                        if seq.is_multiple_of(2) && !m0_key {
                             frame
                         } else {
                             2 * frame - 16
@@ -7084,6 +7132,7 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
     tokio::time::sleep(AFTER_LIFT).await;
     stop.store(true, Ordering::SeqCst);
     let calls = publisher.await.expect("publisher");
+    m0_events.abort();
     let (rows, labels) = sampler.await.expect("sampler");
     for b in &bulk {
         b.abort();
@@ -7240,6 +7289,8 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
     let mut audio_gap = Vec::new();
     let mut video_fresh_of_delivered = Vec::new();
     let mut video_gap = Vec::new();
+    let mut video_decoded_gap: Vec<Duration> = Vec::new();
+    let mut resume_waits: Vec<Duration> = Vec::new();
     let mut video_fps = Vec::new();
     let gap_over = |times: &mut Vec<tokio::time::Instant>| {
         times.sort();
@@ -7311,6 +7362,44 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
         video_fps.push(delivered.len() as f64 / span);
         let mut vt: Vec<tokio::time::Instant> = delivered.iter().map(|(_, t)| *t).collect();
         video_gap.push(gap_over(&mut vt));
+        // The decoder model: a frame decodes if it is a keyframe or the next
+        // frame after the last one decoded (each frame refers to the one
+        // before); a gap leaves video frozen until the next keyframe.
+        let keys = keyframes_heard[video_decoded_gap.len()]
+            .lock()
+            .expect("keyframes")
+            .clone();
+        let mut by_arrival: Vec<(tokio::time::Instant, u64)> =
+            vfirst.iter().map(|(s, t)| (*t, *s)).collect();
+        by_arrival.sort();
+        let mut last: Option<u64> = None;
+        let mut decoded: Vec<tokio::time::Instant> = Vec::new();
+        // Each resume: delivery back after a gap over 200 ms, until the
+        // first decodable frame (the picture stays frozen meanwhile).
+        let mut prev_arrival: Option<tokio::time::Instant> = None;
+        let mut resumed_at: Option<tokio::time::Instant> = None;
+        for (t, s) in by_arrival {
+            let d = t.duration_since(t0);
+            let in_cap = d >= settle_from && d < cap_off;
+            if in_cap
+                && prev_arrival
+                    .is_some_and(|p| t.saturating_duration_since(p) > Duration::from_millis(200))
+                && resumed_at.is_none()
+            {
+                resumed_at = Some(t);
+            }
+            prev_arrival = Some(t);
+            if keys.contains(&s) || last.is_some_and(|l| s == l + 1) {
+                last = Some(s);
+                if let Some(r) = resumed_at.take() {
+                    resume_waits.push(t.saturating_duration_since(r));
+                }
+                if in_cap {
+                    decoded.push(t);
+                }
+            }
+        }
+        video_decoded_gap.push(gap_over(&mut decoded));
     }
     // What the cap leaves after non-media, over the cap after the settle.
     let mut nonmedia_bytes = 0u64;
@@ -7535,6 +7624,20 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
     );
     drop(calls);
     eprintln!("[W] FIRST probe uncapped {probe_uncapped:?}; capped {probe_capped:?}");
+    resume_waits.sort();
+    let rq = |q: usize| {
+        resume_waits
+            .get((resume_waits.len() * q / 100).min(resume_waits.len().saturating_sub(1)))
+            .copied()
+    };
+    eprintln!(
+        "[W] keyframes: {} KeyframeWanted at m0, honoured {honour_keyframes}; {} resumes after a >200 ms gap, frozen until decodable p50 {:?} p95 {:?} max {:?}; longest decodable-video gap after the settle {video_decoded_gap:?}; longest delivered-video gap {video_gap:?}",
+        keyframe_events.load(Ordering::SeqCst),
+        resume_waits.len(),
+        rq(50),
+        rq(95),
+        resume_waits.last()
+    );
     UplinkCapRun {
         capped,
         first_10s,
@@ -7547,6 +7650,8 @@ async fn whole_uplink_cap(tag: &str, n: usize, cap_s: u64, bulk_kbit_server: u64
         audio_gap,
         video_fresh_of_delivered,
         video_gap,
+        video_decoded_gap,
+        keyframe_events: (keyframe_events.load(Ordering::SeqCst), honour_keyframes),
         probe_uncapped,
         probe_capped,
     }
@@ -7605,6 +7710,9 @@ async fn a_room_removal_leaves_at_once_while_video_is_held() {
 /// delivery: the FIFO grows between the crossings (it is read once, at the
 /// send) and the receiver's request rides m1's own uplink.
 const FIRST_PROBE_SLACK: Duration = Duration::from_millis(500);
+
+/// m0's GOP: a keyframe every this many video frames (2 s at 30 Hz).
+const KEYFRAME_EVERY: u64 = 60;
 
 /// 45.3 — m0's audio: one Opus packet per 20 ms, 60 B (24 kbit/s), as a
 /// host packetizes it.

@@ -450,6 +450,15 @@ pub enum CallEvent {
         /// `0`, `1` or `2`.
         tier: u8,
     },
+    /// 45.3 — this node's own video on `stream` resumes after edge held or
+    /// dropped frames of it (the egress budget did not admit them, or row
+    /// STALE kept them off a backlogged uplink): the receivers' decoders lost
+    /// their reference, so the host's encoder should send a keyframe next.
+    /// Once per resume; not again until frames are held once more.
+    KeyframeWanted {
+        /// The own stream (the primary or a share).
+        stream: StreamId,
+    },
     /// v45 — an attendee's stream left the call: once per (attendee,
     /// stream). `Left` and `Backgrounded` come only from the attendee's own
     /// signed end of its stream; `Removed` from the room's MLS group dropping
@@ -1918,9 +1927,9 @@ struct Shared {
     queue_age_ms: AtomicU64,
     /// 45.3 row DR — each out leg's [`alm::SendClock`].
     send_clocks: StdMutex<HashMap<[u8; 16], alm::SendClock>>,
-    /// 45.3 — the egress budget held one of this call's video frames since
-    /// the last one it admitted.
-    video_held: AtomicBool,
+    /// 45.3 — the own streams whose video edge held or dropped since the
+    /// last frame of it that went out ([`video_resumes`]).
+    video_held: StdMutex<std::collections::HashSet<StreamId>>,
     /// G8 — rung when a fan-out parks a chunk: the flusher retries it with
     /// the publisher lock taken briefly, never inside `publish`.
     parked_wake: tokio::sync::Notify,
@@ -2706,7 +2715,7 @@ impl Call {
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
             send_clocks: StdMutex::new(HashMap::new()),
-            video_held: AtomicBool::new(false),
+            video_held: StdMutex::new(std::collections::HashSet::new()),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
             evidence_at: StdMutex::new(HashMap::new()),
@@ -4124,15 +4133,20 @@ async fn send_pieces(
         let admitted = bytes == 0 || shared.transport.egress_budget().take(class, bytes);
         if !admitted {
             shared.count(crate::observability::AV_FRAME_HELD_BUDGET);
-            if class == crate::transport::egress_budget::Class::Video {
-                shared.video_held.store(true, Ordering::Relaxed);
-            }
-        } else if class == crate::transport::egress_budget::Class::Video
-            && shared.video_held.swap(false, Ordering::Relaxed)
-        {
-            // Video resumes after frames were held: here a keyframe is
-            // wanted (the host event waits on the 45.x token set).
+        }
+        // Row STALE drops every chunk of this frame in `send_own_chunk`: for
+        // the keyframe rule that is a held frame too.
+        let stale = Shared::lock(&shared.alm).sends_stale();
+        let video = class == crate::transport::egress_budget::Class::Video;
+        let resumed = video_resumes(
+            &mut Shared::lock(&shared.video_held),
+            stream,
+            video,
+            admitted && !stale,
+        );
+        if resumed {
             shared.count(crate::observability::AV_VIDEO_KEYFRAME_WANTED);
+            shared.emit(CallEvent::KeyframeWanted { stream });
         }
         !admitted
     };
@@ -4262,6 +4276,28 @@ const fn chunk_wire_bytes(plaintext: usize) -> usize {
         + 25
         + 75
         + 28
+}
+
+/// 45.3 — `CallEvent::KeyframeWanted`'s rule, for one own frame of `stream`
+/// (`video`: whether it is video; `sent`: whether it goes out, neither held
+/// by the budget nor dropped by row STALE). A video frame that does not go
+/// out marks the stream; the first one that does after that unmarks it and
+/// returns `true`, once per resume.
+fn video_resumes(
+    held: &mut std::collections::HashSet<StreamId>,
+    stream: StreamId,
+    video: bool,
+    sent: bool,
+) -> bool {
+    if !video {
+        return false;
+    }
+    if sent {
+        held.remove(&stream)
+    } else {
+        held.insert(stream);
+        false
+    }
 }
 
 /// 45.3 — the egress budget's class of a media chunk.

@@ -1152,3 +1152,44 @@ fn a_stream_that_starts_late_is_judged_from_its_first_on_time_chunk() {
     // ...and the queue coming back is stale.
     assert!(super::is_stale_end_to_end(Some(floor.sample(late, 62_000))));
 }
+
+/// 45.3 — `CallEvent::KeyframeWanted`: once per resume of an own stream's
+/// video after frames were held or dropped, never for audio, never for a
+/// stream that was not held, and not again until it is held once more; each
+/// own stream on its own.
+#[test]
+fn a_keyframe_is_wanted_once_per_resume_of_held_video() {
+    let (a, b) = (StreamId([1; 32]), StreamId([2; 32]));
+    let mut held = std::collections::HashSet::new();
+    assert!(
+        !super::video_resumes(&mut held, a, true, true),
+        "never held"
+    );
+    assert!(
+        !super::video_resumes(&mut held, a, false, false),
+        "audio held"
+    );
+    assert!(
+        !super::video_resumes(&mut held, a, false, true),
+        "audio resumes"
+    );
+    assert!(!super::video_resumes(&mut held, a, true, false), "held");
+    assert!(
+        !super::video_resumes(&mut held, a, true, false),
+        "still held"
+    );
+    assert!(
+        !super::video_resumes(&mut held, b, true, true),
+        "the other stream"
+    );
+    assert!(
+        super::video_resumes(&mut held, a, true, true),
+        "resumes: wanted"
+    );
+    assert!(!super::video_resumes(&mut held, a, true, true), "once");
+    assert!(!super::video_resumes(&mut held, a, true, false));
+    assert!(
+        super::video_resumes(&mut held, a, true, true),
+        "the next resume"
+    );
+}

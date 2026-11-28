@@ -1123,8 +1123,8 @@ pub const AV_BULK_DEFERRED_DRAIN: &str = "av_bulk_deferred_budget";
 /// 45.3 — a media frame (own: every fragment; relayed: one chunk) the egress
 /// budget did not admit, so not sent.
 pub const AV_FRAME_HELD_BUDGET: &str = "av_frame_held_budget";
-/// 45.3 — video resumed after the egress budget held frames of it: the point
-/// where the host's encoder would be asked for a keyframe.
+/// 45.3 — own video resumed after edge held or dropped frames of it (the
+/// egress budget, or row STALE): `CallEvent::KeyframeWanted` fires with it.
 pub const AV_VIDEO_KEYFRAME_WANTED: &str = "av_video_keyframe_wanted";
 /// 45.3 row STALE — one media chunk (own or relayed, audio included) not
 /// handed to a backlogged uplink because it would reach its receivers past
