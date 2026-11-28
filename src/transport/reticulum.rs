@@ -455,12 +455,6 @@ const CHANNEL_FRAME_SEND_BUDGET: Duration = Duration::from_secs(15);
 /// frames keep the Resource path with the Channel as the busy fallback.
 const CHANNEL_FIRST_MAX_FRAGMENTS: usize = 8;
 
-/// 45.3 (leviculum ciris.5) — the most Channel fragments a FIRST envelope
-/// rides on a dialled lane before it falls back to a Resource (which the
-/// scheduler takes as bulk): FIRST rows are small (a removal, a key, a halt),
-/// and riding the Channel keeps them ahead of media.
-const FIRST_CHANNEL_MAX_FRAGMENTS: usize = 32;
-
 /// CIRISEdge#716 — the largest payload ONE link-Channel send accepts on a link
 /// whose packet MDU is `link_mdu`: leviculum's `Channel::mdu`, i.e. the link MDU
 /// minus the 6-byte channel envelope header (`CHANNEL_ENVELOPE_HEADER_SIZE`,
@@ -13302,34 +13296,6 @@ impl ReticulumTransport {
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
         // hard cap (v13.6.1 progress-aware wait).
-        // 45.3 (leviculum ciris.5) — the scheduler takes every Resource as
-        // bulk, so a FIRST envelope (a removal, a key, a halt) goes on the
-        // Channel, scheduled as Control, ahead of media; a stall falls through
-        // to the Resource as before (and is counted there).
-        if matches!(
-            crate::transport::egress_budget::current_send_class(),
-            crate::transport::egress_budget::SendClass::First
-        ) {
-            let mdu = send_mdu(&self.node, &self.shapers, &link_id);
-            if let Some(fragments) = crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
-                .filter(|f| f.len() <= FIRST_CHANNEL_MAX_FRAGMENTS)
-            {
-                let outcome = self
-                    .send_channel_marked(
-                        link_id,
-                        crate::transport::link_shaping::Lane::of(envelope_bytes),
-                        &fragments,
-                    )
-                    .await;
-                if outcome.complete() {
-                    note_outbound_use(&self.link_last_outbound_at, link_id);
-                    claim.release().await;
-                    self.propose_direct_to_room_peer(destination_key_id, link_id, &candidates)
-                        .await;
-                    return Ok(TransportSendOutcome::Delivered);
-                }
-            }
-        }
         let reused = claim.reused;
         let shipped = self
             .ship_resource_on_link(

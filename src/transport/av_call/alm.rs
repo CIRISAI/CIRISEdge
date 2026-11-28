@@ -311,6 +311,9 @@ pub(super) struct AlmState {
     /// 45.3 (R31) — per received stream, when a stale chunk was last
     /// forwarded on as this node's children's witness.
     witness_sent_at: BTreeMap<StreamId, u64>,
+    /// 45.3 (R34) — direct children offering this node's own stream on, with
+    /// when (call ms): the relays its other children may have moved to.
+    own_relay_offers: BTreeMap<String, u64>,
     /// Row ProbeAfterDrain — out legs that cannot read as drained now: their
     /// queue gauge is unmeasured (no `min_rtt` yet, or right after a path
     /// move) or a Channel message is still outstanding on them.
@@ -620,6 +623,7 @@ impl AlmState {
             relayed_stamps: BTreeMap::new(),
             witness_seq: BTreeMap::new(),
             witness_sent_at: BTreeMap::new(),
+            own_relay_offers: BTreeMap::new(),
             leg_busy: BTreeSet::new(),
             members: members.to_vec(),
             tier: ServiceTier::FullOps,
@@ -1847,6 +1851,14 @@ impl AlmState {
             .is_none_or(|at| now.saturating_sub(*at) >= OFFER_EVERY_MS);
         if usable && due {
             self.witness_sent_at.insert(stream, now);
+            tracing::debug!(
+                target: "ciris_edge::stamp",
+                node = %self.me,
+                from = %from,
+                seq,
+                latency_ms = l,
+                "stale chunk: excuses its carrier, forwarded on as a witness"
+            );
             return true;
         }
         false
@@ -2086,6 +2098,19 @@ impl AlmState {
                 self.sync_upstream(stream);
             }
             ControlMsg::Offer(o) => {
+                // R34 — a direct child offering this node's own stream on
+                // (depth 1, this node its only ancestor) is a relay its
+                // siblings may have moved to: the over-commit shed keeps the
+                // lowest-ranked of these, as the movers' RM4 reading does.
+                if self.is_own(stream)
+                    && o.forwarding
+                    && o.depth == 1
+                    && o.ancestry.len() == 1
+                    && o.ancestry[0] == self.me
+                {
+                    let now = self.now_ms();
+                    self.own_relay_offers.insert(peer.to_owned(), now);
+                }
                 if self.is_own(stream) || !self.members.iter().any(|m| m == peer) {
                     return out;
                 }
@@ -2315,6 +2340,18 @@ impl AlmState {
             own_w.capacity_bps = Some(one + self.cfg.reserve_bps as f64 + ext as f64);
         }
         self.log.set_stream(Some(stream_label(self.own_stream)));
+        // R34 — the child the movers spared (the lowest-ranked direct child
+        // offering this stream on, as RM4 reads it from offers) is shed
+        // last: shedding it strands the members who moved to it.
+        let fresh = |at: &u64| now.saturating_sub(*at) <= self.cfg.down_silence_ms;
+        let relays: Vec<String> = self
+            .own_relay_offers
+            .iter()
+            .filter(|(_, at)| fresh(at))
+            .map(|(p, _)| p.clone())
+            .collect();
+        let spared = rxmove::lowest(self.own_stream, &relays).cloned();
+        self.own.set_spared(spared);
         for p in self.own.on_egress_window(now, &own_w, &mut self.log) {
             shed.push((self.own_stream, p));
         }

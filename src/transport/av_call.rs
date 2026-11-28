@@ -161,6 +161,20 @@ fn is_stale_end_to_end(latency_ms: Option<i64>) -> bool {
     latency_ms.is_some_and(|l| l > budget)
 }
 
+/// 45.3 row AGE at presentation — the hand-off's own allowance: a frame is
+/// judged a moment before the host reads it (the channel, the host's task
+/// waking), so one judged within this of the budget would reach the host
+/// past it (800.7 ms on a loaded runner). It is judged against the budget
+/// less this, and the host is never handed stale media.
+const HANDOFF_ALLOWANCE_MS: i64 = 20;
+
+/// 45.3 row AGE — whether a frame about to be handed to the host would reach
+/// it stale ([`is_stale_end_to_end`] less [`HANDOFF_ALLOWANCE_MS`]).
+fn is_stale_at_handout(latency_ms: Option<i64>) -> bool {
+    let budget = i64::try_from(MEDIA_STALE_BUDGET.as_millis()).unwrap_or(i64::MAX);
+    latency_ms.is_some_and(|l| l > budget.saturating_sub(HANDOFF_ALLOWANCE_MS))
+}
+
 /// ALM C5 — consecutive congested sends before a leg is shed to the base
 /// layer.
 const LEG_SHED_AFTER: u32 = 3;
@@ -6924,7 +6938,7 @@ async fn reorder_loop(
             whole
                 .iter()
                 .map(|f| {
-                    !off && is_stale_end_to_end(a.latency_now(f.stream, f.epoch.0, f.source_ts_ms))
+                    !off && is_stale_at_handout(a.latency_now(f.stream, f.epoch.0, f.source_ts_ms))
                 })
                 .collect()
         };

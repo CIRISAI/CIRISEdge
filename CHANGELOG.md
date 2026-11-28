@@ -42,8 +42,8 @@ capability-gated); leviculum v0.34.0+ciris.5.
 - leviculum v0.34.0+ciris.5: the transport's egress scheduler follows the budget (paced at 2x R,
   bulk floor and media age bound edge's), media datagrams carry their kind (audio first), Channel
   sends carry the edge class (FIRST as Control), and the scheduler's own queue joins the backlog
-  reading. A FIRST envelope on a dialled lane rides the Channel before any Resource (a Resource is
-  scheduled as bulk); one that falls back is counted, `egress_first_on_resource`.
+  reading. A FIRST envelope that goes as a Resource (the scheduler takes a Resource as bulk) is
+  counted, `egress_first_on_resource`; at 2x the scheduler rarely holds one.
 - Logs for field diagnosis, debug level, key ids only: `ciris_edge::alm_decision` (every ALM
   decision: who chose what about whom and why) and `ciris_edge::stamp` (stamps made, heard,
   refused).
@@ -95,6 +95,11 @@ capability-gated); leviculum v0.34.0+ciris.5.
   in 45.2.
 
 ### Fixed (models)
+- An over-commit shed keeps the relay its other children moved to: the lowest-ranked direct child
+  offering the stream on, as the movers' RM4 reading counts it. It had ranked its whole ledger
+  and could keep a child the movers could not see, stranding them on a shed relay (R34).
+- A frame is judged for staleness at hand-out with a 20 ms allowance for the hand-off itself, so
+  the host is never handed one past 800 ms.
 - AGE floor: every floor, an epoch's first included, needs a confirming second chunk and is the
   lower of the pair, so one chunk from a stepped publisher clock poisons nothing (R27).
 - A relay advertises the most late stale drop of the last 2.5 s, not the last one (R29b).

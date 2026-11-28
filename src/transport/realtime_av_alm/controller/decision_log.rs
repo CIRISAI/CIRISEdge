@@ -100,11 +100,13 @@ impl DecisionLog {
     ) {
         // 45.3 — every ALM decision, readable in a field log
         // (`RUST_LOG=ciris_edge::alm_decision=debug`): which node chose what
-        // about whom and why. Key ids only, never an address.
+        // about whom, on which stream, and why. Key ids and stream labels
+        // only, never an address.
         tracing::debug!(
             target: "ciris_edge::alm_decision",
             at_ms,
             node = ?node,
+            stream = self.stream.as_deref().unwrap_or("-"),
             ?kind,
             subject = ?subject,
             value,
